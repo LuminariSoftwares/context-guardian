@@ -121,6 +121,10 @@ NUM_CTX = int(os.environ.get("GUARDIAN_NUM_CTX", "32768"))  # keep in sync with 
 COMPACT_THRESHOLD = float(os.environ.get("GUARDIAN_COMPACT_THRESHOLD", "0.85"))
 KEEP_RECENT_MESSAGES = int(os.environ.get("GUARDIAN_KEEP_RECENT_MESSAGES", "8"))
 CHARS_PER_TOKEN_ESTIMATE = float(os.environ.get("GUARDIAN_CHARS_PER_TOKEN", "3.5"))  # conservative -- triggers a little early rather than late
+# Count the `tools` array against the budget. Default ON: it IS in the request
+# and the model IS charged for it. Set GUARDIAN_COUNT_TOOLS=0 for the old
+# messages-only behaviour (v0.1.0 and earlier) if you need to bisect.
+COUNT_TOOLS = os.environ.get("GUARDIAN_COUNT_TOOLS", "1") not in ("0", "false", "False")
 UPSTREAM_TIMEOUT_SECONDS = float(os.environ.get("GUARDIAN_UPSTREAM_TIMEOUT", "600.0"))
 UPSTREAM_CONNECT_TIMEOUT_SECONDS = float(os.environ.get("GUARDIAN_UPSTREAM_CONNECT_TIMEOUT", "10.0"))
 
@@ -174,8 +178,46 @@ async def _shutdown() -> None:
         await _http_client.aclose()
 
 
+def estimate_tool_tokens(payload: Dict[str, Any]) -> int:
+    """What the `tools` array costs.
+
+    Added in 0.2.0, because leaving it out was a real bug and not a rounding
+    error. Guardian used to estimate the request from `messages` alone. For a
+    plain chat client that is fine -- there is no `tools` array. For the tools
+    this proxy was actually written to help (agentic CLIs, and anything wired
+    to MCP servers) the tool definitions are frequently the LARGEST single
+    item in the request and they are sent on every turn.
+
+    A concrete measurement from the setup this was built on: five MCP servers
+    came to 28,689 tokens -- 87.6% of a 32,768-token window -- before the first
+    user message. Guardian was counting that as zero. It was not firing late;
+    it was measuring against the wrong ceiling on every request of its life.
+    On a smaller 8,192-token window the same tool payload was 2.7x the entire
+    context, which no amount of compaction can fix.
+
+    Counts `tools` and the legacy `functions` field by serialised length.
+    """
+    if not COUNT_TOOLS:
+        return 0
+    chars = 0
+    for key in ("tools", "functions"):
+        blob = payload.get(key)
+        if blob:
+            try:
+                chars += len(json.dumps(blob, ensure_ascii=False))
+            except (TypeError, ValueError):
+                # Never let a weird payload break the request path.
+                chars += len(str(blob))
+    return int(chars / CHARS_PER_TOKEN_ESTIMATE)
+
+
 def estimate_tokens(messages: List[Dict[str, Any]]) -> int:
-    """Rough, conservative token estimate from raw message text length."""
+    """Rough, conservative token estimate from raw message text length.
+
+    Messages only. `tools` is counted separately by estimate_tool_tokens(),
+    deliberately kept apart so the log can distinguish the part of the budget
+    compaction can move from the part it cannot.
+    """
     total_chars = 0
     for m in messages:
         content = m.get("content", "")
@@ -246,9 +288,31 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
     messages = payload.get("messages", [])
     _state["requests_seen"] += 1
 
-    estimated = estimate_tokens(messages)
+    message_tokens = estimate_tokens(messages)
+    tool_tokens = estimate_tool_tokens(payload)
+    estimated = message_tokens + tool_tokens
     _state["last_known_total_tokens"] = estimated
+    _state["last_tool_tokens"] = tool_tokens
+    _state["last_message_tokens"] = message_tokens
     threshold_tokens = int(NUM_CTX * COMPACT_THRESHOLD)
+
+    # Tool definitions are a FLOOR. This proxy can only summarise messages, so
+    # it can never reduce them. Say so out loud the first time a given tool
+    # payload is seen, so someone watching constant compaction is looking at
+    # the real cause instead of blaming the summariser.
+    if tool_tokens and tool_tokens != _state.get("logged_tool_tokens"):
+        _state["logged_tool_tokens"] = tool_tokens
+        share = tool_tokens / NUM_CTX if NUM_CTX else 0
+        log.info("Tool definitions in this request: ~%d tokens (%.1f%% of %d). "
+                 "Compaction cannot reduce this -- only sending fewer tools can.",
+                 tool_tokens, share * 100, NUM_CTX)
+        log_event({"event": "tool_budget", "tool_tokens": tool_tokens,
+                   "num_ctx": NUM_CTX, "share_of_ctx": round(share, 3),
+                   "note": "fixed floor; not reducible by compaction"})
+        if tool_tokens >= NUM_CTX:
+            log.warning("TOOL DEFINITIONS ALONE (%d) EXCEED THE ENTIRE CONTEXT "
+                        "WINDOW (%d). Nothing this proxy does can fix that -- "
+                        "send fewer tools.", tool_tokens, NUM_CTX)
 
     if estimated < threshold_tokens or len(messages) <= KEEP_RECENT_MESSAGES + 1:
         return payload
@@ -292,12 +356,17 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
         "messages_before": len(messages),
         "messages_after": len(new_messages),
         "estimated_tokens_before": estimated,
-        "estimated_tokens_after": estimate_tokens(new_messages),
+        "estimated_tokens_after": estimate_tokens(new_messages) + tool_tokens,
+        "message_tokens_before": message_tokens,
+        "message_tokens_after": estimate_tokens(new_messages),
+        "tool_tokens": tool_tokens,
         "summary_preview": summary[:500],
     })
     log.info(
-        "Compacted %d messages -> %d. Estimated tokens %d -> %d.",
-        len(messages), len(new_messages), estimated, estimate_tokens(new_messages),
+        "Compacted %d messages -> %d. Estimated tokens %d -> %d "
+        "(of which %d is tool definitions, unchanged).",
+        len(messages), len(new_messages), estimated,
+        estimate_tokens(new_messages) + tool_tokens, tool_tokens,
     )
     return new_payload
 
@@ -308,8 +377,11 @@ async def stats():
         "num_ctx": NUM_CTX,
         "compact_threshold": COMPACT_THRESHOLD,
         "keep_recent_messages": KEEP_RECENT_MESSAGES,
+        "count_tools": COUNT_TOOLS,
         "upstream": UPSTREAM_URL,
         **_state,
+        "note": ("last_known_total_tokens INCLUDES the tools array as of 0.2.0. "
+                 "last_tool_tokens is the portion compaction cannot reduce."),
     })
 
 

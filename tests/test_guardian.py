@@ -100,3 +100,45 @@ def test_stats_endpoint_reports_config(guardian):
     assert data["num_ctx"] == 1000
     assert data["compact_threshold"] == 0.5
     assert "requests_seen" in data
+
+
+# --- tool-definition accounting (0.2.0) -------------------------------------
+# Regression tests for the bug this release fixes: Guardian estimated the
+# request from `messages` alone and never looked at `tools`, so for any agentic
+# or MCP-backed client it was measuring a fraction of the real payload.
+
+def test_estimate_tool_tokens_counts_tools(guardian):
+    tools = [{"name": "x", "description": "y" * 28}]
+    # serialised length / 3.5, so just assert it is non-trivially counted
+    assert guardian.estimate_tool_tokens({"tools": tools}) > 5
+
+
+def test_estimate_tool_tokens_counts_legacy_functions(guardian):
+    fns = [{"name": "x", "description": "y" * 28}]
+    assert (guardian.estimate_tool_tokens({"functions": fns})
+            == guardian.estimate_tool_tokens({"tools": fns}))
+
+
+def test_estimate_tool_tokens_zero_without_tools(guardian):
+    assert guardian.estimate_tool_tokens({"messages": []}) == 0
+
+
+def test_estimate_tool_tokens_survives_unserialisable_payload(guardian):
+    """Never raise on the request path -- a weird payload must not 500."""
+    assert guardian.estimate_tool_tokens({"tools": object()}) >= 0
+
+
+def test_estimate_tokens_still_ignores_tools(guardian):
+    """The two halves stay separate so the log can distinguish them."""
+    messages = [{"role": "user", "content": "a" * 35}]
+    assert guardian.estimate_tokens(messages) == 10
+
+
+def test_count_tools_can_be_disabled(monkeypatch, tmp_path):
+    import importlib
+    import sys
+    monkeypatch.setenv("GUARDIAN_COUNT_TOOLS", "0")
+    monkeypatch.setenv("GUARDIAN_LOG_PATH", str(tmp_path / "g.json"))
+    module = importlib.reload(sys.modules["context_guardian"])
+    assert module.COUNT_TOOLS is False
+    assert module.estimate_tool_tokens({"tools": [{"name": "x" * 100}]}) == 0

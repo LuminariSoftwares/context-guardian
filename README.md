@@ -23,6 +23,45 @@ Your CLI / agent (Claude Code, OpenClaude, etc.)
 
 Point your CLI's `OPENAI_BASE_URL` at Context Guardian instead of directly at your backend, and set `GUARDIAN_UPSTREAM_URL` to wherever your backend actually lives. Guardian is a pure passthrough for everything except `POST /v1/chat/completions`, which gets the compaction check — every other route, including streaming responses, is forwarded byte-for-byte, untouched.
 
+## If you use MCP servers or an agentic CLI, read this
+
+Guardian counts your `tools` array against the context budget. It did not
+before 0.2.0, and that was a real bug — see the changelog.
+
+Tool definitions are usually invisible in a way message history is not. You do
+not type them, they do not scroll past, and your CLI's context display often
+does not break them out. But they are in every single request. On the setup this
+was developed against, seven MCP servers came to **28,689 tokens — 87.6% of a
+32,768-token window** — before the first user message.
+
+**Guardian cannot compact them.** It summarizes conversation history; tool
+definitions are a fixed floor underneath it. So there are two different problems
+and only one of them is Guardian's:
+
+| Problem | What fixes it |
+|---|---|
+| Conversation history grows until the window fills | Guardian |
+| Two thirds of the window is gone before you type | Loading fewer tools |
+
+Guardian will now tell you which one you have. It logs a `tool_budget` event the
+first time it sees a given tool payload, and warns outright when the tool
+definitions alone meet or exceed the whole window:
+
+```
+[ContextGuardian] TOOL DEFINITIONS ALONE (2671) EXCEED THE ENTIRE CONTEXT
+WINDOW (1000). Nothing this proxy does can fix that -- send fewer tools.
+```
+
+If you see that, no proxy setting will help you. Most MCP-capable CLIs let you
+scope which servers load per session — Claude Code and OpenClaude both accept
+`--mcp-config <file>` together with `--strict-mcp-config`, which makes that file
+the only source of MCP servers for the session.
+
+One consequence worth expecting: **after upgrading, Guardian compacts sooner and
+more often.** It is measuring the whole request now instead of a fraction of it.
+If that feels aggressive, the honest reading is that your window was already
+this full and you could not see it.
+
 ## What this does *not* do
 
 - **It doesn't replace or duplicate compression your backend already does** (e.g. Headroom, prompt caching). It forwards to your backend as-is once it's decided whether to compact first — the two are complementary, not competing.
@@ -73,6 +112,7 @@ cp .env.example .env
 | `GUARDIAN_COMPACT_THRESHOLD` | `0.85` | Fraction of `GUARDIAN_NUM_CTX` at which compaction triggers |
 | `GUARDIAN_KEEP_RECENT_MESSAGES` | `8` | Most-recent messages always kept verbatim, never summarized |
 | `GUARDIAN_CHARS_PER_TOKEN` | `3.5` | Characters-per-token used for the estimate |
+| `GUARDIAN_COUNT_TOOLS` | `1` | Count the `tools` array against the budget. Set `0` for pre-0.2.0 messages-only behaviour |
 | `GUARDIAN_UPSTREAM_TIMEOUT` | `600` | Seconds to wait for the upstream backend to respond |
 | `GUARDIAN_UPSTREAM_CONNECT_TIMEOUT` | `10` | Seconds to wait for the upstream connection itself |
 | `GUARDIAN_LOG_PATH` | `logs/context_guardian_log.json` | Where compaction events are logged (JSON lines) |
