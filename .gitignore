@@ -8,3 +8,8 @@ logs/
 *.log
 .pytest_cache/
 .DS_Store
+
+# Working scratch -- editor backups, staged deletions, and the
+# runtime log/span directory that now defaults inside the repo.
+*.backup-*
+_to_delete*/

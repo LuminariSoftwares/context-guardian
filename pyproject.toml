@@ -1,0 +1,32 @@
+# Pytest configuration.
+#
+# WHY THIS FILE EXISTS
+#     There was no pytest.ini, pyproject.toml, setup.cfg or conftest.py in this
+#     repo. pytest-asyncio appears only in requirements-dev.txt, while the
+#     README's install step is `pip install -r requirements.txt`. Without the
+#     plugin installed, pytest does NOT run `async def` tests -- it warns,
+#     SKIPS them, and exits 0.
+#
+#     Every test guarding the empty-summary data-loss bug is async. So a fresh
+#     checkout following the README could run the suite, see green, and have
+#     executed none of them. Same shape as the bug itself: a check that reports
+#     success without checking the thing.
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+testpaths = ["tests"]
+addopts = "--strict-markers --strict-config"
+filterwarnings = [
+    # Everything stays visible but non-fatal: this repo targets whatever
+    # fastapi/httpx a user already has, and turning their deprecations into
+    # errors would fail the suite for reasons that are not our correctness.
+    "default",
+    # ...except a coroutine that was collected and never awaited. That is the
+    # silent-skip failure above, and it must be an ERROR.
+    #
+    # Matched by MESSAGE, not by warning class. The first version of this file
+    # named `pytest.PytestUnhandledCoroutineWarning`, which does not exist in
+    # every pytest version -- and a bad filter here is a hard config error that
+    # stops the suite from running at all. A message regex works across
+    # versions and degrades to "matches nothing" rather than to a crash.
+    "error:coroutine .* was never awaited",
+]
