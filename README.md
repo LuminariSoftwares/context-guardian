@@ -1,4 +1,6 @@
 # Context Guardian
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)
 
 A tiny proxy that sits in front of any OpenAI-compatible LLM backend (Ollama, LiteLLM, Headroom, vLLM, LM Studio, and similar) and forces a conversation-history compaction *before* the context window fills up — instead of letting requests grow until the backend hard-errors and the session dies.
 
