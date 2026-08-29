@@ -4,6 +4,10 @@
 
 A tiny proxy that sits in front of any OpenAI-compatible LLM backend (Ollama, LiteLLM, Headroom, vLLM, LM Studio, and similar) and forces a conversation-history compaction *before* the context window fills up — instead of letting requests grow until the backend hard-errors and the session dies.
 
+![Context Guardian compaction monitor: a request climbs past the budget line, gets compacted, and drops back under it](context_guardian_demo.gif)
+
+*The `/guardian/health` compaction monitor: a request grows past the window, Guardian compacts it, and the session keeps going instead of hard-erroring.*
+
 ## Why this exists
 
 Claude-Code-style coding CLIs (Claude Code itself, and OpenAI-compatible-backend tools like OpenClaude) ship with a built-in auto-compact feature. That feature depends on accurate, real-time token-usage accounting coming back from the API in the exact shape the CLI expects. Point one of these tools at a local model through an OpenAI-compatible bridge — Ollama's `/v1` endpoint, a LiteLLM proxy, a Headroom proxy — and that accounting is frequently missing, wrong, or shaped differently, so auto-compact silently never fires.
