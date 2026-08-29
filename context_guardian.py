@@ -1161,7 +1161,8 @@ async def proxy(path: str, request: Request):
     )
 
 
-if __name__ == "__main__":
+def main():
+    """Console entry point (`context-guardian`) and `python context_guardian.py`."""
     import uvicorn
     log.info(
         "Starting Context Guardian on port %d, forwarding to %s (num_ctx=%d, threshold=%.2f)",
@@ -1177,3 +1178,7 @@ if __name__ == "__main__":
     # If a container ever does need it, set GUARDIAN_HOST deliberately rather
     # than reverting this line.
     uvicorn.run(app, host=GUARDIAN_HOST, port=GUARDIAN_PORT)
+
+
+if __name__ == "__main__":
+    main()

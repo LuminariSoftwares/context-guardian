@@ -1,3 +1,47 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "context-guardian"
+version = "0.4.0"
+description = "A tiny proxy in front of any OpenAI-compatible LLM backend that compacts conversation history before the context window fills, so local-model coding CLIs don't hard-die from overflow."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "LuminariSoftwares" }]
+keywords = ["ollama", "local-llm", "llm", "openai-api", "proxy", "context-window", "context-management", "litellm", "mcp", "coding-assistant"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/LuminariSoftwares/context-guardian"
+Repository = "https://github.com/LuminariSoftwares/context-guardian"
+Changelog = "https://github.com/LuminariSoftwares/context-guardian/blob/main/CHANGELOG.md"
+Issues = "https://github.com/LuminariSoftwares/context-guardian/issues"
+
+[project.scripts]
+context-guardian = "context_guardian:main"
+
+[tool.setuptools]
+py-modules = ["context_guardian"]
+
 # Pytest configuration.
 #
 # WHY THIS FILE EXISTS

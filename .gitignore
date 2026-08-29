@@ -13,3 +13,8 @@ logs/
 # runtime log/span directory that now defaults inside the repo.
 *.backup-*
 _to_delete*/
+
+# python build artifacts
+dist/
+build/
+*.egg-info/
