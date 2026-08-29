@@ -47,7 +47,7 @@ and only one of them is Guardian's:
 | Problem | What fixes it |
 |---|---|
 | Conversation history grows until the window fills | Guardian |
-| Two thirds of the window is gone before you type | Loading fewer tools |
+| Two thirds of the window is gone before you type | Loading fewer tools, or [Tool Guardian](https://github.com/LuminariSoftwares/tool-guardian) |
 
 Guardian will now tell you which one you have. It logs a `tool_budget` event the
 first time it sees a given tool payload, and warns outright when the tool
@@ -62,6 +62,12 @@ If you see that, no proxy setting will help you. Most MCP-capable CLIs let you
 scope which servers load per session — Claude Code and OpenClaude both accept
 `--mcp-config <file>` together with `--strict-mcp-config`, which makes that file
 the only source of MCP servers for the session.
+
+**Companion project — [Tool Guardian](https://github.com/LuminariSoftwares/tool-guardian)**
+(`pip install tool-guardian`) does the other half of this. It fronts your MCP servers behind three
+generic tools and reveals the rest on demand, so the tool definitions stop being re-sent on every
+request in the first place. Context Guardian can't compact that fixed tool floor — Tool Guardian
+removes it. Use them together: **one trims the conversation, the other trims the tools.**
 
 One consequence worth expecting: **after upgrading, Guardian compacts sooner and
 more often.** It is measuring the whole request now instead of a fraction of it.
