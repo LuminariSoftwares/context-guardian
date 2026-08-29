@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.5.1 - Compaction monitor: watch each compaction happen
+
+Additive, dashboard-only. No change to the proxy's behaviour.
+
+The `/guardian/health` dashboard gained a **compaction monitor**. A 3-second
+snapshot could never show the thing Guardian actually does — a request climbs
+past the budget, gets compacted, and drops back down — because the drop happened
+between polls. Now every compaction is recorded per-run and replayed visually:
+
+- A **before → after bar** animates the request climbing over the budget line
+  (red) and dropping back under it (green), so the compaction is something you
+  *see*, not infer from a counter.
+- A **per-compaction dropdown** lets you step through every compaction in the
+  current run and read its exact before/after tokens, tokens saved, and messages
+  evicted.
+- An **advice box** appears when the fixed floor (tools + system prompt) is a
+  large share of the budget — the case where compaction can't help and the real
+  fix is loading fewer MCP servers.
+
+New read-only endpoint **`GET /guardian/events`** returns the current run's
+compaction records (parsed from the existing log; bounded tail read; fail-open).
+The compaction log now carries `run_id` and `compaction_index` so events can be
+scoped to the running process.
+
 ## 0.5.0 - Visibility: you can now see what the proxy is doing
 
 Additive release. No behavioural change to compaction itself — everything

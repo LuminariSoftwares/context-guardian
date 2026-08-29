@@ -121,7 +121,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 # PyPI, importlib.metadata reports the same string off the wheel; this constant
 # is the fallback for a bare `python context_guardian.py` run out of a checkout,
 # where no distribution metadata exists. Keep it in lockstep with pyproject.toml.
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 from starlette.background import BackgroundTask
 
 # Load .env BEFORE any config is read.
@@ -1088,6 +1088,11 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
     _state["tokens_saved_total"] += tokens_saved
     log_event({
         "event": "compaction",
+        # RUN_ID scopes an event to this process, so /guardian/events (and the
+        # dashboard's compaction monitor) can show only the current session's
+        # compactions rather than everything ever logged to this file.
+        "run_id": RUN_ID,
+        "compaction_index": _state["compactions_performed"],
         "messages_before": len(messages),
         "messages_after": len(new_messages),
         "estimated_tokens_before": estimated,
@@ -1260,10 +1265,11 @@ async def stats():
         # 2026-08-21 to discover a process 51 minutes behind the source.
         "keep_summaries": KEEP_SUMMARIES,
         "keep_spans": KEEP_SPANS,
-        "code_version": "0.5.0-tools+spans+counts-tool-calls"
+        "code_version": "0.5.1-tools+spans+counts-tool-calls"
                         "+renders-tool-calls+nonempty-summary-guard"
                         "+fenced-transcript+tool-pair-safe-cut+portable-paths"
-                        "+verbose-banner+cost-compare+health-view+update-check",
+                        "+verbose-banner+cost-compare+health-view+update-check"
+                        "+compaction-monitor+events-endpoint",
         "version": guardian_version(),
         "latest_version": (_update_notice or {}).get("latest"),
         "update_available": _update_notice is not None,
@@ -1284,6 +1290,49 @@ async def stats():
         **_state,
         "note": ("last_known_total_tokens now INCLUDES the tools array. "
                  "last_tool_tokens is the part compaction cannot touch."),
+    })
+
+
+@app.get("/guardian/events")
+async def events(limit: int = 50):
+    """The compaction history for THIS run, newest last, read from the log.
+
+    Every compaction already writes a full record to GUARDIAN_LOG_PATH; this just
+    reads them back so the dashboard's compaction monitor can show each event's
+    before/after instead of only the latest aggregate. Bounded tail read so a
+    long-lived proxy with a big log does not pay for the whole file each poll.
+    Fail-open: any read/parse problem yields an empty list, never a 500."""
+    out = []
+    try:
+        if LOG_PATH.exists():
+            size = LOG_PATH.stat().st_size
+            with LOG_PATH.open("rb") as f:
+                if size > 512 * 1024:
+                    f.seek(-512 * 1024, 2)
+                    f.readline()  # drop the partial first line after the seek
+                raw = f.read().decode("utf-8", "replace")
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                if ev.get("event") == "compaction" and ev.get("run_id") == RUN_ID:
+                    out.append(ev)
+    except Exception:
+        out = []
+    try:
+        limit = max(1, min(int(limit), 500))
+    except (TypeError, ValueError):
+        limit = 50
+    return JSONResponse({
+        "run_id": RUN_ID,
+        "count": len(out),
+        "num_ctx": NUM_CTX,
+        "effective_input_budget": effective_threshold(),
+        "events": out[-limit:],
     })
 
 
@@ -1308,21 +1357,42 @@ _HEALTH_HTML = """<!doctype html>
   .pill{padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600}
   .ok{background:#132d1a;color:#3fb950}.warn{background:#3d2a10;color:#e3b341}
   .bad{background:#3d1518;color:#f85149}
-  main{padding:22px;display:grid;gap:16px;
-       grid-template-columns:repeat(auto-fit,minmax(210px,1fr));max-width:1000px}
+  main{padding:0 22px 22px;display:grid;gap:16px;
+       grid-template-columns:repeat(auto-fit,minmax(210px,1fr));max-width:1040px}
   .card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:16px}
-  .card h2{margin:0 0 6px;font-size:12px;font-weight:600;text-transform:uppercase;
+  .card h2,.panel h2{margin:0;font-size:12px;font-weight:600;text-transform:uppercase;
            letter-spacing:.05em;color:#8b949e}
+  .card h2{margin-bottom:6px}
   .big{font-size:26px;font-weight:700}
   .sub{color:#8b949e;font-size:12px;margin-top:4px}
   .bar{height:8px;border-radius:6px;background:#21262d;margin-top:10px;overflow:hidden}
   .bar > i{display:block;height:100%;background:#3fb950;transition:width .4s}
   .bar.warn > i{background:#e3b341}.bar.bad > i{background:#f85149}
-  #notice{margin:0 22px;padding:12px 16px;border-radius:8px;background:#182b4d;
+  .panel{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px;
+         margin:22px 22px 16px;max-width:996px}
+  .panel-head{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+  select{background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;
+         padding:5px 8px;font:inherit;max-width:100%}
+  .track{position:relative;height:28px;border-radius:6px;background:#21262d;
+         margin:16px 0 6px;overflow:hidden}
+  .track > .fill{position:absolute;left:0;top:0;bottom:0;width:0;border-radius:6px;
+         background:#3fb950;transition:width .7s cubic-bezier(.4,0,.2,1),background .3s}
+  .track > .fill.over{background:#f85149}
+  .track > .line{position:absolute;top:-4px;bottom:-4px;width:2px;background:#e3b341;left:66.66%}
+  .scale{display:flex;justify-content:space-between;color:#8b949e;font-size:11px}
+  .scale .mid{color:#e3b341}
+  .nums{margin-top:12px;display:flex;gap:10px;flex-wrap:wrap;align-items:baseline}
+  .nums b{font-size:18px}
+  .arrow{color:#8b949e}
+  .save{color:#3fb950;font-weight:600}
+  .advice{margin:0 22px 16px;padding:12px 16px;border-radius:8px;background:#3d2a10;
+          border:1px solid #9e6a1c;color:#e3b341;max-width:996px;font-size:13px}
+  #notice{margin:0 22px 16px;padding:12px 16px;border-radius:8px;background:#182b4d;
           border:1px solid #1f6feb;display:none}
   #notice.show{display:block}
   code{background:#21262d;padding:1px 5px;border-radius:4px}
-  footer{padding:14px 22px;color:#8b949e;font-size:12px}
+  footer{padding:6px 22px 22px;color:#8b949e;font-size:12px}
+  [hidden]{display:none!important}
 </style></head><body>
 <header>
   <h1>Context Guardian</h1>
@@ -1331,54 +1401,124 @@ _HEALTH_HTML = """<!doctype html>
   <span class="ver" id="upstream"></span>
 </header>
 <div id="notice"></div>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>Compaction monitor</h2>
+    <select id="pick"><option value="latest">Latest (auto-follow)</option></select>
+  </div>
+  <div class="sub" id="mono-sub">Waiting for the first compaction this run...</div>
+  <div class="track"><div class="line"></div><div class="fill" id="fill"></div></div>
+  <div class="scale"><span>0</span><span class="mid">budget (100%)</span><span>150%+</span></div>
+  <div class="nums" id="nums"></div>
+</section>
+
+<div class="advice" id="advice" hidden></div>
 <main id="cards"></main>
-<footer>Auto-refreshing every 3s from <code>/guardian/stats</code>. Local, unauthenticated, loopback-only.</footer>
+<footer>Auto-refreshing every 3s from <code>/guardian/stats</code> + <code>/guardian/events</code>. Local, unauthenticated, loopback-only.</footer>
+
 <script>
 const $=id=>document.getElementById(id);
 const fmt=n=>n==null?"-":Number(n).toLocaleString();
-function card(title,big,sub,bar){
-  let h=`<div class="card"><h2>${title}</h2><div class="big">${big}</div>`;
-  if(sub)h+=`<div class="sub">${sub}</div>`;
-  if(bar!=null){const c=bar>=95?"bad":bar>=85?"warn":"";
-    h+=`<div class="bar ${c}"><i style="width:${Math.min(100,bar)}%"></i></div>`;}
-  return h+`</div>`;
-}
+const TRACKMAX=150;                       // the track spans 0..150% of budget
+const w=p=>Math.min(TRACKMAX,Math.max(0,p))/TRACKMAX*100+"%";
+let evtCount=-1, mode="latest", budget=1, curEvents=[];
+
 function human(s){s=Math.floor(s||0);const d=Math.floor(s/86400);s%=86400;
   const h=Math.floor(s/3600);s%=3600;const m=Math.floor(s/60);
   return (d?d+"d ":"")+(h?h+"h ":"")+(m?m+"m ":"")+(s%60)+"s";}
+function card(title,big,sub,bar){
+  let h=`<div class="card"><h2>${title}</h2><div class="big">${big}</div>`;
+  if(sub)h+=`<div class="sub">${sub}</div>`;
+  if(bar!=null){const c=bar>=100?"bad":bar>=85?"warn":"";
+    h+=`<div class="bar ${c}"><i style="width:${Math.min(100,bar)}%"></i></div>`;}
+  return h+`</div>`;
+}
+function pct(t){return Math.round(100*t/budget);}
+function tfmt(ts){try{return new Date(ts).toLocaleTimeString();}catch(e){return ts||"";}}
+
+// Animate the playhead: climb to BEFORE (over budget, red), then drop to AFTER.
+function play(ev){
+  const f=$("fill"), bp=pct(ev.estimated_tokens_before), ap=pct(ev.estimated_tokens_after);
+  f.style.transition="none"; f.style.width="0%"; f.classList.add("over");
+  requestAnimationFrame(()=>requestAnimationFrame(()=>{
+    f.style.transition=""; f.style.width=w(bp); f.classList.toggle("over",bp>=100);
+    setTimeout(()=>{ f.style.width=w(ap); f.classList.toggle("over",ap>=100); },850);
+  }));
+  $("mono-sub").innerHTML=`Compaction <b>#${ev.compaction_index}</b> &middot; ${tfmt(ev.timestamp)} `+
+    `&middot; ${ev.messages_before}&rarr;${ev.messages_after} messages`;
+  $("nums").innerHTML=
+    `<span>before <b>${fmt(ev.estimated_tokens_before)}</b> (${bp}%)</span>`+
+    `<span class="arrow">&rarr;</span>`+
+    `<span>after <b>${fmt(ev.estimated_tokens_after)}</b> (${ap}%)</span>`+
+    `<span class="save">&nbsp;saved ${fmt(ev.tokens_saved)} tokens</span>`+
+    `<span class="sub">(tool floor ${fmt(ev.tool_tokens)} kept)</span>`;
+}
+function showNone(){
+  $("fill").style.width="0%";
+  $("mono-sub").textContent="No compactions yet this run — drive some traffic and they appear here.";
+  $("nums").innerHTML="";
+}
+
 async function tick(){
-  let s;
-  try{s=await (await fetch("/guardian/stats",{cache:"no-store"})).json();}
-  catch(e){$("status").className="pill bad";$("status").textContent="unreachable";return;}
+  let s,e;
+  try{
+    [s,e]=await Promise.all([
+      fetch("/guardian/stats",{cache:"no-store"}).then(r=>r.json()),
+      fetch("/guardian/events?limit=200",{cache:"no-store"}).then(r=>r.json())
+    ]);
+  }catch(err){$("status").className="pill bad";$("status").textContent="unreachable";return;}
   $("status").className="pill ok";$("status").textContent="live";
   $("ver").textContent="v"+(s.version||"?");
   $("upstream").textContent="-> "+(s.upstream||"");
-  const budget=s.effective_input_budget||s.num_ctx||1;
-  const used=s.last_known_total_tokens||0;
-  const pct=Math.round(100*used/budget);
-  const rejected=s.summaries_rejected_empty||0;
-  const cards=[
-    card("Context window",`${pct}%`,
-         `${fmt(used)} / ${fmt(budget)} usable tokens`,pct),
-    card("Compactions",fmt(s.compactions_performed),
-         `${fmt(s.requests_seen)} requests seen`),
+  budget=e.effective_input_budget||s.effective_input_budget||s.num_ctx||1;
+
+  const used=s.last_known_total_tokens||0, up=pct(used), rejected=s.summaries_rejected_empty||0;
+  $("cards").innerHTML=[
+    card("Latest request",`${up}%`,`${fmt(used)} / ${fmt(budget)} budget &middot; red = over`,up),
+    card("Compactions",fmt(s.compactions_performed),`${fmt(s.requests_seen)} requests seen`),
     card("Tokens saved",fmt(s.tokens_saved_total),
-         s.cost_saved_usd!=null?`~$${Number(s.cost_saved_usd).toFixed(4)} @ $${s.cost_per_1m_input_usd}/1M`
-                                :"set GUARDIAN_COST_PER_1M_INPUT_USD to price it"),
-    card("Tool definitions",fmt(s.last_tool_tokens||0),
-         "fixed floor - compaction can't touch it"),
-    card("Rejected summaries",fmt(rejected),
-         rejected?"empty/degenerate - investigate":"none - healthy"),
-    card("Uptime",human(s.uptime_seconds),`run ${s.run_id||""}`),
-  ];
-  $("cards").innerHTML=cards.join("");
-  // colour the rejected card red if non-zero
-  if(rejected){const c=$("cards").children[4];c.querySelector(".big").style.color="#f85149";}
+      s.cost_saved_usd!=null?`~$${Number(s.cost_saved_usd).toFixed(4)} @ $${s.cost_per_1m_input_usd}/1M`
+                            :"set GUARDIAN_COST_PER_1M_INPUT_USD to price it"),
+    card("Tool definitions",fmt(s.last_tool_tokens||0),"fixed floor - compaction can't touch it"),
+    card("Rejected summaries",fmt(rejected),rejected?"empty/degenerate - investigate":"none - healthy"),
+    card("Uptime",human(s.uptime_seconds),`run ${s.run_id||""}`)
+  ].join("");
+  if(rejected){$("cards").children[4].querySelector(".big").style.color="#f85149";}
+
+  // Advice: the fixed floor is too large to leave room to compact into.
+  const floor=s.last_tool_tokens||0, adv=$("advice");
+  if(floor>0 && floor/budget>=0.4){
+    adv.hidden=false;
+    adv.innerHTML=`Heads-up: tool definitions are <b>${fmt(floor)}</b> tokens — `+
+      `${Math.round(100*floor/budget)}% of the ${fmt(budget)}-token budget. Compaction manages the `+
+      `conversation on top of this floor but cannot shrink the floor itself. To free real room, load `+
+      `fewer MCP servers (e.g. <code>--mcp-config &lt;file&gt; --strict-mcp-config</code>).`;
+  } else { adv.hidden=true; }
+
   const n=$("notice");
   if(s.update_available){n.className="show";
     n.innerHTML=`Update available: <b>${s.version}</b> installed, <b>${s.latest_version}</b> on PyPI &mdash; <code>pip install -U context-guardian</code>`;}
   else n.className="";
+
+  // Compaction monitor: rebuild the dropdown only when the event set changes,
+  // so a browsing user's selection is not reset every 3s.
+  curEvents=e.events||[];
+  if(curEvents.length!==evtCount){
+    const prev=$("pick").value;
+    $("pick").innerHTML=`<option value="latest">Latest (auto-follow)</option>`+
+      curEvents.map((ev,i)=>`<option value="${i}">#${ev.compaction_index} · ${tfmt(ev.timestamp)} · saved ${fmt(ev.tokens_saved)}</option>`).join("");
+    $("pick").value=(mode==="latest")?"latest":prev;
+    evtCount=curEvents.length;
+    if(curEvents.length===0){ showNone(); }
+    else if(mode==="latest"){ play(curEvents[curEvents.length-1]); }
+  }
 }
+$("pick").addEventListener("change",ev=>{
+  const v=ev.target.value;
+  if(v==="latest"){ mode="latest"; curEvents.length?play(curEvents[curEvents.length-1]):showNone(); }
+  else { mode="fixed"; const c=curEvents[+v]; if(c)play(c); }
+});
 tick();setInterval(tick,3000);
 </script></body></html>"""
 
