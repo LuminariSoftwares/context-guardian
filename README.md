@@ -127,6 +127,10 @@ cp .env.example .env
 | `GUARDIAN_MIN_TRANSCRIPT_CHARS` | `80` | If the messages being evicted render to less than this, Guardian refuses to summarise rather than summarising nothing |
 | `GUARDIAN_TOOL_ARG_CHARS` | `300` | How much of a tool call's arguments reaches the summariser. The full text is in the span |
 | `GUARDIAN_SUMMARY_REASONING_EFFORT` | unset | Passed as `reasoning_effort` on the summarisation call only. Non-standard, so off by default; `low` roughly halved summarisation latency on gpt-oss |
+| `GUARDIAN_VERBOSE` | `1` | Print a visible multi-line banner on every compaction (what it cut, tokens before/after, tokens saved). Set `0` for the old single-line log entry |
+| `GUARDIAN_COST_PER_1M_INPUT_USD` | `0` | Price of 1M input tokens on the hosted API you're *avoiding* by running locally. When set, Guardian reports the running dollar value of the tokens compaction has kept you from re-sending. `0` (default) omits the cost line — you're on a local model, there's no real bill |
+| `GUARDIAN_VERSION_CHECK` | `1` | On startup, ask PyPI once (2s timeout, cached 24h, fully fail-open) whether a newer `context-guardian` exists and print one line if so. Set `0` to disable — airgapped/privacy setups never touch the network |
+| `GUARDIAN_VERSION_CACHE` | `<repo>/logs/.version_check_cache.json` | Where the update check caches PyPI's answer so frequent restarts don't re-hit the network (24h TTL) |
 
 **A note on timeouts:** local "thinking"/reasoning models can go silent for a long time before their first output token. If you see `500` errors appear only on real (non-trivial) requests after a long pause, raise `GUARDIAN_UPSTREAM_TIMEOUT` before assuming something is broken — the default 5-second timeout most HTTP clients ship with is sized for ordinary REST APIs, not local LLM inference, which is exactly the bug this project's own commit history caught during development.
 
@@ -148,7 +152,7 @@ Then point your CLI's `OPENAI_BASE_URL` at `http://localhost:8786/v1` (or whatev
      -H "Content-Type: application/json" \
      -d '{"model":"<your-model>","messages":[{"role":"user","content":"say hi"}]}'
    ```
-4. Check `GET http://localhost:8786/guardian/stats` for the running token estimate and compaction count.
+4. Check `GET http://localhost:8786/guardian/stats` for the running token estimate and compaction count — or open `http://localhost:8786/guardian/health` in a browser for the live dashboard (window usage, compactions, tokens/cost saved, and any update notice), which just renders that same JSON on a 3-second refresh.
 5. Force a compaction test: temporarily set `GUARDIAN_NUM_CTX` and `GUARDIAN_COMPACT_THRESHOLD` low (e.g. `NUM_CTX=2000`, `THRESHOLD=0.5`), then send a conversation with several long messages. Confirm a compaction log entry appears at `GUARDIAN_LOG_PATH` and the request that actually reaches your backend is smaller than what was sent in.
 6. Only after that, point your CLI's `OPENAI_BASE_URL` at Guardian and test with a real session.
 

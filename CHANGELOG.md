@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.5.0 - Visibility: you can now see what the proxy is doing
+
+Additive release. No behavioural change to compaction itself — everything
+0.4.0 did, 0.5.0 does identically. This adds four ways to *see* it, all
+fail-open and all off-switchable.
+
+### Verbose compaction indicator (`GUARDIAN_VERBOSE`, default on)
+
+Every compaction now prints a visible banner — messages before/after, estimated
+tokens before/after, tokens saved, how much of the window is now used, and where
+the evicted transcript was archived — instead of a single line that scrolls past
+in a busy log. A compaction silently reshaping your context is exactly the moment
+you want to see something. Set `GUARDIAN_VERBOSE=0` for the old one-line log.
+
+### Cost-compare (`GUARDIAN_COST_PER_1M_INPUT_USD`, default 0 = off)
+
+Guardian now tracks the cumulative tokens compaction has removed from the request
+stream (`tokens_saved_total` in `/guardian/stats`). Set this to the input price
+of whatever hosted API you're avoiding by running locally, and Guardian reports
+the running dollar value of what it saved you from re-sending. Default 0 omits
+the figure — on a local model there is no real bill.
+
+### Health view (`GET /guardian/health`)
+
+A self-contained HTML dashboard — no build step, no external asset, no CDN — that
+renders `/guardian/stats` on a 3-second refresh: window usage, compaction count,
+tokens/cost saved, the tool-definition floor, a red flag if any summary was
+rejected as empty, uptime, and an update notice. All data still lives in the one
+JSON route; this is only a readable face on it. Loopback-only, same as the proxy.
+
+### Startup update check (`GUARDIAN_VERSION_CHECK`, default on)
+
+pip does not tell a user their installed package is out of date. On startup
+Guardian now asks PyPI once — on a daemon thread, 2-second timeout, result cached
+24h — whether a newer `context-guardian` exists, and prints a single line if so.
+Offline, airgapped, or PyPI-down all produce silence, never a delay or a
+traceback. Set `GUARDIAN_VERSION_CHECK=0` to disable it entirely. The check runs
+only from `main()`, so importing the app (as the test suite does) never touches
+the network.
+
 ## 0.4.0 - Compaction stops silently deleting your conversation
 
 **If you are running 0.2.0 or 0.3.x, upgrade.** Under 0.2.0 this proxy could

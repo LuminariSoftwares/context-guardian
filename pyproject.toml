@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "context-guardian"
-version = "0.4.0"
+version = "0.5.0"
 description = "A tiny proxy in front of any OpenAI-compatible LLM backend that compacts conversation history before the context window fills, so local-model coding CLIs don't hard-die from overflow."
 readme = "README.md"
 requires-python = ">=3.10"

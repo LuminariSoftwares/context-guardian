@@ -107,13 +107,21 @@ HOW TO TEST BEFORE TRUSTING IT (same discipline as scrape_etsy_trends.py):
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+
+# Single source of truth for the running code's version. Used by /guardian/stats,
+# the /guardian/health dashboard, and the PyPI update check. When installed from
+# PyPI, importlib.metadata reports the same string off the wheel; this constant
+# is the fallback for a bare `python context_guardian.py` run out of a checkout,
+# where no distribution metadata exists. Keep it in lockstep with pyproject.toml.
+__version__ = "0.5.0"
 from starlette.background import BackgroundTask
 
 # Load .env BEFORE any config is read.
@@ -165,6 +173,37 @@ CHARS_PER_TOKEN_ESTIMATE = float(os.environ.get("GUARDIAN_CHARS_PER_TOKEN", "3.5
 # request and the model IS charged for it. Set GUARDIAN_COUNT_TOOLS=0 to get
 # the old messages-only behaviour back if this ever needs bisecting.
 COUNT_TOOLS = os.environ.get("GUARDIAN_COUNT_TOOLS", "1") not in ("0", "false", "False")
+
+# --- 0.5.0 additions ---------------------------------------------------------
+# VERBOSE: print a visible multi-line banner on every compaction instead of the
+# single terse INFO line. Default ON -- a compaction silently reshaping your
+# context is exactly the moment an operator wants to SEE something. Set
+# GUARDIAN_VERBOSE=0 for the old one-line behaviour.
+VERBOSE = os.environ.get("GUARDIAN_VERBOSE", "1") not in ("0", "false", "False")
+
+# COST_PER_1M_INPUT_USD: what 1,000,000 input tokens would cost on whatever
+# hosted API you are AVOIDING by running locally. Guardian evicts tokens from
+# every request after a compaction; multiplied out that is a running figure for
+# "tokens this proxy stopped you from re-sending". Default 0.0 => the cost line
+# is simply omitted (you are on a local model; there is no real bill). Set it to
+# e.g. 0.15 to frame the savings against a specific provider's input price.
+try:
+    COST_PER_1M_INPUT_USD = float(os.environ.get("GUARDIAN_COST_PER_1M_INPUT_USD", "0"))
+except ValueError:
+    COST_PER_1M_INPUT_USD = 0.0
+
+# VERSION_CHECK: on startup, ask PyPI once whether a newer context-guardian
+# exists and print a single line if so. Fully fail-open -- offline, airgapped,
+# or PyPI-down all produce silence, never a delay or a traceback. Set
+# GUARDIAN_VERSION_CHECK=0 to disable (airgapped / privacy setups).
+VERSION_CHECK = os.environ.get("GUARDIAN_VERSION_CHECK", "1") not in ("0", "false", "False")
+# Result is cached here so frequent restarts do not hammer PyPI; a known-newer
+# result keeps printing from cache even while offline.
+VERSION_CACHE_PATH = Path(os.environ.get(
+    "GUARDIAN_VERSION_CACHE", str(REPO_DIR / "logs" / ".version_check_cache.json")))
+VERSION_CACHE_TTL_SECONDS = 86_400  # re-ask PyPI at most once a day
+PYPI_JSON_URL = "https://pypi.org/pypi/context-guardian/json"
+# -----------------------------------------------------------------------------
 
 # Upstream timeouts. Backported from the public repo at 0.2.0, which made these
 # env-tunable while this copy hardcoded them at the call site. Same defaults --
@@ -313,7 +352,19 @@ _state = {
     # reasoning model emitting only a reasoning channel). Non-zero means the
     # backend is not returning what an OpenAI client expects.
     "summaries_from_alt_field": 0,
+    # Cumulative estimated tokens removed from the request stream by compaction
+    # (before-minus-after, summed over every compaction this run). This is the
+    # basis of the cost-compare figure -- see COST_PER_1M_INPUT_USD.
+    "tokens_saved_total": 0,
 }
+
+# When this process started, for the health view's uptime line.
+STARTED_AT = time.time()
+
+# Populated by the background PyPI check (or the cache) if a newer version
+# exists: {"latest": "0.6.0"}. None means "no newer version known" -- which is
+# also the permanent state when VERSION_CHECK is off or PyPI was unreachable.
+_update_notice: Optional[Dict[str, str]] = None
 
 # One long-lived client for the life of the app, NOT a per-request
 # "async with" client. A per-request client that gets closed when the
@@ -1024,27 +1075,172 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
     new_payload = dict(payload)
     new_payload["messages"] = new_messages
 
+    # Compute the "after" figures once and reuse -- estimate_tokens walks every
+    # message, so calling it three times on the request path was pure waste.
+    msgs_after_tokens = estimate_tokens(new_messages)
+    tokens_after = msgs_after_tokens + tool_tokens
+    # Tokens this compaction removed from the outgoing request. Clamp at 0: a
+    # summary is normally far smaller than what it replaced, but a pathological
+    # tiny eviction should never subtract from the running savings total.
+    tokens_saved = max(0, estimated - tokens_after)
+
     _state["compactions_performed"] += 1
+    _state["tokens_saved_total"] += tokens_saved
     log_event({
         "event": "compaction",
         "messages_before": len(messages),
         "messages_after": len(new_messages),
         "estimated_tokens_before": estimated,
-        "estimated_tokens_after": estimate_tokens(new_messages) + tool_tokens,
+        "estimated_tokens_after": tokens_after,
         "message_tokens_before": message_tokens,
-        "message_tokens_after": estimate_tokens(new_messages),
+        "message_tokens_after": msgs_after_tokens,
         "tool_tokens": tool_tokens,
+        "tokens_saved": tokens_saved,
         "span_file": span_path,
         "span_written": span_path is not None,
         "summary_preview": summary[:500],
     })
-    log.info(
-        "Compacted %d messages -> %d. Estimated tokens %d -> %d "
-        "(of which %d is tool definitions, unchanged).",
-        len(messages), len(new_messages), estimated,
-        estimate_tokens(new_messages) + tool_tokens, tool_tokens,
-    )
+
+    if VERBOSE:
+        # A visible banner, not a line that scrolls past in a busy log. This is
+        # the moment the operator most wants to know the proxy acted and that it
+        # did not silently drop anything -- span_written says the evicted text is
+        # on disk, tokens_saved says how much room it bought.
+        pct = (100.0 * tokens_after / NUM_CTX) if NUM_CTX else 0.0
+        span_note = (f"archived -> {span_path}" if span_path
+                     else "NOT archived (span write skipped)")
+        cost_line = ""
+        if COST_PER_1M_INPUT_USD > 0:
+            saved_usd = _state["tokens_saved_total"] / 1_000_000 * COST_PER_1M_INPUT_USD
+            cost_line = (f"\n  saved so far : ~${saved_usd:,.4f} "
+                         f"(@ ${COST_PER_1M_INPUT_USD}/1M input tok)")
+        log.info(
+            "\n"
+            "  +-- COMPACTION #%d ------------------------------------------\n"
+            "  messages     : %d -> %d\n"
+            "  est. tokens  : %d -> %d  (saved ~%d; %d are tool defs, fixed)\n"
+            "  window now   : %d / %d  (%.0f%%)\n"
+            "  transcript   : %s%s\n"
+            "  +-----------------------------------------------------------",
+            _state["compactions_performed"], len(messages), len(new_messages),
+            estimated, tokens_after, tokens_saved, tool_tokens,
+            tokens_after, NUM_CTX, pct, span_note, cost_line,
+        )
+    else:
+        log.info(
+            "Compacted %d messages -> %d. Estimated tokens %d -> %d "
+            "(of which %d is tool definitions, unchanged).",
+            len(messages), len(new_messages), estimated, tokens_after, tool_tokens,
+        )
     return new_payload
+
+
+def guardian_version() -> str:
+    """The running version. Prefers installed distribution metadata (authoritative
+    when pip-installed), falls back to the in-file __version__ for a bare checkout
+    run. Never raises."""
+    try:
+        from importlib.metadata import version, PackageNotFoundError
+        try:
+            return version("context-guardian")
+        except PackageNotFoundError:
+            return __version__
+    except Exception:  # pragma: no cover -- importlib always present on 3.8+
+        return __version__
+
+
+def cost_saved_usd() -> Optional[float]:
+    """Dollar value of the tokens compaction has removed from the request stream,
+    at the configured hosted-API input price. None when pricing is unset (the
+    local-model default) -- there is no real bill to compare against."""
+    if COST_PER_1M_INPUT_USD <= 0:
+        return None
+    return round(_state["tokens_saved_total"] / 1_000_000 * COST_PER_1M_INPUT_USD, 6)
+
+
+def _parse_ver(v: str):
+    """Best-effort (major, minor, patch...) tuple for comparing plain X.Y.Z
+    versions without a hard dependency on `packaging`. Non-numeric junk on a
+    component stops the parse there rather than raising, so a pre-release like
+    0.6.0rc1 compares as (0, 6, 0) -- deliberately conservative: we would rather
+    NOT nag about a pre-release than crash the check."""
+    parts = []
+    for chunk in str(v).split("."):
+        num = ""
+        for ch in chunk:
+            if ch.isdigit():
+                num += ch
+            else:
+                break
+        if num == "":
+            break
+        parts.append(int(num))
+    return tuple(parts)
+
+
+def _newer(latest: str, current: str) -> bool:
+    """True only when `latest` parses to a strictly greater version than
+    `current`. Any parse ambiguity returns False -- silence beats a false nag."""
+    try:
+        lt, ct = _parse_ver(latest), _parse_ver(current)
+        return bool(lt) and lt > ct
+    except Exception:
+        return False
+
+
+def _version_check_worker() -> None:
+    """Runs in a daemon thread from main(). Consults a 24h cache; only touches
+    the network when the cache is stale. Sets the module-level _update_notice if
+    a newer version exists. Every failure mode is swallowed -- this feature must
+    never delay startup, emit a traceback, or block a shutdown."""
+    global _update_notice
+    try:
+        current = guardian_version()
+        latest = None
+
+        # 1. Try the cache first.
+        try:
+            cached = json.loads(VERSION_CACHE_PATH.read_text(encoding="utf-8"))
+            if (time.time() - float(cached.get("checked_at", 0))) < VERSION_CACHE_TTL_SECONDS:
+                latest = str(cached.get("latest") or "") or None
+        except Exception:
+            latest = None
+
+        # 2. Cache miss/stale -> ask PyPI, with a tight timeout. Any error here
+        #    leaves `latest` as whatever the cache gave (possibly None) and we
+        #    simply do not nag this run.
+        if latest is None:
+            try:
+                resp = httpx.get(PYPI_JSON_URL, timeout=2.0,
+                                 headers={"Accept": "application/json"})
+                if resp.status_code == 200:
+                    latest = str(resp.json()["info"]["version"])
+                    try:
+                        VERSION_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                        VERSION_CACHE_PATH.write_text(
+                            json.dumps({"checked_at": time.time(), "latest": latest}),
+                            encoding="utf-8")
+                    except Exception:
+                        pass  # cache is an optimisation, not a requirement
+            except Exception:
+                return  # offline / PyPI down / anything -> stay silent
+
+        if latest and _newer(latest, current):
+            _update_notice = {"latest": latest, "current": current}
+            log.info(
+                "Update available: %s installed, %s on PyPI -> "
+                "pip install -U context-guardian", current, latest)
+    except Exception:  # pragma: no cover -- belt and suspenders
+        return
+
+
+def start_version_check() -> None:
+    """Kick the PyPI check on a daemon thread if enabled. Called from main() only,
+    so importing `app` (as the test suite does) never triggers a network call."""
+    if not VERSION_CHECK:
+        return
+    threading.Thread(target=_version_check_worker, name="cg-version-check",
+                     daemon=True).start()
 
 
 @app.get("/guardian/stats")
@@ -1064,9 +1260,17 @@ async def stats():
         # 2026-08-21 to discover a process 51 minutes behind the source.
         "keep_summaries": KEEP_SUMMARIES,
         "keep_spans": KEEP_SPANS,
-        "code_version": "0.4.0-tools+spans+counts-tool-calls"
+        "code_version": "0.5.0-tools+spans+counts-tool-calls"
                         "+renders-tool-calls+nonempty-summary-guard"
-                        "+fenced-transcript+tool-pair-safe-cut+portable-paths",
+                        "+fenced-transcript+tool-pair-safe-cut+portable-paths"
+                        "+verbose-banner+cost-compare+health-view+update-check",
+        "version": guardian_version(),
+        "latest_version": (_update_notice or {}).get("latest"),
+        "update_available": _update_notice is not None,
+        "verbose": VERBOSE,
+        "uptime_seconds": round(time.time() - STARTED_AT, 1),
+        "cost_per_1m_input_usd": COST_PER_1M_INPUT_USD,
+        "cost_saved_usd": cost_saved_usd(),
         "summary_reasoning_effort": SUMMARY_REASONING_EFFORT or None,
         "condense_prompt_is_fenced": "BEGIN_TRANSCRIPT" in CONDENSE_PROMPT,
         "min_transcript_chars": MIN_TRANSCRIPT_CHARS,
@@ -1081,6 +1285,109 @@ async def stats():
         "note": ("last_known_total_tokens now INCLUDES the tools array. "
                  "last_tool_tokens is the part compaction cannot touch."),
     })
+
+
+# The health view is one self-contained HTML file served inline -- no build
+# step, no external asset, nothing to host. It fetches /guardian/stats on a
+# timer and renders it, so all the real data still lives in that one JSON route;
+# this is only a readable face on it. Kept deliberately dependency-free so it
+# works on a locked-down box with no CDN reachable. Guardian binds loopback with
+# no auth, so this dashboard is only ever reachable from the same machine.
+_HEALTH_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Context Guardian - health</title>
+<style>
+  :root{color-scheme:light dark}
+  body{margin:0;font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+       background:#0d1117;color:#e6edf3}
+  header{padding:18px 22px;border-bottom:1px solid #30363d;display:flex;
+         align-items:baseline;gap:12px;flex-wrap:wrap}
+  header h1{font-size:18px;margin:0;font-weight:600}
+  .ver{color:#8b949e;font-size:13px}
+  .pill{padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600}
+  .ok{background:#132d1a;color:#3fb950}.warn{background:#3d2a10;color:#e3b341}
+  .bad{background:#3d1518;color:#f85149}
+  main{padding:22px;display:grid;gap:16px;
+       grid-template-columns:repeat(auto-fit,minmax(210px,1fr));max-width:1000px}
+  .card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:16px}
+  .card h2{margin:0 0 6px;font-size:12px;font-weight:600;text-transform:uppercase;
+           letter-spacing:.05em;color:#8b949e}
+  .big{font-size:26px;font-weight:700}
+  .sub{color:#8b949e;font-size:12px;margin-top:4px}
+  .bar{height:8px;border-radius:6px;background:#21262d;margin-top:10px;overflow:hidden}
+  .bar > i{display:block;height:100%;background:#3fb950;transition:width .4s}
+  .bar.warn > i{background:#e3b341}.bar.bad > i{background:#f85149}
+  #notice{margin:0 22px;padding:12px 16px;border-radius:8px;background:#182b4d;
+          border:1px solid #1f6feb;display:none}
+  #notice.show{display:block}
+  code{background:#21262d;padding:1px 5px;border-radius:4px}
+  footer{padding:14px 22px;color:#8b949e;font-size:12px}
+</style></head><body>
+<header>
+  <h1>Context Guardian</h1>
+  <span class="ver" id="ver">-</span>
+  <span class="pill ok" id="status">live</span>
+  <span class="ver" id="upstream"></span>
+</header>
+<div id="notice"></div>
+<main id="cards"></main>
+<footer>Auto-refreshing every 3s from <code>/guardian/stats</code>. Local, unauthenticated, loopback-only.</footer>
+<script>
+const $=id=>document.getElementById(id);
+const fmt=n=>n==null?"-":Number(n).toLocaleString();
+function card(title,big,sub,bar){
+  let h=`<div class="card"><h2>${title}</h2><div class="big">${big}</div>`;
+  if(sub)h+=`<div class="sub">${sub}</div>`;
+  if(bar!=null){const c=bar>=95?"bad":bar>=85?"warn":"";
+    h+=`<div class="bar ${c}"><i style="width:${Math.min(100,bar)}%"></i></div>`;}
+  return h+`</div>`;
+}
+function human(s){s=Math.floor(s||0);const d=Math.floor(s/86400);s%=86400;
+  const h=Math.floor(s/3600);s%=3600;const m=Math.floor(s/60);
+  return (d?d+"d ":"")+(h?h+"h ":"")+(m?m+"m ":"")+(s%60)+"s";}
+async function tick(){
+  let s;
+  try{s=await (await fetch("/guardian/stats",{cache:"no-store"})).json();}
+  catch(e){$("status").className="pill bad";$("status").textContent="unreachable";return;}
+  $("status").className="pill ok";$("status").textContent="live";
+  $("ver").textContent="v"+(s.version||"?");
+  $("upstream").textContent="-> "+(s.upstream||"");
+  const budget=s.effective_input_budget||s.num_ctx||1;
+  const used=s.last_known_total_tokens||0;
+  const pct=Math.round(100*used/budget);
+  const rejected=s.summaries_rejected_empty||0;
+  const cards=[
+    card("Context window",`${pct}%`,
+         `${fmt(used)} / ${fmt(budget)} usable tokens`,pct),
+    card("Compactions",fmt(s.compactions_performed),
+         `${fmt(s.requests_seen)} requests seen`),
+    card("Tokens saved",fmt(s.tokens_saved_total),
+         s.cost_saved_usd!=null?`~$${Number(s.cost_saved_usd).toFixed(4)} @ $${s.cost_per_1m_input_usd}/1M`
+                                :"set GUARDIAN_COST_PER_1M_INPUT_USD to price it"),
+    card("Tool definitions",fmt(s.last_tool_tokens||0),
+         "fixed floor - compaction can't touch it"),
+    card("Rejected summaries",fmt(rejected),
+         rejected?"empty/degenerate - investigate":"none - healthy"),
+    card("Uptime",human(s.uptime_seconds),`run ${s.run_id||""}`),
+  ];
+  $("cards").innerHTML=cards.join("");
+  // colour the rejected card red if non-zero
+  if(rejected){const c=$("cards").children[4];c.querySelector(".big").style.color="#f85149";}
+  const n=$("notice");
+  if(s.update_available){n.className="show";
+    n.innerHTML=`Update available: <b>${s.version}</b> installed, <b>${s.latest_version}</b> on PyPI &mdash; <code>pip install -U context-guardian</code>`;}
+  else n.className="";
+}
+tick();setInterval(tick,3000);
+</script></body></html>"""
+
+
+@app.get("/guardian/health")
+async def health():
+    """Human-readable health dashboard. All data comes from /guardian/stats;
+    this is just a readable face on it."""
+    return HTMLResponse(_HEALTH_HTML)
 
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST"])
@@ -1165,9 +1472,14 @@ def main():
     """Console entry point (`context-guardian`) and `python context_guardian.py`."""
     import uvicorn
     log.info(
-        "Starting Context Guardian on port %d, forwarding to %s (num_ctx=%d, threshold=%.2f)",
-        GUARDIAN_PORT, UPSTREAM_URL, NUM_CTX, COMPACT_THRESHOLD,
+        "Starting Context Guardian v%s on port %d, forwarding to %s "
+        "(num_ctx=%d, threshold=%.2f). Health view: http://%s:%d/guardian/health",
+        guardian_version(), GUARDIAN_PORT, UPSTREAM_URL, NUM_CTX,
+        COMPACT_THRESHOLD, GUARDIAN_HOST, GUARDIAN_PORT,
     )
+    # Fire-and-forget PyPI update check on a daemon thread. Only from main(), so
+    # importing `app` in the test suite never reaches the network.
+    start_version_check()
     # BIND 127.0.0.1, NOT 0.0.0.0 (fixed 2026-08-22, bandit B104).
     # This proxy fronts Headroom -> Ollama with NO authentication. Bound to
     # 0.0.0.0 it accepted /v1/chat/completions from anyone on the LAN: free use
