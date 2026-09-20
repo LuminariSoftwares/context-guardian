@@ -1,0 +1,41 @@
+# The dsh-context-guardian bundle patch. Applied after @deepseek-ai/dsh-base
+# and before the profile's own cordis.patch.yml; override by id
+# (`context-guardian`) in a later layer. A later layer REPLACES the whole
+# `config` value (no deep merge) -- restate every key you keep.
+#
+# The row references the package BY NAME, never by relative path.
+#
+# Precedence for every key: environment variable (the existing GUARDIAN_*
+# names, so the proxy's .env and .bat launchers mean the same thing here) >
+# DSH settings namespace `context-guardian` > this row's config > default.
+#
+# PHASE 1 SCAFFOLD: this row loads the plugin shell only. It does not yet
+# touch compaction -- @deepseek-ai/dsh-compaction-basic stays exactly as the
+# profile has it.
+- insert:
+    - id: context-guardian
+      name: dsh-context-guardian
+      config:
+        # Python for the optional bridge to context_guardian.py (span archive,
+        # proxy config). '' = $GUARDIAN_PYTHON, then a .venv beside this
+        # package, then python / python3 on PATH.
+        python: ''
+        # Model context window the ratios below are measured against.
+        numCtx: 32768
+        # Hard trigger (GUARDIAN_COMPACT_THRESHOLD).
+        compactThreshold: 0.85
+        # Proactive trigger when the agent goes idle (Phase 3c).
+        idleCompactRatio: 0.45
+        # Most recent messages never compacted (GUARDIAN_KEEP_RECENT_MESSAGES).
+        keepRecentMessages: 8
+        # Tokens held back for the reply (GUARDIAN_RESERVE_OUTPUT).
+        reserveOutput: 8192
+        # Span archive. '' = $GUARDIAN_SPAN_DIR, then the proxy's own default.
+        spanDir: ''
+        maxRecallTokens: 16000
+        maxSearchHits: 50
+        # Tools whose compiled line keeps its key argument; [] = the compiler's
+        # DEFAULT_ARG_TOOLS.
+        toolArgTools: []
+        # Tools that produce no compiled line at all.
+        hideTools: []

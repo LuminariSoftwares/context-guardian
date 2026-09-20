@@ -1,12 +1,66 @@
-# Context Guardian
-![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
-![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)
+<h1 align="center">Context Guardian</h1>
 
-A tiny proxy that sits in front of any OpenAI-compatible LLM backend (Ollama, LiteLLM, Headroom, vLLM, LM Studio, and similar) and forces a conversation-history compaction *before* the context window fills up — instead of letting requests grow until the backend hard-errors and the session dies.
+<p align="center"><b>Your local-model session hits the context limit and dies. This stops that.</b></p>
+
+<p align="center">
+  <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-yellow.svg">
+  <img alt="Python 3.11" src="https://img.shields.io/badge/python-3.11-blue.svg">
+  <img alt="OpenAI-compatible proxy" src="https://img.shields.io/badge/OpenAI--compatible-proxy-2ea44f.svg">
+  <img alt="DeepSeek Harness engine" src="https://img.shields.io/badge/DSH-compaction%20engine-0969da.svg">
+  <img alt="Fails open" src="https://img.shields.io/badge/fails-open-6f42c1.svg">
+</p>
+
+<p align="center">
+  <a href="#why-this-exists">Why</a> &middot;
+  <a href="#two-ways-to-run-it">Two ways to run it</a> &middot;
+  <a href="#install">Install the proxy</a> &middot;
+  <a href="docs/dsh-integration.md">Install in DSH</a> &middot;
+  <a href="#see-it-work">See it work</a> &middot;
+  <a href="CHANGELOG.md">Changelog</a>
+</p>
+
+Compaction for local models that actually fires, and never takes the conversation down with it. Two front doors, one idea: a **proxy** that sits in front of any OpenAI-compatible backend (Ollama, LiteLLM, Headroom, vLLM, LM Studio) for any CLI or agent, and a **native engine** for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). Both keep the full original on disk, and both fail **open**.
 
 ![Context Guardian compaction monitor: a request climbs past the budget line, gets compacted, and drops back under it](context_guardian_demo.gif)
 
 *The `/guardian/health` compaction monitor: a request grows past the window, Guardian compacts it, and the session keeps going instead of hard-erroring.*
+
+| | Without Context Guardian | With it |
+|---|---|---|
+| Claude-Code-style CLI on a local model | auto-compact never fires; the backend hard-rejects the request and the session is over | the proxy compacts before the window fills; the session keeps going |
+| DSH on a 32K local model (measured: 314 compaction attempts) | **48 succeeded**; the rest failed on an empty summary or overflowed the window *while summarising* | every failed or impossible summary falls back to a deterministic checkpoint: ~14,012 → ~584 tokens in 23 ms, no model call |
+| The part that was compacted away | gone | archived on disk; in DSH every checkpoint line carries a `seq` pointer that `recall` reads back |
+
+## Two ways to run it
+
+| | **Proxy** (`context_guardian.py`) | **DSH engine** (`engine.js`) |
+|---|---|---|
+| Works with | Claude Code, OpenClaude, anything that talks to an OpenAI-compatible `/v1/chat/completions` | [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 0.1.2+ |
+| How it hooks in | you point `OPENAI_BASE_URL` at it | one row in your agent preset's `compaction` group |
+| Who writes the summary | the same backend model, asked by the proxy | DSH's own summariser first; a deterministic compiler when that fails, returns nothing, or cannot fit |
+| Reads originals back | span archive on disk (plain JSON, one file per compaction) | `recall` / `search` tools for the model, `/recall` and `/context` for you |
+| Live view | **`/guardian/health` dashboard** with the compaction monitor, `/guardian/events` | DSH's own "Context compacted" row and context meter, plus one JSON line per decision in `guardian_dsh.jsonl` |
+| Compacts while idle | — | yes, above 45 % of the window |
+| Archive format | `logs/guardian_spans/<run>/NNNN.json` | the same format, so the same tools read both |
+| Setup guide | this README | **[docs/dsh-integration.md](docs/dsh-integration.md)** |
+
+```mermaid
+flowchart LR
+    subgraph P["Proxy: any OpenAI-compatible harness"]
+      A1["CLI / agent"] --> G1["Context Guardian<br/>proxy :8786"] --> B1["Ollama / LiteLLM / vLLM"]
+      G1 -. "over budget" .-> S1["summarise older turns<br/>keep recent verbatim"]
+    end
+    subgraph D["Engine: inside DeepSeek Harness"]
+      A2["DSH agent"] --> C2["compaction-basic"] --> E2{"LLM summary<br/>fits and works?"}
+      E2 -->|yes| K2["LLM checkpoint"]
+      E2 -->|no| X2["deterministic checkpoint<br/>with seq pointers"]
+    end
+    S1 --> Z[("span archive on disk")]
+    X2 --> Z
+    K2 --> Z
+```
+
+The rest of this page is the **proxy**. The DSH engine has its own five-minute guide: **[docs/dsh-integration.md](docs/dsh-integration.md)**.
 
 ## Why this exists
 
@@ -179,6 +233,22 @@ Guardian's `GUARDIAN_NUM_CTX` is fixed for the lifetime of one running instance.
 pip install -r requirements-dev.txt
 pytest
 ```
+
+## See it work
+
+- **Proxy:** open `http://localhost:8786/guardian/health` while a session runs. The compaction monitor replays every compaction as a before → after bar, with a per-compaction dropdown and an advice box when your fixed floor (tools + system prompt) is the real problem. `GET /guardian/events` returns the same records as JSON.
+- **DSH:** type `/context` in a session for pressure, cache hits and what compacting now would save; `/recall 3-7`, `/recall result 42` or `/recall find <text>` to read originals; `logs/guardian_dsh.jsonl` for the decision trail (`idle-check` → `compaction/start` → `deterministic` or `llm` → `compaction/end`).
+
+## Acknowledgements
+
+Context Guardian stands on other people's ideas, and says so:
+
+- **[dsh-compaction-instant](https://www.npmjs.com/package/dsh-compaction-instant)** (TsFreddie, MIT) — `vendor/compiler.js` and `vendor/region.js` are vendored **unmodified** from 0.1.4, with their original headers and the MIT licence text in [`vendor/LICENSE.dsh-compaction-instant`](vendor/LICENSE.dsh-compaction-instant). The `recall` / `search` contract follows theirs.
+- **[VCC](https://github.com/lllyasviel/VCC)** (lllyasviel) — the conversation-compiler principle that compiler ports: compile the log into a compact view made only of original tokens, with a pointer back to every elided part.
+- **[dsh-openwolf](https://github.com/hawk2048/dsh-openwolf)** (MIT) — the idea of snapshotting session state right before a compaction. The engine's `precompact-<seq>.json` and the `FILES WRITTEN` list are an independent implementation of that idea; no openwolf code is included.
+- **[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)** — `summarize()` is the hook its compaction engine documents for exactly this.
+
+Full third-party notices: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## License
 

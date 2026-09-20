@@ -18,3 +18,12 @@ _to_delete*/
 dist/
 build/
 *.egg-info/
+
+# node (DSH bundle dev install)
+node_modules/
+
+# local pre-edit backups
+_archive/
+
+# library: no lockfile
+pnpm-lock.yaml

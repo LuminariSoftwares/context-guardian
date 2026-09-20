@@ -1,0 +1,74 @@
+{
+  "name": "dsh-context-guardian",
+  "version": "0.1.0-alpha.2",
+  "description": "Context Guardian as a native DeepSeek Harness (DSH) bundle: deterministic, seq-pointer-preserving compaction with model-facing recall and search. Companion to dsh-tool-guardian.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./engine": "./engine.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "engine.js",
+    "cg_recall.js",
+    "cordis.patch.yml",
+    "modules/cg_bridge.py",
+    "vendor/compiler.js",
+    "vendor/region.js",
+    "vendor/LICENSE.dsh-compaction-instant",
+    "context_guardian.py",
+    "configure.py",
+    "requirements.txt",
+    "docs/dsh-integration.md",
+    "THIRD_PARTY_NOTICES.md",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "check": "node --check index.js && node --check engine.js && node --check cg_recall.js && node --check vendor/compiler.js",
+    "selftest": "python modules/cg_bridge.py --selftest",
+    "test:node": "node tests/probes/probe_cg_recall.mjs && node cg_recall.js --selftest && node tests/engine_smoke.mjs"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.2"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-compaction": ">=0.1.2-alpha.2",
+    "@deepseek-ai/dsh-llm": ">=0.1.2-alpha.2",
+    "@deepseek-ai/dsh-tools": ">=0.1.2-alpha.2"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "dsh-bundle",
+    "deepseek-harness",
+    "compaction",
+    "context-window",
+    "context-management",
+    "recall",
+    "local-llm",
+    "ollama"
+  ],
+  "license": "MIT",
+  "author": "LuminariSoftwares",
+  "homepage": "https://github.com/LuminariSoftwares/context-guardian",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LuminariSoftwares/context-guardian.git"
+  },
+  "bugs": {
+    "url": "https://github.com/LuminariSoftwares/context-guardian/issues"
+  }
+}

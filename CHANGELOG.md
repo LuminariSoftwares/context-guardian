@@ -1,5 +1,45 @@
 # Changelog
 
+## dsh-context-guardian 0.1.0-alpha.2 - the DSH compaction engine (2026-09-20)
+
+The proxy (`context_guardian.py`) is unchanged. This adds the DSH side.
+
+**Why.** On a 32k local model the stock DSH compaction fails most of the time.
+Counted over every session log on the build machine: 314 compaction attempts,
+**48 succeeded**. 145 ended `summarization produced no text summary content`,
+116 ended in a context overflow *of the summariser's own request* (it replays
+system prompt + tools + the whole span and asks for 8k of output on top).
+
+**What.** `engine.js`, mounted as one row inside the agent preset's
+`compaction` group, replaces only `summarize()` -- the hook DSH documents as
+"the sole subclass customization hook". compaction-basic still owns selection,
+stability checks, the durable transaction and the shrink guarantee.
+
+- `mode: llm-then-deterministic` (default): the stock LLM summary runs first.
+  If it throws, returns nothing, or cannot fit in the window at all, the span is
+  compiled deterministically (vendored compaction-instant compiler): every line
+  carries a `seq` pointer into the append-only session log.
+- Harness-injected context (workspace instructions, skill catalogue, runtime
+  snapshots) is left out of the checkpoint and named by seq; the harness
+  re-injects it anyway.
+- `FILES WRITTEN` list and a folded keyword index (identifiers somebody
+  actually said, not directory listings) close the checkpoint.
+- `recall` / `search` tools and `/recall`, `/context` commands read originals
+  back. `context_rewrite_cost` and `context_compact` tools are opt-in (`tools:`)
+  because every tool schema rides every request.
+- Idle pressure trigger: above `idleCompactRatio` (0.45) the agent compacts when
+  it goes idle. Ladder 30 watch / 50 idle / 70 compact / 90 emergency sets how
+  tight the checkpoint is.
+- Every compacted span is archived in the proxy's `write_span` format; a
+  `precompact-<seq>.json` snapshot is written on `compaction/start` (what
+  dsh-openwolf did); one JSON line per decision goes to `guardian_dsh.jsonl`.
+- Every key has a `GUARDIAN_*` environment override; `GUARDIAN_DSH_MODE=off`
+  restores stock behaviour without editing the preset.
+
+Measured live (DSH 0.1.2-alpha.2, qwen3 30B, 32,768 window): idle trigger at
+71 % -> 15 nodes, ~14,012 -> ~584 tokens, surface 23,395 -> 10,043 tokens,
+`compaction/end` with no error, 23 ms, no model call.
+
 ## 0.5.1 - Compaction monitor: watch each compaction happen
 
 Additive, dashboard-only. No change to the proxy's behaviour.
