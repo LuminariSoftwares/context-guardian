@@ -1,5 +1,9 @@
 # Changelog
 
+## dsh-context-guardian 0.1.0-alpha.3 - install from npm (2026-09-20)
+
+Docs only. `dsh plugin --profile <name> add dsh-context-guardian` now works by name; the DSH guide says where `engine.js` lands after an npm install and how to point the agent-preset row at it. No code change (engine `cg-engine-3`).
+
 ## dsh-context-guardian 0.1.0-alpha.2 - the DSH compaction engine (2026-09-20)
 
 The proxy (`context_guardian.py`) is unchanged. This adds the DSH side.

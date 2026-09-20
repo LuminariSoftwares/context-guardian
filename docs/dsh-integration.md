@@ -18,7 +18,9 @@ DSH mounts compaction inside the AGENT PRESET (the `compaction` group), not in t
 
 ## Install the engine (5 minutes)
 
-1. Get the code: `git clone https://github.com/LuminariSoftwares/context-guardian` (or use your existing checkout). Note the absolute path.
+1. Get the code — either way works, and you need the absolute path of `engine.js` for step 3:
+   - **From npm (recommended):** `dsh plugin --profile <your-profile> add dsh-context-guardian`. The engine then sits at `<DSH_HOME>/profiles/<your-profile>/node_modules/dsh-context-guardian/engine.js`.
+   - **From git:** `git clone https://github.com/LuminariSoftwares/context-guardian` anywhere on disk. No `pnpm install` is needed for the engine; it has no dependencies.
 
 2. Make your own agent preset if you do not have one: copy the shipped `standard` preset folder to `<DSH_HOME>/.agent-presets/<your-id>/` (it contains `agent.cordis.yml` and `preset.yml`). `<DSH_HOME>` is `~/.dsh` unless you set the `DSH_HOME` environment variable.
 
@@ -33,7 +35,7 @@ DSH mounts compaction inside the AGENT PRESET (the `compaction` group), not in t
            tools: [recall, search]
    ```
    In the shipped preset the sibling rows (`- id: tool-result-pruner`) start at 4 spaces; match whatever yours use.
-   Note: `name` is a `file:///` URL to YOUR checkout (forward slashes, also on Windows), or a path starting with `./` relative to the preset folder if you copy `engine.js`, `cg_recall.js` and `vendor/compiler.js` next to it. `numCtx` must be your model's real context window.
+   Note: `name` is a `file:///` URL to the `engine.js` from step 1 — for an npm install that is `file:///C:/Users/<you>/.dsh/profiles/<your-profile>/node_modules/dsh-context-guardian/engine.js`. It is a URL to YOUR copy (forward slashes, also on Windows), or a path starting with `./` relative to the preset folder if you copy `engine.js`, `cg_recall.js` and `vendor/compiler.js` next to it. `numCtx` must be your model's real context window.
 
 4. Start a NEW session with that preset selected. No restart is needed: DSH re-mounts a preset whose file changed when the next session starts.
 
