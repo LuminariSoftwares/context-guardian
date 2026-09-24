@@ -1,6 +1,6 @@
 {
   "name": "dsh-context-guardian",
-  "version": "0.1.0-alpha.3",
+  "version": "0.1.0-alpha.4",
   "description": "Context Guardian as a native DeepSeek Harness (DSH) bundle: deterministic, seq-pointer-preserving compaction with model-facing recall and search. Companion to dsh-tool-guardian.",
   "type": "module",
   "main": "index.js",

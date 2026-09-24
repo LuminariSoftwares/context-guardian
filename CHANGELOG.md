@@ -1,5 +1,32 @@
 # Changelog
 
+## dsh-context-guardian 0.1.0-alpha.4 - pinned goal survives compaction (2026-09-24)
+
+Engine only (`cg-engine-3`, unchanged). Every checkpoint now carries the
+session's original request byte-for-byte, so a local model cannot drift off
+the task across one or several compactions.
+
+**What.** `extractGoal(nodes)` recovers the pinned goal: a goal block already
+embedded in an earlier checkpoint wins; otherwise the first real user-text
+node (never a tool result, never harness-injected context) is the fallback.
+A later `Goal: ...` user message is captured as a numbered UPDATE, deduped by
+seq (first wins) and replayed in order -- it does not replace the original
+request. `renderGoal(g)` writes the pinned block back (`<<<GOAL ... GOAL>>>`,
+plus one `<<<GOAL update seq N ... GOAL>>>` block per update) at the TOP of
+every deterministic checkpoint, ahead of `RECALL_GUIDE`, and is never counted
+against or cut by any length cap. The same block is also prepended as a new
+first summary entry when the stock LLM summary succeeds, so the pin survives
+regardless of which summarization path a given compaction takes.
+
+**Tests.** `tests/goal_pin_smoke.mjs` (new, 11 checks): byte-for-byte survival
+of a 6000-character non-ASCII request across a second compaction, no
+duplication, `Goal:` updates captured/deduped/ordered, tool results and
+harness-injected messages never mistaken for the goal, no goal block at all
+when there is no user text, and the checkpoint-goal-wins-over-later-message
+rule. `tests/engine_smoke.mjs`'s `llm_success_passes_through_untouched` check
+was loosened to assert the stock summary block is present rather than at a
+fixed index, since a pinned-goal block may now be prepended as `summary[0]`.
+
 ## dsh-context-guardian 0.1.0-alpha.3 - install from npm (2026-09-20)
 
 Docs only. `dsh plugin --profile <name> add dsh-context-guardian` now works by name; the DSH guide says where `engine.js` lands after an npm install and how to point the agent-preset row at it. No code change (engine `cg-engine-3`).

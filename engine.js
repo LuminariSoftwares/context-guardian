@@ -47,6 +47,13 @@ export const name = 'context-guardian-engine'
 export const inject = ['compaction']
 export const ENGINE_REV = 'cg-engine-3'
 
+// Pinned goal markers. The session's original request is pinned into every
+// checkpoint byte-for-byte so a local model never drifts from the task after
+// one (or two) compactions.
+export const GOAL_OPEN = '<<<GOAL'
+export const GOAL_CLOSE = 'GOAL>>>'
+export const GOAL_UPDATE_RE = /^\s*goal\s*:/i
+
 const PACKAGE_ROOT = dirname(fileURLToPath(import.meta.url))
 const MODES = ['llm-then-deterministic', 'deterministic', 'off']
 const ALL_TOOLS = ['recall', 'search', 'context_rewrite_cost', 'context_compact']
@@ -250,6 +257,83 @@ export function splitInjected(nodes, dropSources) {
 /** Identifier-like: a path, a dotted/underscored/hyphenated name, or anything with a digit -- not an English word. */
 const IDENTIFIER_RE = /[_/\\.\-\d]/
 
+// ── pinned goal ─────────────────────────────────────────────────────────────
+// A `<<<GOAL ... >>>`-delimited block survives compaction inside the checkpoint
+// text; extractGoal reads it back out (from earlier checkpoints and from the
+// live user messages) and renderGoal writes it verbatim onto a fresh one.
+
+const GOAL_BLOCK_RE = new RegExp(`${GOAL_OPEN}\\n([\\s\\S]*?)\\n${GOAL_CLOSE}`)
+const GOAL_UPDATE_BLOCK_RE = new RegExp(`${GOAL_OPEN} update seq (\\d+)\\n([\\s\\S]*?)\\n${GOAL_CLOSE}`, 'g')
+
+/** Every text block of a message joined with "\n". */
+function messageText(message) {
+  const blocks = Array.isArray(message?.content) ? message.content : []
+  return blocks.filter(block => block?.type === 'text').map(block => String(block.text ?? '')).join('\n')
+}
+
+/** A real user turn: role user, not a checkpoint, no injected source, first block text. */
+function isUserTextNode(message) {
+  if (message?.role !== 'user') return false
+  if (isCheckpointSource(message.source)) return false
+  const source = message.source
+  if (source !== undefined && source !== null) return false
+  return message.content?.[0]?.type === 'text'
+}
+
+/**
+ * The session's pinned goal and its `goal:` updates, recovered from `nodes`
+ * (walked in the given order). A goal carried by any checkpoint node wins; the
+ * first user-text node is the fallback goal. Updates are de-duplicated by seq
+ * (first wins) and returned sorted by seq ascending.
+ */
+export function extractGoal(nodes) {
+  let goal = null
+  let goalNode = null
+  let firstUserText = null
+  const collected = []
+  for (const node of nodes ?? []) {
+    const message = node?.message
+    if (message === undefined || message === null) continue
+    if (isCheckpointSource(message.source)) {
+      const text = messageText(message)
+      if (goal === null) {
+        const match = text.match(GOAL_BLOCK_RE)
+        if (match !== null) goal = match[1]
+      }
+      for (const match of text.matchAll(GOAL_UPDATE_BLOCK_RE)) {
+        collected.push({ seq: Number(match[1]), text: match[2], node: null })
+      }
+    } else if (isUserTextNode(message)) {
+      const text = messageText(message)
+      if (firstUserText === null) firstUserText = { node, text }
+      if (GOAL_UPDATE_RE.test(text)) collected.push({ seq: node.seq, text, node })
+    }
+  }
+  if (goal === null && firstUserText !== null) {
+    goal = firstUserText.text
+    goalNode = firstUserText.node
+  }
+  const bySeq = new Map()
+  for (const update of collected) {
+    // Skip the goal node's own text; checkpoint updates carry node=null, so
+    // only a real goalNode may suppress an update.
+    if ((goalNode !== null && update.node === goalNode) || bySeq.has(update.seq)) continue
+    bySeq.set(update.seq, { seq: update.seq, text: update.text })
+  }
+  return { goal, updates: [...bySeq.values()].sort((a, b) => a.seq - b.seq) }
+}
+
+/** Render a pinned-goal block for a checkpoint head. '' when there is no goal. */
+export function renderGoal(g) {
+  if (g?.goal === null || g?.goal === undefined) return ''
+  let out = "[pinned goal -- the session's first request, verbatim; later 'goal:' updates follow. Keep working toward it.]"
+  out += `\n${GOAL_OPEN}\n${g.goal}\n${GOAL_CLOSE}`
+  for (const update of g.updates ?? []) {
+    out += `\n${GOAL_OPEN} update seq ${update.seq}\n${update.text}\n${GOAL_CLOSE}`
+  }
+  return out
+}
+
 /** The deterministic checkpoint body for one region. Pure. */
 export function buildCheckpoint(allRegionNodes, options, pressure, allNodes) {
   const { kept: nodes, dropped } = splitInjected(allRegionNodes, options.dropSources)
@@ -274,10 +358,16 @@ export function buildCheckpoint(allRegionNodes, options, pressure, allNodes) {
   })
   const real = allRegionNodes.filter(node => node.seq >= 0).map(node => node.seq)
   const range = real.length === 0 ? 'unmapped' : `${Math.min(...real)}-${Math.max(...real)}`
+  // The goal is computed from the region PLUS the whole session (region first),
+  // so a goal carried by a checkpoint inside the region wins over a later user
+  // message. It is never counted against or cut by any cap.
+  const goalNodes = allNodes === undefined || allNodes === null ? allRegionNodes : [...allRegionNodes, ...allNodes]
+  const goalBlock = renderGoal(extractGoal(goalNodes))
   const parts = [
     `[context-guardian checkpoint · deterministic · ${allRegionNodes.length} nodes · seqs ${range} · ~${regionTokens} -> ~${compiled.stats.tokens} tokens · ${COMPILER_REV}]`,
-    RECALL_GUIDE,
   ]
+  if (goalBlock.length > 0) parts.push(goalBlock)
+  parts.push(RECALL_GUIDE)
   if (dropped.length > 0) parts.push(`[${dropped.length} harness-injected context messages omitted (instructions, skill list, runtime notes -- the harness re-injects them): seqs ${dropped.map(node => node.seq).join(', ')}]`)
   parts.push(...compiled.entries)
   const files = filesWritten(nodes, options.filesListed)
@@ -396,6 +486,17 @@ export function apply(ctx, config) {
       const result = await original.call(this, input, agent, signal)
       if (hasText(result)) {
         record({ event: 'llm', session: String(agent?.session?.id ?? ''), provider: result.provider, model: result.model })
+        // Pin the goal on top of the stock summary too, as a NEW first text block.
+        let goalBlock = ''
+        try {
+          const region = mapRegionSeqs(agent?.session, input.messages).nodes
+          const session = agent?.session
+          const goalNodes = session === undefined || session === null ? region : [...region, ...sessionNodes(session)]
+          goalBlock = renderGoal(extractGoal(goalNodes))
+        } catch { goalBlock = '' }
+        if (goalBlock.length > 0) {
+          return { ...result, summary: [{ type: 'text', text: goalBlock }, ...(Array.isArray(result.summary) ? result.summary : [])] }
+        }
         return result
       }
       return deterministic(input, agent, 'llm summary was empty')

@@ -85,7 +85,10 @@ check('llm_success_passes_through_untouched', async () => {
   const h = makeCtx({ llm: 'ok' }); engine.apply(h.ctx, baseConfig())
   const session = makeSession()
   const result = await h.compaction.summarize(smallInput(session), { session })
-  return result.llmStreamCall === true && result.summary[0].text === 'LLM SUMMARY' && h.calls.llm === 1
+  // The stock summary text and object shape pass through unchanged. Since the
+  // goal-pin change, a pinned-goal block may be prepended as summary[0], so
+  // assert the stock block is present rather than at a fixed index.
+  return result.llmStreamCall === true && result.summary.some(b => b.text === 'LLM SUMMARY') && h.calls.llm === 1
 })
 check('live_error_falls_back_to_deterministic_with_real_seq_pointers', async () => {
   const h = makeCtx({ llm: 'throw' }); engine.apply(h.ctx, baseConfig())
