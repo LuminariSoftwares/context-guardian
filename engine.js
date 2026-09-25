@@ -110,9 +110,14 @@ export function resolveEngineOptions(config = {}, env = process.env) {
   const rowMode = String(pick('mode')).trim().toLowerCase()
   const mode = MODES.includes(envMode) ? envMode : MODES.includes(rowMode) ? rowMode : DEFAULTS.mode
   const numCtx = Math.floor(num('GUARDIAN_NUM_CTX', 'numCtx', 1024, 4_000_000))
+  // Did the user pin the window themselves? An explicit numCtx (env or preset row)
+  // must always win over what the host reports, so the window helper needs to know.
+  const numCtxExplicit = (env.GUARDIAN_NUM_CTX !== undefined && env.GUARDIAN_NUM_CTX !== '')
+    || (row.numCtx !== undefined && row.numCtx !== null)
   return {
     mode,
     numCtx,
+    numCtxExplicit,
     reserveOutput: Math.floor(num('GUARDIAN_RESERVE_OUTPUT', 'reserveOutput', 0, 1_000_000)),
     idleCompactRatio: num('GUARDIAN_IDLE_COMPACT_RATIO', 'idleCompactRatio', 0, 0.99),
     idleDelayMs: Math.floor(num('GUARDIAN_IDLE_DELAY_MS', 'idleDelayMs', 0, 3_600_000)),
@@ -122,7 +127,12 @@ export function resolveEngineOptions(config = {}, env = process.env) {
     toolCallTokens: Math.floor(num('GUARDIAN_TOOL_CALL_TOKENS', 'toolCallTokens', 8, 100_000)),
     toolResultExcerptTokens: Math.floor(num('GUARDIAN_TOOL_RESULT_TOKENS', 'toolResultExcerptTokens', 8, 100_000)),
     // One recall may never take more than a quarter of the window it lands in.
-    maxRecallTokens: Math.min(Math.floor(num('GUARDIAN_MAX_RECALL_TOKENS', 'maxRecallTokens', 100, 1_000_000)), Math.floor(numCtx / 4)),
+    // One recall may never take more than a quarter of the window it lands in. When the user pinned the window,
+    // cap here; otherwise the quarter cap is applied per session at use (doRecall) against the model's real window --
+    // capping by the default numCtx would pin every big-model user at 8192 (O5 2026-09-25).
+    maxRecallTokens: numCtxExplicit
+      ? Math.min(Math.floor(num('GUARDIAN_MAX_RECALL_TOKENS', 'maxRecallTokens', 100, 1_000_000)), Math.floor(numCtx / 4))
+      : Math.floor(num('GUARDIAN_MAX_RECALL_TOKENS', 'maxRecallTokens', 100, 1_000_000)),
     maxSearchHits: Math.floor(num('GUARDIAN_MAX_SEARCH_HITS', 'maxSearchHits', 1, 1000)),
     keywordTerms: Math.floor(num('GUARDIAN_KEYWORD_TERMS', 'keywordTerms', 0, 500)),
     filesListed: Math.floor(num('GUARDIAN_FILES_LISTED', 'filesListed', 0, 200)),
@@ -134,6 +144,21 @@ export function resolveEngineOptions(config = {}, env = process.env) {
     hideTools: list('GUARDIAN_HIDE_TOOLS', 'hideTools'),
     dropSources: list('GUARDIAN_DROP_SOURCES', 'dropSources'),
   }
+}
+
+/**
+ * The window pressure and caps must divide by, for ONE session: an explicit
+ * user/preset numCtx always wins; otherwise a positive host-reported window
+ * (the model's real `request/context` contextWindow); otherwise the default.
+ * Pure. `hostWindow` is only honoured when it is a positive integer, so a
+ * malformed 0 / -5 / 1.5 / "200000" falls back to `options.numCtx`.
+ */
+export function effectiveWindow(options, hostWindow, explicit) {
+  const configured = Number(options?.numCtx)
+  const fallback = Number.isFinite(configured) && configured > 0 ? configured : DEFAULTS.numCtx
+  if (explicit) return fallback
+  if (Number.isInteger(hostWindow) && hostWindow > 0) return hostWindow
+  return fallback
 }
 
 /** Conservative token estimate for "will this request fit": chars / 3.5. */
@@ -404,6 +429,11 @@ export function apply(ctx, config) {
   const runId = `dsh-${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)}-${process.pid}`
   const pressureBySession = new WeakMap()
   const triggerBySession = new WeakMap()
+  // The host reports the model's real context window on every `request/context`
+  // event; keep the last one per session and honour it for pressure and caps.
+  const windowBySession = new WeakMap()
+  const windowLogged = new WeakSet()
+  const sessionWindow = (session) => effectiveWindow(options, windowBySession.get(session), options.numCtxExplicit)
 
   const record = (entry) => {
     try {
@@ -481,7 +511,8 @@ export function apply(ctx, config) {
     // for output on top. When that cannot fit in the window the call is
     // doomed before it is made -- the failure TJ hit on 2026-09-19.
     const need = estRequestTokens(input.system) + estRequestTokens(input.tools) + estRequestTokens(input.messages) + options.reserveOutput
-    if (need > options.numCtx) return deterministic(input, agent, `llm summary cannot fit: ~${need} > ${options.numCtx}`)
+    const window = sessionWindow(agent?.session)
+    if (need > window) return deterministic(input, agent, `llm summary cannot fit: ~${need} > ${window}`)
     try {
       const result = await original.call(this, input, agent, signal)
       if (hasText(result)) {
@@ -525,7 +556,7 @@ export function apply(ctx, config) {
       const measurement = tokenMeter?.measure?.(agent.session)
       if (measurement === undefined || measurement === null) return undefined
       const tokens = Number(measurement.totalTokens ?? measurement.surfaceTokens ?? 0)
-      const pressure = tokens / options.numCtx
+      const pressure = tokens / sessionWindow(agent.session)
       pressureBySession.set(agent.session, pressure)
       return { tokens, surfaceTokens: Number(measurement.surfaceTokens ?? tokens), pressure, usage: measurement.baseline?.kind === 'usage' ? measurement.baseline.usage : undefined, nodes: measurement.nodes ?? [] }
     } catch { return undefined }
@@ -549,6 +580,17 @@ export function apply(ctx, config) {
       record({ event: 'compaction/end', session: String(session?.id ?? ''), compactionId: event.data?.compactionId, error: event.data?.error ?? null })
       if (event.data?.error) log.warn(`context-guardian engine: compaction ended with error: ${event.data.error}`)
       triggerBySession.delete(session)
+    } else if (event?.type === 'request/context') {
+      const host = event.data?.contextWindow
+      if (Number.isInteger(host) && host > 0 && session !== null && typeof session === 'object') {
+        windowBySession.set(session, host)
+        if (!windowLogged.has(session) && host !== options.numCtx) {
+          windowLogged.add(session)
+          log.info(options.numCtxExplicit
+            ? `context-guardian engine: GUARDIAN_NUM_CTX=${options.numCtx} overrides the model's window ${host}`
+            : `context-guardian engine: using the model's window ${host} (host-reported); set GUARDIAN_NUM_CTX to override`)
+        }
+      }
     }
   })
 
@@ -594,13 +636,14 @@ export function apply(ctx, config) {
     const shadowed = m.nodes.slice(0, Math.max(0, m.nodes.length - keep)).reduce((total, node) => total + Number(node.tokens ?? 0), 0)
     const replacement = Math.min(options.checkpointMaxTokens, Math.floor(shadowed * 0.5))
     const cached = Number(m.usage?.cacheReadTokens ?? 0)
-    const cost = lib.rewriteCost({ surfaceTokens: m.tokens, shadowedTokens: shadowed, replacementTokens: replacement, window: options.numCtx, cachedPrefixTokens: cached })
+    const window = sessionWindow(agent?.session)
+    const cost = lib.rewriteCost({ surfaceTokens: m.tokens, shadowedTokens: shadowed, replacementTokens: replacement, window, cachedPrefixTokens: cached })
     if (cost.error) return `context-guardian: ${cost.error}`
     const cacheLine = m.usage === undefined ? 'cache: no provider usage yet'
       : m.usage.cacheReadTokens === undefined ? 'cache: provider does not report cache reads'
         : `cache: ${cached} of ${m.usage.inputTokens} input tokens read from cache (${m.usage.inputTokens > 0 ? Math.round(cached / m.usage.inputTokens * 100) : 0} %)`
     return [
-      `context: ~${m.tokens} of ${options.numCtx} tokens (${(cost.pressureBefore * 100).toFixed(0)} %), tier ${cost.tier}`,
+      `context: ~${m.tokens} of ${window} tokens (${(cost.pressureBefore * 100).toFixed(0)} %), tier ${cost.tier}`,
       `compacting now (estimate): replaces ~${shadowed} tokens with ~${replacement}; saves ~${cost.saved}; pressure -> ${(cost.pressureAfter * 100).toFixed(0)} %`,
       `rewrite cost: ~${cost.reprefillTokens} tokens must be prefilled again because the prompt prefix changes`,
       cacheLine,
@@ -610,7 +653,8 @@ export function apply(ctx, config) {
 
   const doRecall = (session, request) => {
     if (!request.ok) return { ok: false, text: `recall: ${request.error}` }
-    return lib.recall(sessionNodes(session), request, { maxTokens: options.maxRecallTokens })
+    // One recall may never take more than a quarter of THIS session's window.
+    return lib.recall(sessionNodes(session), request, { maxTokens: Math.min(options.maxRecallTokens, Math.floor(sessionWindow(session) / 4)) })
   }
 
   // ── model-facing tools ───────────────────────────────────────────────────

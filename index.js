@@ -24,11 +24,12 @@
  * MIT licensed.
  */
 import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
 import Schema from '@deepseek-ai/schemastery'
+import { checkForUpdate, defaultCacheFile } from './update_check.js'
 import { COMPILER_REV, DEFAULT_ARG_TOOLS } from './vendor/compiler.js'
 
 export const name = 'dsh-context-guardian'
@@ -42,6 +43,9 @@ export const SETTINGS_NAMESPACE = 'context-guardian'
 /** Resolved from the module URL -- never from process.cwd(). */
 const PACKAGE_ROOT = dirname(fileURLToPath(import.meta.url))
 const BRIDGE_SCRIPT = join(PACKAGE_ROOT, 'modules', 'cg_bridge.py')
+
+/** This plugin's own version, from the package.json beside this file. */
+const PKG_VERSION = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version
 
 const ratio = () => Schema.number().min(0.05).max(0.99)
 
@@ -240,6 +244,14 @@ export function apply(ctx, config) {
 
   const now = options()
   ctx.logger.info(`context-guardian scaffold loaded (compiler ${COMPILER_REV}; window ${now.numCtx}, hard ${now.compactThreshold}, idle ${now.idleCompactRatio}) -- compaction untouched in Phase 1`)
+
+  // Fire-and-forget: the update notice is a courtesy line, never a reason to wait.
+  void checkForUpdate({
+    pkg: name,
+    current: PKG_VERSION,
+    cacheFile: defaultCacheFile(name),
+    log: (line) => ctx.logger.info(line),
+  }).catch(() => {})
 
   // ── PHASE 3 lands here ────────────────────────────────────────────────────
   // 3.1  snapshot on ctx.on('session/event', ...) where event type is

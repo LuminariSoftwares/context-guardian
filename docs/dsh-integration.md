@@ -30,12 +30,12 @@ DSH mounts compaction inside the AGENT PRESET (the `compaction` group), not in t
          name: 'file:///C:/path/to/context-guardian/engine.js'
          config:
            mode: llm-then-deterministic
-           numCtx: 32768
+           # numCtx: 32768   # optional: leave it out and the engine uses your model's real window (DSH reports it)
            idleCompactRatio: 0.45
            tools: [recall, search]
    ```
    In the shipped preset the sibling rows (`- id: tool-result-pruner`) start at 4 spaces; match whatever yours use.
-   Note: `name` is a `file:///` URL to the `engine.js` from step 1 — for an npm install that is `file:///C:/Users/<you>/.dsh/profiles/<your-profile>/node_modules/dsh-context-guardian/engine.js`. It is a URL to YOUR copy (forward slashes, also on Windows), or a path starting with `./` relative to the preset folder if you copy `engine.js`, `cg_recall.js` and `vendor/compiler.js` next to it. `numCtx` must be your model's real context window.
+   Note: `name` is a `file:///` URL to the `engine.js` from step 1 — for an npm install that is `file:///C:/Users/<you>/.dsh/profiles/<your-profile>/node_modules/dsh-context-guardian/engine.js`. It is a URL to YOUR copy (forward slashes, also on Windows), or a path starting with `./` relative to the preset folder if you copy `engine.js`, `cg_recall.js` and `vendor/compiler.js` next to it. Leave `numCtx` out: since 0.1.0-alpha.5 the engine reads your model's real context window from DSH. Set it (or `GUARDIAN_NUM_CTX`) only to force a smaller window; the log says which one is in use.
 
 4. Start a NEW session with that preset selected. No restart is needed: DSH re-mounts a preset whose file changed when the next session starts.
 

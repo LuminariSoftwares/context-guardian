@@ -1,5 +1,20 @@
 # Changelog
 
+## dsh-context-guardian 0.1.0-alpha.5 - uses your model's real context window; update notice (2026-09-25)
+
+**Fix — big-context models were compacted far too early.** The engine divided every
+pressure number by its 32768 default, so on a 200k or 1M-token model the idle trigger
+fired at ~14.7k tokens. It now reads the window DSH reports for the session
+(`request/context` -> `contextWindow`) and uses that for pressure, the summary-fit
+check, the cost report and the recall cap. `numCtx` in the preset or
+`GUARDIAN_NUM_CTX` still wins when you set it; the log says which window is in use.
+If you copied `numCtx: 32768` from the old docs, delete that line.
+
+**New — update notice.** Once a day, in the background, the plugin asks the npm
+registry for newer versions and prints one line if there is one. Offline, slow or
+failing checks are silent. Turn it off with `GUARDIAN_NO_UPDATE_CHECK=1`
+(`NO_UPDATE_NOTIFIER` and `CI` are honoured too).
+
 ## dsh-context-guardian 0.1.0-alpha.4 - pinned goal survives compaction (2026-09-24)
 
 Engine only (`cg-engine-3`, unchanged). Every checkpoint now carries the

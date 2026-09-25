@@ -1,6 +1,6 @@
 {
   "name": "dsh-context-guardian",
-  "version": "0.1.0-alpha.4",
+  "version": "0.1.0-alpha.5",
   "description": "Context Guardian as a native DeepSeek Harness (DSH) bundle: deterministic, seq-pointer-preserving compaction with model-facing recall and search. Companion to dsh-tool-guardian.",
   "type": "module",
   "main": "index.js",
@@ -11,6 +11,7 @@
   },
   "files": [
     "index.js",
+    "update_check.js",
     "engine.js",
     "cg_recall.js",
     "cordis.patch.yml",
@@ -35,7 +36,7 @@
   "scripts": {
     "check": "node --check index.js && node --check engine.js && node --check cg_recall.js && node --check vendor/compiler.js",
     "selftest": "python modules/cg_bridge.py --selftest",
-    "test:node": "node tests/probes/probe_cg_recall.mjs && node cg_recall.js --selftest && node tests/engine_smoke.mjs"
+    "test:node": "node tests/probes/probe_cg_recall.mjs && node cg_recall.js --selftest && node tests/engine_smoke.mjs && node tests/update_check.test.mjs"
   },
   "engines": {
     "node": "^22.19.0 || >=24.0.0"

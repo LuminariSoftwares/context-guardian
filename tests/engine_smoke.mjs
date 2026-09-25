@@ -26,7 +26,7 @@ function makeSession() {
   }
 }
 
-function makeCtx({ llm = 'throw', pressure = 0.85, withMeter = true } = {}) {
+function makeCtx({ llm = 'throw', pressure = 0.85, withMeter = true, tokens = null } = {}) {
   const listeners = new Map()
   const disposers = []
   const logs = []
@@ -57,7 +57,8 @@ function makeCtx({ llm = 'throw', pressure = 0.85, withMeter = true } = {}) {
     commands: { register(def) { commands.set(def.name, def); return () => commands.delete(def.name) } },
   }
   if (withMeter) {
-    services.tokenMeter = { measure: (session) => ({ totalTokens: Math.round(pressure * 32768), surfaceTokens: Math.round(pressure * 32768), baseline: { kind: 'usage', usage: { inputTokens: 20000, outputTokens: 10, cacheReadTokens: 15000 } }, nodes: session.surface.nodes.map(seq => ({ seq, tokens: 600, heuristicTokens: 600 })) }) }
+    const total = () => (tokens === null ? Math.round(pressure * 32768) : tokens)
+    services.tokenMeter = { measure: (session) => ({ totalTokens: total(), surfaceTokens: total(), baseline: { kind: 'usage', usage: { inputTokens: 20000, outputTokens: 10, cacheReadTokens: 15000 } }, nodes: session.surface.nodes.map(seq => ({ seq, tokens: 600, heuristicTokens: 600 })) }) }
   }
   const emit = (name, ...args) => { for (const fn of listeners.get(name) ?? []) fn(...args) }
   const dispose = () => { while (disposers.length > 0) disposers.pop()() }
@@ -259,6 +260,38 @@ check('dispose_restores_the_stock_summarizer', async () => {
   const session = makeSession()
   const result = await h.compaction.summarize(smallInput(session), { session })
   return !Object.hasOwn(h.compaction, 'summarize') && result.summary[0].text === 'LLM SUMMARY'
+})
+
+check('effective_window_table', () => {
+  const defaults = engine.resolveEngineOptions({}, {})
+  const explicit = engine.resolveEngineOptions({}, { GUARDIAN_NUM_CTX: '65536' })
+  const rows = [
+    [defaults, 1_000_000, false, 1_000_000], // host window honoured when not explicit
+    [defaults, undefined, false, 32768],      // no host window -> the default
+    [explicit, 1_000_000, true, 65536],       // explicit numCtx always wins
+    [defaults, 0, false, 32768],              // non-positive / non-integer fall back
+    [defaults, -5, false, 32768],
+    [defaults, 1.5, false, 32768],
+    [defaults, '200000', false, 32768],
+  ]
+  return rows.every(([options, host, exp, want]) => engine.effectiveWindow(options, host, exp) === want)
+})
+check('resolve_engine_options_reports_num_ctx_explicit', () => {
+  const none = engine.resolveEngineOptions({}, {})
+  const fromEnv = engine.resolveEngineOptions({}, { GUARDIAN_NUM_CTX: '65536' })
+  const fromRow = engine.resolveEngineOptions({ numCtx: 8192 }, {})
+  return none.numCtxExplicit === false && fromEnv.numCtxExplicit === true
+    && fromEnv.numCtx === 65536 && fromRow.numCtxExplicit === true && fromRow.numCtx === 8192
+})
+check('host_context_window_lowers_pressure_and_logs_once', async () => {
+  const h = makeCtx({ tokens: 20_000 }); engine.apply(h.ctx, baseConfig())
+  const session = makeSession()
+  h.emit('session/event', session, { seq: 1, type: 'request/context', data: { contextWindow: 1_000_000 } })
+  h.emit('session/event', session, { seq: 2, type: 'request/context', data: { contextWindow: 1_000_000 } })
+  const out = (await h.commands.get('context').handler({ rawInput: '', agent: { session } })).text
+  const hostLogs = h.logs.filter(line => line.includes("using the model's window 1000000"))
+  // 20k tokens is ~2 % of a 1M window (not the ~61 % of the 32k default).
+  return out.includes('of 1000000 tokens (2 %)') && !out.includes('61 %') && hostLogs.length === 1
 })
 
 let passed = 0
