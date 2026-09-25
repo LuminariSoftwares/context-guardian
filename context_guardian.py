@@ -163,7 +163,20 @@ COMPACT_THRESHOLD = float(os.environ.get("GUARDIAN_COMPACT_THRESHOLD", "0.85"))
 # no schema to format); very squeezed -> Grep plus a fabricated answer.
 # So: reserve an explicit output budget and compact against what is LEFT.
 RESERVE_OUTPUT = int(os.environ.get("GUARDIAN_RESERVE_OUTPUT", "8192"))
-KEEP_RECENT_MESSAGES = int(os.environ.get("GUARDIAN_KEEP_RECENT_MESSAGES", "8"))
+# KEEP_RECENT: a bare message count treats a 40 KB tool result and a "hi" the
+# same, so "keep the newest 8" can be 90% of the window (compaction frees
+# nothing) or, with short chat turns, far too little. The default is now a
+# TOKEN BUDGET: keep the newest messages totalling at most ~20% of the usable
+# window (NUM_CTX - RESERVE_OUTPUT), never fewer than KEEP_RECENT_MIN_MESSAGES.
+# Setting GUARDIAN_KEEP_RECENT_MESSAGES explicitly restores the EXACT old
+# count behaviour -- that env var is the only way back to a fixed count, and
+# an explicit "0" still means "keep none". KEEP_RECENT_MESSAGES below is the
+# message FLOOR in budget mode (and the whole answer in explicit mode).
+_KEEP_RECENT_ENV = os.environ.get("GUARDIAN_KEEP_RECENT_MESSAGES", "").strip()
+KEEP_RECENT_EXPLICIT = _KEEP_RECENT_ENV != ""
+KEEP_RECENT_MIN_MESSAGES = 4
+KEEP_RECENT_FRACTION = float(os.environ.get("GUARDIAN_KEEP_RECENT_FRACTION", "0.20"))
+KEEP_RECENT_MESSAGES = int(_KEEP_RECENT_ENV) if KEEP_RECENT_EXPLICIT else KEEP_RECENT_MIN_MESSAGES
 CHARS_PER_TOKEN_ESTIMATE = float(os.environ.get("GUARDIAN_CHARS_PER_TOKEN", "3.5"))
 # ^ backported 2026-08-20 from the public repo (ClaudeRepos/context-guardian),
 # which had this env override and this copy did not. The two files have drifted
@@ -570,6 +583,50 @@ def _safe_cut(non_system: List[Dict[str, Any]], cut: int) -> int:
     return cut
 
 
+def keep_recent_count(non_system: List[Dict[str, Any]], num_ctx: int = None,
+                      reserve: int = None, fraction: float = None) -> int:
+    """How many of the newest non-system messages to keep, as a count. Pure.
+
+    WHY A BUDGET AND NOT A COUNT
+        "Keep the newest 8" is only a proxy for "keep a bounded slice of the
+        window", and in an agent session it is a bad one: a single message can
+        be a 40 KB tool result, so 8 messages can be 90% of the window and the
+        compaction frees nothing -- or 8 short chat turns can be far too
+        little context to keep working. Here the default is to keep the newest
+        messages totalling at most `fraction` of the usable window
+        (num_ctx - reserve), never fewer than KEEP_RECENT_MIN_MESSAGES, and
+        never more than there are.
+
+        Set GUARDIAN_KEEP_RECENT_MESSAGES and the EXACT old behaviour comes
+        back: the count as given, not clamped, not budgeted.
+
+    Walks newest -> oldest and stops at the first message that would push the
+    running total over budget; it never skips an oversized message to reach
+    smaller older ones. Pure: no I/O, no logging, no globals written, input
+    untouched. The reserve clamp mirrors effective_threshold's (without its
+    one-off warning) so budget mode and the compaction threshold cannot
+    disagree about how big the window really is.
+    """
+    if KEEP_RECENT_EXPLICIT:
+        return KEEP_RECENT_MESSAGES
+    num_ctx = NUM_CTX if num_ctx is None else num_ctx
+    reserve = RESERVE_OUTPUT if reserve is None else reserve
+    fraction = KEEP_RECENT_FRACTION if fraction is None else fraction
+    if reserve >= num_ctx:
+        reserve = max(1, num_ctx // 2)
+    usable = num_ctx - reserve
+    budget = int(max(0, usable) * fraction)
+    total = 0
+    n = 0
+    for m in reversed(non_system):
+        tokens = estimate_tokens([m])
+        if total + tokens > budget:
+            break
+        total += tokens
+        n += 1
+    return min(len(non_system), max(n, KEEP_RECENT_MIN_MESSAGES))
+
+
 def partition_messages(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Split a conversation into what is kept, retired, and summarised.
 
@@ -591,7 +648,8 @@ def partition_messages(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     kept_summaries = prior[len(prior) - keep_n:] if keep_n else []
     retired_summaries = prior[:len(prior) - len(kept_summaries)]
 
-    cut = len(non_system) - KEEP_RECENT_MESSAGES if KEEP_RECENT_MESSAGES else len(non_system)
+    keep = keep_recent_count(non_system)
+    cut = len(non_system) - keep if keep else len(non_system)
     cut = max(0, min(cut, len(non_system)))
     cut = _safe_cut(non_system, cut)
     to_summarize = non_system[:cut]
@@ -1256,6 +1314,8 @@ async def stats():
         "reserve_output": RESERVE_OUTPUT,
         "effective_input_budget": effective_threshold(),
         "keep_recent_messages": KEEP_RECENT_MESSAGES,
+        "keep_recent_mode": "messages" if KEEP_RECENT_EXPLICIT else "budget",
+        "keep_recent_fraction": KEEP_RECENT_FRACTION,
         "count_tools": COUNT_TOOLS,
         "upstream_timeout_seconds": UPSTREAM_TIMEOUT_SECONDS,
         "upstream_connect_timeout_seconds": UPSTREAM_CONNECT_TIMEOUT_SECONDS,

@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+**New — `cg_doctor.py`.** `python cg_doctor.py` checks an install and says how to fix what is wrong, in
+the same style as tool-guardian's `tg_setup.py doctor`: one `OK` / `WARN` / `FAIL` line per check, a
+`fix:` line under each problem, a `doctor: N ok, N warnings, N errors` count line, exit 1 on any FAIL.
+It covers the package and proxy versions, the `.env` (every numeric `GUARDIAN_*` value must parse; the
+reserve must be below the window), which context window is in use (`GUARDIAN_NUM_CTX`, a `numCtx` pinned
+in the preset given with `--preset`, or the window DSH reports), whether the proxy answers on its port, and
+whether the Python bridge starts under the interpreter the plugin would use (3.10+). `--json` prints the
+findings. Stdlib only; it never writes a file. Shipped in the npm package.
+
+**Changed — the proxy keeps recent messages by TOKEN BUDGET, not by count.** `context_guardian.py` used to
+keep the newest 8 messages verbatim whatever their size, so one 40 KB tool result could make a compaction
+free almost nothing, or 8 short turns could keep too little. With `GUARDIAN_KEEP_RECENT_MESSAGES` unset it
+now keeps the newest messages that fit in 20% of the usable window (`GUARDIAN_NUM_CTX` −
+`GUARDIAN_RESERVE_OUTPUT`), never fewer than 4 (`GUARDIAN_KEEP_RECENT_FRACTION` changes the 20%).
+**Setting `GUARDIAN_KEEP_RECENT_MESSAGES` keeps the exact old behaviour** (that many messages; `0` keeps
+none). `configure.py` now offers `auto` (the budget) as its default and only writes the variable when you
+type a number; `.env.example` ships it commented out. `/guardian/stats` reports `keep_recent_mode`
+(`budget` or `messages`) and `keep_recent_fraction`. If your existing `.env` has
+`GUARDIAN_KEEP_RECENT_MESSAGES=8` from an earlier `configure.py`, delete that line to get the new default.
+Tests: `tests/test_keep_recent_budget.py` (11 new); full suite 96 passed.
+
 ## dsh-context-guardian 0.1.0-alpha.5 - uses your model's real context window; update notice (2026-09-25)
 
 **Fix — big-context models were compacted far too early.** The engine divided every

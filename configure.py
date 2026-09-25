@@ -12,7 +12,6 @@ Every question has a sensible default (press Enter to accept). Numeric answers
 are validated, so a typo tells you rather than crashing Guardian at startup.
 Re-run any time to change your answers, or edit .env directly.
 """
-import os
 import sys
 from pathlib import Path
 
@@ -79,6 +78,21 @@ def ask_float(prompt: str, default: float, lo: float, hi: float) -> float:
             print(f"  {val} is out of range. Expected {lo}..{hi}.")
             continue
         return val
+
+
+def ask_keep_recent():
+    """None = the token-budget default (the key is NOT written, so the proxy
+    keeps the newest messages that fit in ~20% of the usable window, at least
+    4). A number = keep exactly that many messages (the old behaviour)."""
+    while True:
+        raw = input("\nWhat stays verbatim (never summarized)?\n"
+                    "  Enter = auto (newest ~20% of the window, at least 4 messages),\n"
+                    "  or a fixed number of messages\n  [auto]: ").strip().lower()
+        if raw in ("", "auto"):
+            return None
+        if raw.isdigit() and 1 <= int(raw) <= 1000:
+            return int(raw)
+        print(f"  '{raw}' is not a number from 1 to 1000 or 'auto'.")
 
 
 def ask_context() -> int:
@@ -151,9 +165,9 @@ def main() -> int:
     answers["GUARDIAN_COMPACT_THRESHOLD"] = str(ask_float(
         "Fraction of the context window at which Guardian compacts (0.1-1.0)",
         0.85, lo=0.1, hi=1.0))
-    answers["GUARDIAN_KEEP_RECENT_MESSAGES"] = str(ask_int(
-        "Most-recent messages to always keep verbatim (never summarized)", 8,
-        lo=1, hi=1000))
+    keep = ask_keep_recent()
+    if keep is not None:
+        answers["GUARDIAN_KEEP_RECENT_MESSAGES"] = str(keep)
     answers["GUARDIAN_UPSTREAM_TIMEOUT"] = str(ask_int(
         "Seconds to wait for the upstream backend to respond\n"
         "  (raise this if a slow local \"thinking\" model gives 500s only on "

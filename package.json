@@ -21,6 +21,7 @@
     "vendor/LICENSE.dsh-compaction-instant",
     "context_guardian.py",
     "configure.py",
+    "cg_doctor.py",
     "requirements.txt",
     "docs/dsh-integration.md",
     "THIRD_PARTY_NOTICES.md",

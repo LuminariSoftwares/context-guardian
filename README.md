@@ -176,7 +176,8 @@ cp .env.example .env
 | `GUARDIAN_UPSTREAM_URL` | `http://localhost:11434/v1` | The OpenAI-compatible backend Guardian forwards to |
 | `GUARDIAN_NUM_CTX` | `32768` | Your model's real context window, in tokens — keep this in sync with your actual backend/model config |
 | `GUARDIAN_COMPACT_THRESHOLD` | `0.85` | Fraction of `GUARDIAN_NUM_CTX` at which compaction triggers |
-| `GUARDIAN_KEEP_RECENT_MESSAGES` | `8` | Most-recent messages always kept verbatim, never summarized |
+| `GUARDIAN_KEEP_RECENT_MESSAGES` | unset | Unset (the default): keep the newest messages that fit in `GUARDIAN_KEEP_RECENT_FRACTION` of the usable window (`GUARDIAN_NUM_CTX` − `GUARDIAN_RESERVE_OUTPUT`), never fewer than 4 — a 40 KB tool result counts as what it is, not as one message. Set a number to keep exactly that many messages instead (the old fixed-count behaviour; `0` keeps none) |
+| `GUARDIAN_KEEP_RECENT_FRACTION` | `0.20` | Share of the usable window kept verbatim when `GUARDIAN_KEEP_RECENT_MESSAGES` is unset |
 | `GUARDIAN_CHARS_PER_TOKEN` | `3.5` | Characters-per-token used for the estimate |
 | `GUARDIAN_COUNT_TOOLS` | `1` | Count the `tools` array against the budget. Set `0` for pre-0.2.0 messages-only behaviour |
 | `GUARDIAN_UPSTREAM_TIMEOUT` | `600` | Seconds to wait for the upstream backend to respond |
@@ -205,6 +206,33 @@ python context_guardian.py
 ```
 
 Then point your CLI's `OPENAI_BASE_URL` at `http://localhost:8786/v1` (or whatever port you configured).
+
+## Check your setup: `cg_doctor.py`
+
+One command says what is configured, what is wrong, and how to fix each problem:
+
+```bash
+python cg_doctor.py                          # from the repo, or the installed npm package folder
+python cg_doctor.py --preset path/to/agent.cordis.yml   # also check the DSH preset that mounts engine.js
+python cg_doctor.py --json                   # the same findings as JSON
+```
+
+It prints one `OK` / `WARN` / `FAIL` line per check, a `fix:` line under every problem, and a count line
+(`doctor: 5 ok, 1 warnings, 0 errors`); it exits 1 if anything FAILed. It checks:
+
+- **the package version** (`package.json`) and the proxy's own version (`context_guardian.py`);
+- **your `.env`** — found or not, and every numeric `GUARDIAN_*` value actually parses (a `32k` or a
+  `GUARDIAN_RESERVE_OUTPUT` that is not below `GUARDIAN_NUM_CTX` is a FAIL with the fix);
+- **the context window in use** — `GUARDIAN_NUM_CTX` if you set it, else a `numCtx` pinned in the preset you
+  pass with `--preset` (a WARN: since 0.1.0-alpha.5 the engine reads your model's real window from DSH, so
+  a copied `numCtx: 32768` usually just shrinks it), else the window DSH reports for the session;
+- **whether the proxy answers** on `GUARDIAN_HOST:GUARDIAN_PORT` (a WARN, not a FAIL — the DSH bundle works
+  without it), and whether a running proxy was started with a different window than you now have set;
+- **whether the Python bridge works** — it starts `modules/cg_bridge.py` with the same interpreter the plugin
+  would pick (`GUARDIAN_PYTHON`, then a `.venv` beside the package, then `python`/`python3` on PATH) and
+  requires Python 3.10+.
+
+Standard library only; it never changes a file.
 
 ## Testing before you trust it with a real session
 
