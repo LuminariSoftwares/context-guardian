@@ -1,12 +1,13 @@
 {
   "name": "dsh-context-guardian",
-  "version": "0.1.0-alpha.5",
+  "version": "0.1.0-alpha.6",
   "description": "Context Guardian as a native DeepSeek Harness (DSH) bundle: deterministic, seq-pointer-preserving compaction with model-facing recall and search. Companion to dsh-tool-guardian.",
   "type": "module",
   "main": "index.js",
   "exports": {
     ".": "./index.js",
     "./engine": "./engine.js",
+    "./memory": "./cg_memory.js",
     "./package.json": "./package.json"
   },
   "files": [
@@ -14,6 +15,8 @@
     "update_check.js",
     "engine.js",
     "cg_recall.js",
+    "cg_memory.js",
+    "setup.mjs",
     "cordis.patch.yml",
     "modules/cg_bridge.py",
     "vendor/compiler.js",
@@ -24,6 +27,7 @@
     "cg_doctor.py",
     "requirements.txt",
     "docs/dsh-integration.md",
+    "docs/dsh-upstream-append-only.md",
     "THIRD_PARTY_NOTICES.md",
     "README.md",
     "CHANGELOG.md",
@@ -35,9 +39,10 @@
     }
   },
   "scripts": {
-    "check": "node --check index.js && node --check engine.js && node --check cg_recall.js && node --check vendor/compiler.js",
+    "check": "node --check index.js && node --check engine.js && node --check cg_recall.js && node --check cg_memory.js && node --check setup.mjs && node --check vendor/compiler.js",
     "selftest": "python modules/cg_bridge.py --selftest",
-    "test:node": "node tests/probes/probe_cg_recall.mjs && node cg_recall.js --selftest && node tests/engine_smoke.mjs && node tests/update_check.test.mjs"
+    "test:node": "node tests/probes/probe_cg_recall.mjs && node cg_recall.js --selftest && node tests/engine_smoke.mjs && node tests/goal_pin_smoke.mjs && node tests/memory_smoke.mjs && node tests/append_only_smoke.mjs && node tests/setup_smoke.mjs && node tests/update_check.test.mjs",
+    "setup": "node setup.mjs"
   },
   "engines": {
     "node": "^22.19.0 || >=24.0.0"

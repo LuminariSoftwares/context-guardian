@@ -1,6 +1,66 @@
 # Changelog
 
-## Unreleased
+## dsh-context-guardian 0.1.0-alpha.6 / PyPI context-guardian 0.6.0 (2026-09-26)
+
+**New: `npm run setup` (`setup.mjs`) adds the engine to your DSH agent preset.** A plugin's `cordis.patch.yml` cannot do this, because DSH composes it into the profile tree and never patches agent presets, so until now the compaction row was a hand-edit. `npm run setup`:
+- finds your DSH home (`--dsh-home`, else `DSH_HOME`, else `~/.dsh`);
+- picks the preset: `--preset`, else your default preset, else your only preset, else a new `guardian` preset copied from DSH's shipped `standard`;
+- backs up `agent.cordis.yml` and inserts the `context-guardian` row at the end of its `compaction` group, with the `file:///` URL of the `engine.js` beside it;
+- re-checks the file, and prints the next step.
+
+It is a dry run unless you add `--apply`. If the row is already there, it changes nothing. If the row points at an older copy, only its `name:` line is updated. The insert is text-only, so comments, layout and CRLF endings survive. `--json` prints the plan as JSON. Tests: `tests/setup_smoke.mjs`.
+
+**New: persistent memory (`cg_memory.js`).** On every compaction the engine pulls six kinds of fact out of the region being compacted, deterministically and with no model call:
+- decisions;
+- constraints;
+- files written;
+- to-dos;
+- errors from failed tool results;
+- preferences.
+
+Explicit `decision:`, `constraint:`, `todo:`, `error:` and `preference:` lines always count. The facts are merged into `memory.json`: `memoryPath`, default `<spanDir>/memory.json`. That file is loaded when the engine starts, re-read and saved after each compaction, and rendered as a `[memory -- ...]` block right after the pinned goal. The block appears in every checkpoint (deterministic and LLM) and in the next session. The block is capped by `memoryMaxTokens` (1200; `0` turns memory off). An unreadable memory file is moved aside, and memory never blocks a compaction. `cg_memory.js` is now in the npm package. Tests: `tests/memory_smoke.mjs`.
+
+**Fixed: files touched early no longer fall out of the checkpoint.** `FILES WRITTEN` used to list only the last 15 files the compacted region's tool calls wrote. A file named by an earlier checkpoint was lost at the next compaction, even under the cap. The line now carries the earlier checkpoints' files forward, and the memory file list keeps up to 200 paths.
+
+**New: `/guardian`.** One command shows:
+- the engine revision;
+- the window in use and where it came from;
+- pressure;
+- the last compaction and why (`llm`, `deterministic`, or `overflow` when the LLM summary could not fit);
+- where the pinned goal came from;
+- the memory counts;
+- whether append-only is on;
+- the spans archived in this run;
+- recalls used this turn.
+
+The same text is available to the model as the opt-in `guardian_status` tool.
+
+**New: `/recall digest`.** It prints:
+- the pinned goal;
+- the memory items this session added;
+- the files written;
+- the open to-dos;
+- the last error;
+- the last compaction.
+
+**New: a recall budget per turn.** The model's `recall` tool now answers with a pointer to `search` after `recallMaxPerTurn` (4) recalls in one turn, instead of letting several quarter-window recalls fill the context. The counter resets when the agent goes idle. `0` is unlimited, and the `/recall` command is never limited.
+
+**New: a warning when `dropSources` leaves a user-role message out of a checkpoint.** Every drop is logged as `dropped-injected` (seqs and kinds). The first drop of each kind in a session is a `warn` line naming the seqs and the `dropSources` entry to remove if it was real user text.
+
+**New (experimental, opt-in): append-only checkpoints (`appendOnly: true`).** DSH has no compaction-strategy hook, but its pressure and overflow compactions call the engine's public `compactRegion`, and the engine now wraps that call:
+- it keeps the leading checkpoints and compacts only what follows, so the new checkpoint is appended and the prompt prefix up to it stays byte-stable;
+- the provider's prefix cache survives;
+- appended checkpoints do not repeat the pinned goal, and show only the memory items they changed;
+- the chain rolls up into one checkpoint past `chainMaxCheckpoints` (4) or `chainMaxTokens`, or at 90% pressure.
+
+DSH's `compactNow` path (manual `/compact`, the idle trigger, `context_compact`) cannot be redirected and still rolls up. The DSH change that would close that is written up in `docs/dsh-upstream-append-only.md`. Off by default until it has a live proof. Tests: `tests/append_only_smoke.mjs`.
+
+**Docs.**
+- The README opens with a combined install block for Context Guardian and Tool Guardian, and has a compatibility matrix.
+- `docs/dsh-integration.md` has a `npm run setup` install and a "First 5 minutes" walkthrough, from a fresh preset to an idle compaction, its log lines, `/recall digest` and a second session that remembers.
+- It also has the memory, recall-budget and append-only sections, and the new options.
+
+`npm run test:node` now also runs `goal_pin_smoke`, `memory_smoke`, `append_only_smoke` and `setup_smoke`. Engine revision `cg-engine-4`.
 
 **New — `cg_doctor.py`.** `python cg_doctor.py` checks an install and says how to fix what is wrong, in
 the same style as tool-guardian's `tg_setup.py doctor`: one `OK` / `WARN` / `FAIL` line per check, a

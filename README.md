@@ -11,11 +11,13 @@
 </p>
 
 <p align="center">
+  <a href="#install-both-deepseek-harness-about-5-minutes">Install both</a> &middot;
   <a href="#why-this-exists">Why</a> &middot;
   <a href="#two-ways-to-run-it">Two ways to run it</a> &middot;
   <a href="#install">Install the proxy</a> &middot;
   <a href="docs/dsh-integration.md">Install in DSH</a> &middot;
   <a href="#see-it-work">See it work</a> &middot;
+  <a href="#compatibility">Compatibility</a> &middot;
   <a href="CHANGELOG.md">Changelog</a>
 </p>
 
@@ -30,6 +32,32 @@ Compaction for local models that actually fires, and never takes the conversatio
 | Claude-Code-style CLI on a local model | auto-compact never fires; the backend hard-rejects the request and the session is over | the proxy compacts before the window fills; the session keeps going |
 | DSH on a 32K local model (measured: 314 compaction attempts) | **48 succeeded**; the rest failed on an empty summary or overflowed the window *while summarising* | every failed or impossible summary falls back to a deterministic checkpoint: ~14,012 → ~584 tokens in 23 ms, no model call |
 | The part that was compacted away | gone | archived on disk; in DSH every checkpoint line carries a `seq` pointer that `recall` reads back |
+
+## Install both (DeepSeek Harness, about 5 minutes)
+
+Context Guardian and Tool Guardian are two halves of one problem: **Tool Guardian** keeps tool schemas and tool results from filling the window, and **Context Guardian** compacts the conversation before it fills and keeps what matters. They share no files and install separately. You need DSH 0.1.2-alpha.2 or later, Node.js `^22.19` or `>=24`, and Python 3.9+ on `PATH` for Tool Guardian's router.
+
+```bash
+# 1. Add both bundles to the DSH profile you use (`web` is the one `dsh web` uses)
+dsh plugin --profile web add dsh-tool-guardian
+dsh plugin --profile web add dsh-context-guardian
+
+# 2. Tool Guardian: copy in the MCP servers you already use (Claude Desktop / Cursor / Windsurf / .mcp.json), then check them
+cd ~/.dsh/profiles/web/node_modules/dsh-tool-guardian          # Windows: cd %USERPROFILE%\.dsh\profiles\web\node_modules\dsh-tool-guardian
+npm run setup                  # asks before it writes ~/.tool-guardian/mcp.json, then prints a doctor report
+
+# 3. Context Guardian: add its compaction row to your agent preset (a dry run until --apply)
+cd ~/.dsh/profiles/web/node_modules/dsh-context-guardian       # Windows: cd %USERPROFILE%\.dsh\profiles\web\node_modules\dsh-context-guardian
+npm run setup
+npm run setup -- --apply
+
+# 4. Start DSH and open a NEW session with the preset setup named
+dsh web
+```
+
+In that session, type `/guardian`. It shows Context Guardian's engine revision and your model's window. Then type `/toolguardian`. It shows each MCP server Tool Guardian started, the tokens the router saves on every request, and whether an update is out.
+
+Not on DSH? Context Guardian's proxy (`python context_guardian.py`, see its README) works with any OpenAI-compatible CLI. Tool Guardian runs as a plain MCP server for Claude Code, Cursor or any MCP client (see its README).
 
 ## Two ways to run it
 
@@ -61,6 +89,21 @@ flowchart LR
 ```
 
 The rest of this page is the **proxy**. The DSH engine has its own five-minute guide: **[docs/dsh-integration.md](docs/dsh-integration.md)**.
+
+## Compatibility
+
+| | tested on | expected to work | notes |
+|---|---|---|---|
+| DeepSeek Harness (engine) | 0.1.2-alpha.2 on Windows 11 | 0.1.2-alpha.2 and later 0.1.x | needs `compaction-basic` (the `standard` preset has it); `npm run setup` needs a user agent preset or DSH's shipped `standard` |
+| Node.js (engine, setup) | 22.23 on Windows 11; 22.x on Linux (test container) | `^22.19.0` or `>=24` | the `engines` field in package.json |
+| Python (proxy, bridge, `cg_doctor.py`) | 3.11 | 3.10 or later | the DSH engine itself needs no Python |
+| Operating system | Windows 11; Linux (tests) | macOS | macOS is untested |
+| Backend (proxy) | Ollama `/v1` | any OpenAI-compatible `/v1/chat/completions`: LiteLLM, vLLM, LM Studio, the llama.cpp server | the proxy estimates tokens itself, so it does not need the backend's usage numbers |
+| Backend (DSH engine) | Ollama models driven by DSH | any model DSH drives | the window is the one DSH reports for the model; set `numCtx` only to force a smaller one |
+| Client (proxy) | OpenClaude | Claude Code and other OpenAI-compatible CLIs | Cursor is untested |
+| Companion | dsh-tool-guardian 0.3.0-alpha.x, side by side in the same DSH profile | 0.3.0 and later | the two share no files and install separately |
+
+"Tested on" means the repo's test suites plus daily use on the machine this was built on. "Expected to work" is not tested; please open an issue if it does not work for you.
 
 ## Why this exists
 
@@ -118,7 +161,7 @@ scope which servers load per session — Claude Code and OpenClaude both accept
 the only source of MCP servers for the session.
 
 **Companion project — [Tool Guardian](https://github.com/LuminariSoftwares/tool-guardian)**
-(`pip install tool-guardian`) does the other half of this. It fronts your MCP servers behind three
+(`dsh-tool-guardian` on npm, or `tool-guardian` as a plain MCP server; see its README) does the other half of this. It fronts your MCP servers behind three
 generic tools and reveals the rest on demand, so the tool definitions stop being re-sent on every
 request in the first place. Context Guardian can't compact that fixed tool floor — Tool Guardian
 removes it. Use them together: **one trims the conversation, the other trims the tools.**

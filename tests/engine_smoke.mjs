@@ -1,8 +1,10 @@
 // Contract smoke for engine.js: a fake cordis ctx + fake compaction-basic service.
 // usage: node tests/engine_smoke.mjs      (exit 0 iff "0 failed")
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { emptyMemory, loadMemory, mergeMemory, saveMemory } from '../cg_memory.js'
+import { RECALL_GUIDE } from '../vendor/compiler.js'
 import * as engine from '../engine.js'
 
 const LIVE_ERROR = 'summarization produced no text summary content'
@@ -70,6 +72,28 @@ const baseConfig = (extra = {}) => ({ spanDir: join(tmp, 'spans'), logPath: join
 const regionOf = (session, count) => session.surface.nodes.slice(0, count).map(seq => session.deriveEventMessage(session.events[seq]))
 const smallInput = (session) => ({ system: 'sys', tools: [], messages: regionOf(session, 30) })
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
+
+/** A session built from raw messages, for checks that need an exact region. */
+const makeSessionOf = (messages, id = 'sess-custom') => {
+  const events = messages.map((data, index) => ({ seq: index, type: 'user/message', data }))
+  return {
+    id, events, surface: { nodes: events.map(event => event.seq), replaceGeneration: 0 },
+    deriveEventMessage: (event) => (event?.type === 'user/message' ? clone(event.data) : null),
+  }
+}
+const wholeInput = (session) => ({ system: 'sys', tools: [], messages: session.events.map(event => event.data) })
+/** One assistant turn that only edits `path` -- no prose, so memory holds files only. */
+const editTurns = (paths) => paths.map((path, index) => ({
+  role: 'assistant',
+  content: [{ type: 'tool-call', id: `t${index}`, name: 'edit', arguments: JSON.stringify({ path }) }],
+}))
+const checkpointTurn = (text) => ({ role: 'user', source: { kind: 'plugin', plugin: 'compact' }, content: [T(text)] })
+const readLog = (path) => {
+  try { return readFileSync(path, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) } catch { return [] }
+}
+/** A memory file holding exactly one durable fact. */
+const seedMemory = (path, item) => saveMemory(path, mergeMemory(emptyMemory(), [{ first: '2026-01-01T00:00:00.000Z', last: '2026-01-01T00:00:00.000Z', ...item }]))
+const fileLineOf = (text) => text.split('\n').find(line => line.startsWith('FILES WRITTEN'))
 
 const checks = []
 const check = (name, fn) => checks.push([name, fn])
@@ -292,6 +316,237 @@ check('host_context_window_lowers_pressure_and_logs_once', async () => {
   const hostLogs = h.logs.filter(line => line.includes("using the model's window 1000000"))
   // 20k tokens is ~2 % of a 1M window (not the ~61 % of the 32k default).
   return out.includes('of 1000000 tokens (2 %)') && !out.includes('61 %') && hostLogs.length === 1
+})
+
+// ── durable memory, durable files, /guardian, recall limits (cg-engine-4) ────
+
+check('defaults_resolve_memory_and_recall_limit', () => {
+  const plain = engine.resolveEngineOptions({}, {})
+  const off = engine.resolveEngineOptions({}, { GUARDIAN_MEMORY_MAX_TOKENS: '0' })
+  const envPath = join(tmp, 'chk-defaults-env.json')
+  const env = engine.resolveEngineOptions({}, { GUARDIAN_MEMORY_PATH: envPath })
+  const row = engine.resolveEngineOptions({ memoryPath: join(tmp, 'chk-defaults-row.json') }, {})
+  return plain.memoryMaxTokens === 1200 && plain.recallMaxPerTurn === 4
+    && plain.memoryPath === join(plain.spanDir, 'memory.json')
+    && off.memoryMaxTokens === 0 && env.memoryPath === envPath && row.memoryPath === join(tmp, 'chk-defaults-row.json')
+})
+check('memory_loaded_at_apply_and_rendered', async () => {
+  const memoryPath = join(tmp, 'chk-loaded', 'memory.json')
+  const config = baseConfig({ memoryPath, logPath: join(tmp, 'chk-loaded.jsonl') })
+  seedMemory(memoryPath, { cat: 'decisions', text: 'use sqlite for the ledger', seq: 4, session: 'sess-smoke' })
+  const h = makeCtx({ llm: 'throw' }); engine.apply(h.ctx, config)
+  const session = makeSession()
+  // The file on disk is already in the closure before any compaction happens.
+  const before = (await h.commands.get('guardian').handler({ rawInput: '', agent: { session } })).text
+  const text = (await h.compaction.summarize(smallInput(session), { session })).summary[0].text
+  const loaded = readLog(config.logPath).find(entry => entry.event === 'memory-loaded')
+  return text.includes('use sqlite for the ledger') && text.includes('[memory --')
+    && text.indexOf('[memory --') !== -1 && text.indexOf('[memory --') < text.indexOf(RECALL_GUIDE)
+    && loaded !== undefined && loaded.status === 'loaded' && loaded.path === memoryPath && loaded.items === 1
+    && before.includes(`memory: 1 items (decisions 1, constraints 0, files 0, todos 0 open, errors 0, preferences 0) in ${memoryPath}`)
+})
+check('memory_saved_after_compaction', async () => {
+  const memoryPath = join(tmp, 'chk-saved', 'memory.json')
+  const h = makeCtx({ llm: 'throw' }); engine.apply(h.ctx, baseConfig({ memoryPath }))
+  const session = makeSessionOf([{ role: 'user', content: [T('decision: keep the broker on port 8790')] }])
+  await h.compaction.summarize(wholeInput(session), { session })
+  const items = loadMemory(memoryPath).memory.items
+  return items.some(item => item.cat === 'decisions' && item.text === 'keep the broker on port 8790' && item.session === 'sess-custom')
+})
+check('memory_prepended_to_llm_summary', async () => {
+  const memoryPath = join(tmp, 'chk-llm', 'memory.json')
+  seedMemory(memoryPath, { cat: 'preferences', text: 'prefer ruff over flake8', seq: 3, session: 'sess-smoke' })
+  const h = makeCtx({ llm: 'ok' }); engine.apply(h.ctx, baseConfig({ memoryPath }))
+  const session = makeSession()
+  const result = await h.compaction.summarize(smallInput(session), { session })
+  const texts = result.summary.map(block => block.text)
+  return result.llmStreamCall === true && texts.length === 3
+    && texts[0].includes("[pinned goal --") && texts[1].includes('[memory --') && texts[1].includes('prefer ruff over flake8')
+    && texts[2] === 'LLM SUMMARY'
+})
+check('memory_off_writes_nothing', async () => {
+  const memoryPath = join(tmp, 'chk-off', 'memory.json')
+  const h = makeCtx({ llm: 'throw' }); engine.apply(h.ctx, baseConfig({ memoryPath, memoryMaxTokens: 0 }))
+  const session = makeSession()
+  const text = (await h.compaction.summarize(smallInput(session), { session })).summary[0].text
+  const status = (await h.commands.get('guardian').handler({ rawInput: '', agent: { session } })).text
+  return !existsSync(memoryPath) && !text.includes('[memory --') && status.includes('memory: off (memoryMaxTokens 0)')
+})
+check('memory_failure_never_breaks_compaction', async () => {
+  const dir = join(tmp, 'chk-fail'); mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'blocker'), 'a plain file where a directory would have to be')
+  const config = baseConfig({ memoryPath: join(dir, 'blocker', 'memory.json') })
+  const h = makeCtx({ llm: 'throw' }); engine.apply(h.ctx, config)
+  const session = makeSession()
+  const result = await h.compaction.summarize(smallInput(session), { session })
+  return result.provider === 'context-guardian' && result.summary[0].text.includes('RECALL:')
+    && result.summary[0].text.includes('seqs 100-129')
+    // Reading a path THROUGH a plain file is ENOTDIR on POSIX (-> "unreadable") but ENOENT on Windows
+    // (-> "missing", start fresh); either is right. The unreadable warning itself is proven cross-platform by
+    // corrupt_memory_file_is_warned_and_moved_aside below.
+    && (h.logs.some(line => line.startsWith('warn') && line.includes(`memory at ${config.memoryPath} is unreadable`))
+      || readLog(config.logPath).some(entry => entry.event === 'memory-loaded' && entry.status === 'missing'))
+    && h.logs.some(line => line.startsWith('warn') && line.includes('memory NOT written to') && line.includes('compaction proceeds'))
+    && readLog(config.logPath).some(entry => entry.event === 'memory' && entry.saved === false)
+})
+check('corrupt_memory_file_is_warned_and_moved_aside', async () => {
+  const dir = join(tmp, 'chk-corrupt'); mkdirSync(dir, { recursive: true })
+  const memoryPath = join(dir, 'memory.json'); writeFileSync(memoryPath, '{ this is not json')
+  const config = baseConfig({ memoryPath })
+  const h = makeCtx({ llm: 'throw' }); engine.apply(h.ctx, config)
+  const session = makeSession()
+  const result = await h.compaction.summarize(smallInput(session), { session })
+  return result.provider === 'context-guardian'
+    && h.logs.some(line => line.startsWith('warn') && line.includes(`memory at ${memoryPath} is unreadable`))
+    && readdirSync(dir).some(name => name.startsWith('memory.json.corrupt'))
+    && readLog(config.logPath).some(entry => entry.event === 'memory' && entry.saved === true)
+})
+check('durable_files_survive_second_compaction', async () => {
+  const many = Array.from({ length: 20 }, (_, index) => `file_${String(index).padStart(2, '0')}.py`)
+  const compactTwice = async (h, memoryOff) => {
+    const first = makeSessionOf(editTurns(many))
+    const firstText = (await h.compaction.summarize(wholeInput(first), { session: first })).summary[0].text
+    const second = makeSessionOf([checkpointTurn(firstText), ...editTurns(['late.py'])])
+    return (await h.compaction.summarize(wholeInput(second), { session: second })).summary[0].text
+  }
+  const off = makeCtx({ llm: 'throw' })
+  engine.apply(off.ctx, baseConfig({ memoryPath: join(tmp, 'chk-durable-off', 'memory.json'), memoryMaxTokens: 0, filesListed: 15 }))
+  const withoutMemory = await compactTwice(off, true)
+  const filesLine = fileLineOf(withoutMemory)
+  if (filesLine === undefined || !filesLine.includes('late.py') || !filesLine.includes('file_19.py')) return false
+  if (filesLine.includes('file_00.py') || withoutMemory.includes('[memory --')) return false
+
+  const memoryPath = join(tmp, 'chk-durable-on', 'memory.json')
+  const on = makeCtx({ llm: 'throw' })
+  engine.apply(on.ctx, baseConfig({ memoryPath, filesListed: 15 }))
+  const withMemory = await compactTwice(on, false)
+  const memoryFiles = (withMemory.split('\n').find(line => line.startsWith('files:')) ?? '')
+  return withMemory.includes('[memory --') && memoryFiles.includes('file_00.py') && memoryFiles.includes('late.py')
+})
+check('guardian_command_registered', async () => {
+  const h = makeCtx(); engine.apply(h.ctx, baseConfig({ memoryPath: join(tmp, 'chk-guardian', 'memory.json') }))
+  const command = h.commands.get('guardian')
+  if (command === undefined || command.input !== undefined) return false
+  const out = (await command.handler({ rawInput: '', agent: { session: makeSession() } })).text
+  return ['context-guardian cg-engine-4', 'window:', 'pressure:', 'last compaction:', 'goal:', 'memory:', 'spans archived:', 'recall this turn:']
+    .every(needle => out.includes(needle))
+})
+check('guardian_reports_last_compaction_kinds', async () => {
+  const report = async (h, session) => (await h.commands.get('guardian').handler({ rawInput: '', agent: { session } })).text
+  const ok = makeCtx({ llm: 'ok' }); engine.apply(ok.ctx, baseConfig({ memoryPath: join(tmp, 'chk-kinds-ok', 'memory.json') }))
+  const usedLlm = makeSession()
+  await ok.compaction.summarize(smallInput(usedLlm), { session: usedLlm })
+  const afterLlm = await report(ok, usedLlm)
+
+  const narrow = makeCtx({ llm: 'ok' }); engine.apply(narrow.ctx, baseConfig({ numCtx: 1024, memoryPath: join(tmp, 'chk-kinds-over', 'memory.json') }))
+  const overflowed = makeSession()
+  const fellBack = await narrow.compaction.summarize(smallInput(overflowed), { session: overflowed })
+  const afterOverflow = await report(narrow, overflowed)
+
+  const broken = makeCtx({ llm: 'throw' }); engine.apply(broken.ctx, baseConfig({ memoryPath: join(tmp, 'chk-kinds-det', 'memory.json') }))
+  const fellToDeterministic = makeSession()
+  await broken.compaction.summarize(smallInput(fellToDeterministic), { session: fellToDeterministic })
+  const afterFailure = await report(broken, fellToDeterministic)
+  return afterLlm.includes('last compaction: llm (p/m) at ')
+    && fellBack.provider === 'context-guardian' && afterOverflow.includes('last compaction: overflow (llm summary cannot fit:')
+    && afterFailure.includes('last compaction: deterministic (llm summary failed:')
+})
+check('guardian_status_tool_opt_in', async () => {
+  const off = makeCtx(); engine.apply(off.ctx, baseConfig({ memoryPath: join(tmp, 'chk-opt-off', 'memory.json') }))
+  const on = makeCtx(); engine.apply(on.ctx, baseConfig({ tools: ['recall', 'search', 'guardian_status'], memoryPath: join(tmp, 'chk-opt-on', 'memory.json') }))
+  if (off.tools.has('guardian_status') || !on.tools.has('guardian_status')) return false
+  if (on.tools.get('guardian_status').parameters.properties === undefined) return false
+  const session = makeSession()
+  const fromTool = await on.tools.get('guardian_status').execute({}, { agent: { session } })
+  const fromCommand = (await on.commands.get('guardian').handler({ rawInput: '', agent: { session } })).text
+  return fromTool === fromCommand && fromTool.includes('context-guardian cg-engine-4') && fromTool.includes('spans archived:')
+})
+check('recall_digest', async () => {
+  const memoryPath = join(tmp, 'chk-digest', 'memory.json')
+  const h = makeCtx({ llm: 'throw' }); engine.apply(h.ctx, baseConfig({ memoryPath }))
+  const session = makeSessionOf([
+    { role: 'user', content: [T('todo: write the docs for the broker')] },
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'e1', name: 'edit', arguments: JSON.stringify({ path: 'docs/broker.md' }) }] },
+  ])
+  await h.compaction.summarize(wholeInput(session), { session })
+  const out = (await h.commands.get('recall').handler({ rawInput: 'DIGEST', agent: { session } })).text
+  const command = h.commands.get('recall')
+  if (!['DIGEST (context-guardian)', 'goal:', 'memory updated this session:', 'open todos:', 'write the docs', 'files written: docs/broker.md', 'last compaction: deterministic', 'last error: none']
+    .every(needle => out.includes(needle))) return false
+  if (!command.description.includes('/recall digest') || !command.input.hint.includes('digest')) return false
+
+  // A goal long enough to be cut, carried into the second compaction BY the checkpoint.
+  const long = `Línea ${'fix café/naïve '.repeat(60)}`
+  if (long.length <= 300) return false
+  const goalSession = makeSessionOf([{ role: 'user', content: [T(long)] }, ...editTurns(['a.py'])])
+  const firstText = (await h.compaction.summarize(wholeInput(goalSession), { session: goalSession })).summary[0].text
+  const carried = makeSessionOf([checkpointTurn(firstText), ...editTurns(['b.py'])])
+  await h.compaction.summarize(wholeInput(carried), { session: carried })
+  const second = (await h.commands.get('recall').handler({ rawInput: 'digest', agent: { session: carried } })).text
+  const status = (await h.commands.get('guardian').handler({ rawInput: '', agent: { session: carried } })).text
+  const goalLine = second.split('\n').find(line => line.startsWith('goal: ')) ?? ''
+  const shown = goalLine.slice('goal: '.length, goalLine.indexOf(' (from a checkpoint)'))
+  return goalLine.endsWith('(from a checkpoint) +0 updates') && shown.length === 300 && shown.endsWith('...')
+    && shown.startsWith('Línea fix café/naïve') && shown.includes('naïve')
+    && status.includes('goal: pinned from a checkpoint (+0 updates)')
+})
+check('recall_limit_per_turn', async () => {
+  const h = makeCtx(); engine.apply(h.ctx, baseConfig({ recallMaxPerTurn: 2, idleCompactRatio: 0, memoryPath: join(tmp, 'chk-limit', 'memory.json') }))
+  const agent = { session: makeSession() }
+  const first = await h.tools.get('recall').execute({ type: 'result', id: '101' }, { agent })
+  const second = await h.tools.get('recall').execute({ type: 'result', id: '103' }, { agent })
+  const third = await h.tools.get('recall').execute({ type: 'result', id: '105' }, { agent })
+  const viaCommand = await h.commands.get('recall').handler({ rawInput: 'result 101', agent })
+  h.emit('agent/status', { agent, status: 'idle' })
+  const afterIdle = await h.tools.get('recall').execute({ type: 'result', id: '101' }, { agent })
+  if (!first.includes('UNIQUE-RESULT-0') || first.includes('limit of')) return false
+  if (second.includes('limit of') || !third.includes('limit of 2 recalls per turn') || !third.includes('search')) return false
+  if (viaCommand.kind !== 'success' || !viaCommand.text.includes('UNIQUE-RESULT-0')) return false
+  if (!afterIdle.includes('UNIQUE-RESULT-0') || afterIdle.includes('limit of')) return false
+
+  const unlimited = makeCtx(); engine.apply(unlimited.ctx, baseConfig({ recallMaxPerTurn: 0, memoryPath: join(tmp, 'chk-limit-0', 'memory.json') }))
+  const other = { session: makeSession() }
+  const texts = []
+  for (let index = 0; index < 5; index += 1) texts.push(await unlimited.tools.get('recall').execute({ type: 'result', id: '101' }, { agent: other }))
+  return texts.every(text => !text.includes('limit of')) && texts.every(text => text.includes('UNIQUE-RESULT-0'))
+})
+check('dropped_injected_warns_once_per_kind', async () => {
+  const config = baseConfig({ memoryPath: join(tmp, 'chk-dropped', 'memory.json'), logPath: join(tmp, 'chk-dropped.jsonl') })
+  const h = makeCtx({ llm: 'throw' }); engine.apply(h.ctx, config)
+  const session = makeSessionOf([
+    { role: 'user', content: [T('the real request about the broker ' + 'Detail sentence about the broker. '.repeat(12))] },
+    { role: 'user', source: { kind: 'agent-instructions' }, content: [T('INSTRUCTION-DUMP ' + 'rule '.repeat(500))] },
+    { role: 'user', source: { kind: 'agent-instructions' }, content: [T('SECOND-DUMP ' + 'rule '.repeat(500))] },
+    { role: 'user', source: { kind: 'plugin', plugin: 'repeat-tool-reminder' }, content: [T('REMINDER ' + 'x '.repeat(200))] },
+    { role: 'assistant', content: [T('working on it now, some prose about the broker. ' + 'Explanation of the change. '.repeat(10))] },
+  ])
+  const input = wholeInput(session)
+  await h.compaction.summarize(input, { session })
+  await h.compaction.summarize(input, { session })
+  const warns = h.logs.filter(line => line.startsWith('warn') && line.includes('out of the checkpoint'))
+  const records = readLog(config.logPath).filter(entry => entry.event === 'dropped-injected')
+  const nodes = session.events.map(event => ({ seq: event.seq, message: event.data }))
+  const droppedNodes = engine.buildCheckpoint(nodes, engine.resolveEngineOptions({ memoryMaxTokens: 0 }, {}), 0.8).droppedNodes
+  return warns.length === 2
+    && warns.some(line => line.includes('of source kind "agent-instructions" out of the checkpoint (seqs 1, 2);'))
+    && warns.some(line => line.includes('left 1 user-role message(s) of source kind "repeat-tool-reminder" out of the checkpoint (seqs 3);'))
+    && warns.every(line => line.includes('remove "') && line.includes('from dropSources.'))
+    && records.length === 2 && records.every(entry => entry.seqs.join(',') === '1,2,3' && entry.kinds.join(',') === 'agent-instructions,repeat-tool-reminder')
+    && JSON.stringify(droppedNodes) === JSON.stringify([{ seq: 1, kind: 'agent-instructions' }, { seq: 2, kind: 'agent-instructions' }, { seq: 3, kind: 'repeat-tool-reminder' }])
+})
+check('build_checkpoint_unchanged_without_extras', () => {
+  const session = makeSession()
+  const { nodes } = engine.mapRegionSeqs(session, regionOf(session, 36))
+  const options = engine.resolveEngineOptions({ memoryMaxTokens: 0 }, {})
+  const all = engine.sessionNodes(session)
+  const plain = engine.buildCheckpoint(nodes, options, 0.8, all)
+  const withExtras = engine.buildCheckpoint(nodes, options, 0.8, all, {})
+  if (plain.text !== withExtras.text || plain.droppedNodes.length !== 0) return false
+  if (!plain.text.includes(RECALL_GUIDE) || !plain.text.includes('context-guardian checkpoint · deterministic')) return false
+  // With a block supplied it lands after the goal and before the recall guide.
+  const seeded = engine.buildCheckpoint(nodes, options, 0.8, all, { memoryBlock: '[memory -- seeded]' }).text
+  const at = seeded.indexOf('[memory -- seeded]')
+  return at !== -1 && at < seeded.indexOf(RECALL_GUIDE) && seeded.indexOf('[pinned goal --') < at
 })
 
 let passed = 0

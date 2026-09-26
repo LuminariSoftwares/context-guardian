@@ -11,6 +11,10 @@ Context Guardian is MIT licensed (see [LICENSE](LICENSE)). This file lists what 
 - Licence text and copyright notice: [`vendor/LICENSE.dsh-compaction-instant`](vendor/LICENSE.dsh-compaction-instant).
 - Used by: `engine.js` imports `compiler.js`. `region.js` is kept beside it for reference and is not loaded.
 
+### DeepSeek Harness 0.1.2-alpha.2 — MIT — deepseek-ai
+
+- Files: `tests/fixtures/standard.agent.cordis.yml` (DSH's shipped `standard` agent preset, unmodified) and `tests/fixtures/installed.agent.cordis.yml` (the same file with the `context-guardian` row added). Test fixtures for `setup.mjs` only; they are not in the npm package.
+
 The compiler itself ports the principle of [VCC](https://github.com/lllyasviel/VCC) (`skills/conversation-compiler/scripts/VCC.py`, lllyasviel), as its own header states.
 
 ## Ideas, with no code included

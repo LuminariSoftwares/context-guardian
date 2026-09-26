@@ -41,11 +41,12 @@ import { appendFileSync, closeSync, mkdirSync, openSync, readdirSync, statSync, 
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { COMPILER_REV, DEFAULT_NOISE_PATTERNS, RECALL_GUIDE, compileNoisePatterns, compileRegion, isCheckpointSource, joinCompiledEntries, parseToolArguments } from './vendor/compiler.js'
+import { MEMORY_REV, emptyMemory, extractMemory, itemsForSession, loadMemory, memoryStats, mergeMemory, normalizeText, renderMemory, saveMemory } from './cg_memory.js'
 import * as lib from './cg_recall.js'
 
 export const name = 'context-guardian-engine'
 export const inject = ['compaction']
-export const ENGINE_REV = 'cg-engine-3'
+export const ENGINE_REV = 'cg-engine-4'
 
 // Pinned goal markers. The session's original request is pinned into every
 // checkpoint byte-for-byte so a local model never drifts from the task after
@@ -56,7 +57,7 @@ export const GOAL_UPDATE_RE = /^\s*goal\s*:/i
 
 const PACKAGE_ROOT = dirname(fileURLToPath(import.meta.url))
 const MODES = ['llm-then-deterministic', 'deterministic', 'off']
-const ALL_TOOLS = ['recall', 'search', 'context_rewrite_cost', 'context_compact']
+const ALL_TOOLS = ['recall', 'search', 'context_rewrite_cost', 'context_compact', 'guardian_status']
 
 export const DEFAULTS = Object.freeze({
   mode: 'llm-then-deterministic',
@@ -73,6 +74,11 @@ export const DEFAULTS = Object.freeze({
   maxSearchHits: 50,
   keywordTerms: 25,
   filesListed: 15,
+  // Durable memory: 0 turns it completely OFF (nothing read, written or rendered).
+  memoryMaxTokens: 1200,
+  memoryPath: '',
+  // 0 = unlimited model-facing recalls per turn (the /recall command is never limited).
+  recallMaxPerTurn: 4,
   keepSpans: 500,
   spanDir: '',
   logPath: '',
@@ -81,6 +87,12 @@ export const DEFAULTS = Object.freeze({
   hideTools: [],
   // Harness-injected context the harness re-injects by itself: worthless inside a checkpoint.
   dropSources: ['agent-instructions', 'skill-catalog', '@deepseek-ai/dsh-system-prompt', 'repeat-tool-reminder'],
+  // Append-only checkpoints: keep the leading run of checkpoint nodes and compact only
+  // what follows, so the prompt prefix never changes and the provider's KV/prefix cache
+  // survives. Opt-in until it has a live proof; 0 chainMaxTokens = auto per session.
+  appendOnly: false,
+  chainMaxTokens: 0,
+  chainMaxCheckpoints: 4,
 })
 
 /**
@@ -109,11 +121,19 @@ export function resolveEngineOptions(config = {}, env = process.env) {
   const envMode = String(env.GUARDIAN_DSH_MODE ?? '').trim().toLowerCase()
   const rowMode = String(pick('mode')).trim().toLowerCase()
   const mode = MODES.includes(envMode) ? envMode : MODES.includes(rowMode) ? rowMode : DEFAULTS.mode
+  // A boolean switch, not a number: only the four spellings turn it, everything
+  // else falls through to the row, which counts as on when it is exactly `true`.
+  const envAppendOnly = String(env.GUARDIAN_APPEND_ONLY ?? '').trim().toLowerCase()
+  const appendOnly = envAppendOnly === '1' || envAppendOnly === 'true' ? true
+    : envAppendOnly === '0' || envAppendOnly === 'false' ? false
+      : pick('appendOnly') === true
   const numCtx = Math.floor(num('GUARDIAN_NUM_CTX', 'numCtx', 1024, 4_000_000))
   // Did the user pin the window themselves? An explicit numCtx (env or preset row)
   // must always win over what the host reports, so the window helper needs to know.
   const numCtxExplicit = (env.GUARDIAN_NUM_CTX !== undefined && env.GUARDIAN_NUM_CTX !== '')
     || (row.numCtx !== undefined && row.numCtx !== null)
+  // Resolved once: the memory file lives next to the spans unless told otherwise.
+  const spanDir = env.GUARDIAN_SPAN_DIR || String(pick('spanDir') || '') || join(PACKAGE_ROOT, 'logs', 'guardian_spans')
   return {
     mode,
     numCtx,
@@ -136,13 +156,19 @@ export function resolveEngineOptions(config = {}, env = process.env) {
     maxSearchHits: Math.floor(num('GUARDIAN_MAX_SEARCH_HITS', 'maxSearchHits', 1, 1000)),
     keywordTerms: Math.floor(num('GUARDIAN_KEYWORD_TERMS', 'keywordTerms', 0, 500)),
     filesListed: Math.floor(num('GUARDIAN_FILES_LISTED', 'filesListed', 0, 200)),
+    memoryMaxTokens: Math.floor(num('GUARDIAN_MEMORY_MAX_TOKENS', 'memoryMaxTokens', 0, 100_000)),
+    memoryPath: env.GUARDIAN_MEMORY_PATH || String(pick('memoryPath') || '') || join(spanDir, 'memory.json'),
+    recallMaxPerTurn: Math.floor(num('GUARDIAN_RECALL_MAX_PER_TURN', 'recallMaxPerTurn', 0, 1000)),
     keepSpans: Math.floor(num('GUARDIAN_KEEP_SPANS', 'keepSpans', 0, 1_000_000)),
-    spanDir: env.GUARDIAN_SPAN_DIR || String(pick('spanDir') || '') || join(PACKAGE_ROOT, 'logs', 'guardian_spans'),
+    spanDir,
     logPath: env.GUARDIAN_DSH_LOG || String(pick('logPath') || '') || join(PACKAGE_ROOT, 'logs', 'guardian_dsh.jsonl'),
     tools: list('GUARDIAN_DSH_TOOLS', 'tools').filter(t => ALL_TOOLS.includes(t)),
     toolArgTools: list('GUARDIAN_TOOL_ARG_TOOLS', 'toolArgTools'),
     hideTools: list('GUARDIAN_HIDE_TOOLS', 'hideTools'),
     dropSources: list('GUARDIAN_DROP_SOURCES', 'dropSources'),
+    appendOnly,
+    chainMaxTokens: Math.floor(num('GUARDIAN_CHAIN_MAX_TOKENS', 'chainMaxTokens', 0, 1_000_000)),
+    chainMaxCheckpoints: Math.floor(num('GUARDIAN_CHAIN_MAX_CHECKPOINTS', 'chainMaxCheckpoints', 1, 1000)),
   }
 }
 
@@ -348,6 +374,27 @@ export function extractGoal(nodes) {
   return { goal, updates: [...bySeq.values()].sort((a, b) => a.seq - b.seq) }
 }
 
+/**
+ * Where the session's pinned goal came from: a checkpoint carried it, or it is
+ * the first user-text node. Same walk as extractGoal; `seq` is null when a
+ * checkpoint owns the goal or when there is no goal at all.
+ */
+export function goalOrigin(nodes) {
+  let fromCheckpoint = false
+  let seq = null
+  for (const node of nodes ?? []) {
+    const message = node?.message
+    if (message === undefined || message === null) continue
+    if (isCheckpointSource(message.source)) {
+      if (!fromCheckpoint && GOAL_BLOCK_RE.test(messageText(message))) fromCheckpoint = true
+      continue
+    }
+    if (seq === null && isUserTextNode(message)) seq = node.seq
+  }
+  if (fromCheckpoint) seq = null
+  return { seq, fromCheckpoint, updates: extractGoal(nodes).updates.length }
+}
+
 /** Render a pinned-goal block for a checkpoint head. '' when there is no goal. */
 export function renderGoal(g) {
   if (g?.goal === null || g?.goal === undefined) return ''
@@ -359,8 +406,77 @@ export function renderGoal(g) {
   return out
 }
 
+// ── append-only checkpoint chains ──────────────────────────────────────────
+// DSH's compaction-basic always compacts a range that starts at the FIRST surface
+// node, so every compaction rewrites the whole prompt prefix, the earlier
+// checkpoints included, and the provider's KV/prefix cache dies each time. There is
+// no strategy hook, but the automatic paths reach the PUBLIC `compactRegion` by
+// dynamic dispatch, so overriding it on the service instance is enough: keep the
+// leading run of checkpoint nodes (the "chain head") and compact only what follows.
+// The new checkpoint is then APPENDED after the head instead of replacing it.
+
+/**
+ * Where an append-only compaction should start, or why the whole chain must roll
+ * up instead. Pure and never throws: an exception is reported as
+ * `reason: 'error: <msg>'` with the given start kept, because a bad plan must
+ * never be a failed compaction.
+ *
+ * `headSeqs` is the leading run of checkpoint surface seqs (the chain head) and
+ * `chainTokens` what they cost, so the caller can record the decision. Both are
+ * also carried by every "keep start" return, empty / 0 when not computed.
+ */
+export function planChainStart(session, start, end, opts = {}) {
+  const keep = (reason, headSeqs = [], chainTokens = 0) => ({ start, reason, headSeqs, chainTokens })
+  try {
+    const surface = Array.from(session?.surface?.nodes ?? [])
+    const si = surface.indexOf(start)
+    const ei = surface.indexOf(end)
+    // Only a range anchored at the very first surface node can leave a head behind.
+    if (si !== 0 || ei < 0) return keep('not head-anchored')
+    const headSeqs = []
+    const headMessages = []
+    let k = 0
+    for (; k <= ei; k += 1) {
+      const seq = surface[k]
+      const message = session.deriveEventMessage(session.events[seq]) ?? null
+      if (!isCheckpointSource(message?.source)) break
+      headSeqs.push(seq)
+      headMessages.push(message)
+    }
+    if (headSeqs.length === 0) return keep('no checkpoint head')
+    // The whole range is checkpoints: there is nothing to append after it.
+    if (k > ei) return keep('nothing after the head', headSeqs)
+    const chainTokens = headMessages.reduce((total, message) => total + lib.estTokens(lib.renderMessage(message)), 0)
+    // Past either budget the head is not a prefix worth preserving: roll it up.
+    if (chainTokens > opts.chainMaxTokens) return keep('roll-up: chain over budget', headSeqs, chainTokens)
+    if (headSeqs.length >= opts.chainMaxCheckpoints) return keep('roll-up: chain at max checkpoints', headSeqs, chainTokens)
+    if (opts.pressure >= 0.9) return keep('roll-up: emergency pressure', headSeqs, chainTokens)
+    return { start: surface[k], reason: 'append', headSeqs, chainTokens }
+  } catch (error) {
+    return keep(`error: ${String(error?.message ?? error)}`)
+  }
+}
+
+/**
+ * The goal block for a checkpoint APPENDED after a chain head. The head already
+ * carries the goal verbatim, so repeating it would grow the prefix for nothing:
+ * the appended checkpoint only names what changed. Without a head-carried goal
+ * there is nothing to point at, and the full block is rendered as usual.
+ */
+export function renderGoalDelta(headNodes, allGoalNodes) {
+  const head = extractGoal(headNodes)
+  const full = extractGoal(allGoalNodes)
+  if (head.goal === null || head.goal === undefined) return renderGoal(full)
+  const seen = new Set((head.updates ?? []).map(update => update.seq))
+  const fresh = (full.updates ?? []).filter(update => !seen.has(update.seq))
+  if (fresh.length === 0) return ''
+  let out = "[pinned goal: unchanged, see the first checkpoint above; new 'goal:' updates follow]"
+  for (const update of fresh) out += `\n${GOAL_OPEN} update seq ${update.seq}\n${update.text}\n${GOAL_CLOSE}`
+  return out
+}
+
 /** The deterministic checkpoint body for one region. Pure. */
-export function buildCheckpoint(allRegionNodes, options, pressure, allNodes) {
+export function buildCheckpoint(allRegionNodes, options, pressure, allNodes, extras = {}) {
   const { kept: nodes, dropped } = splitInjected(allRegionNodes, options.dropSources)
   const regionTokens = allRegionNodes.reduce((total, node) => total + lib.estTokens(lib.renderMessage(node.message)), 0)
   const tier = tierOf(pressure)
@@ -385,17 +501,34 @@ export function buildCheckpoint(allRegionNodes, options, pressure, allNodes) {
   const range = real.length === 0 ? 'unmapped' : `${Math.min(...real)}-${Math.max(...real)}`
   // The goal is computed from the region PLUS the whole session (region first),
   // so a goal carried by a checkpoint inside the region wins over a later user
-  // message. It is never counted against or cut by any cap.
+  // message. It is never counted against or cut by any cap. An append-only chain
+  // supplies its own block instead (renderGoalDelta), '' meaning no goal block.
   const goalNodes = allNodes === undefined || allNodes === null ? allRegionNodes : [...allRegionNodes, ...allNodes]
-  const goalBlock = renderGoal(extractGoal(goalNodes))
+  const goalBlock = typeof extras?.goalBlock === 'string' ? extras.goalBlock : renderGoal(extractGoal(goalNodes))
+  // The durable memory block sits right under the goal, like it: never capped.
+  const memoryBlock = String(extras?.memoryBlock ?? '')
   const parts = [
     `[context-guardian checkpoint · deterministic · ${allRegionNodes.length} nodes · seqs ${range} · ~${regionTokens} -> ~${compiled.stats.tokens} tokens · ${COMPILER_REV}]`,
   ]
   if (goalBlock.length > 0) parts.push(goalBlock)
+  if (memoryBlock.length > 0) parts.push(memoryBlock)
   parts.push(RECALL_GUIDE)
   if (dropped.length > 0) parts.push(`[${dropped.length} harness-injected context messages omitted (instructions, skill list, runtime notes -- the harness re-injects them): seqs ${dropped.map(node => node.seq).join(', ')}]`)
   parts.push(...compiled.entries)
-  const files = filesWritten(nodes, options.filesListed)
+  // Durable files: whatever an EARLIER checkpoint inside this region already
+  // named, then what this region wrote. Without the first group a file edited
+  // before the previous compaction is lost at every later one.
+  const durable = new Map()
+  for (const item of extractMemory(nodes.filter(node => isCheckpointSource(node.message?.source)), { session: '' })) {
+    if (item.cat !== 'files' || typeof item.text !== 'string' || item.text === '') continue
+    durable.delete(item.text)
+    durable.set(item.text, { path: item.text, seq: item.seq })
+  }
+  for (const file of filesWritten(nodes, Infinity)) {
+    if (durable.has(file.path)) continue
+    durable.set(file.path, file)
+  }
+  const files = options.filesListed > 0 ? [...durable.values()].slice(-options.filesListed) : []
   if (files.length > 0) parts.push(`FILES WRITTEN (latest last): ${files.map(file => `${file.path} (seq ${file.seq})`).join(', ')}`)
   if (options.keywordTerms > 0) {
     // Only identifiers somebody SAID (user or assistant text): a directory listing in a
@@ -413,7 +546,13 @@ export function buildCheckpoint(allRegionNodes, options, pressure, allNodes) {
     const index = lib.renderKeywordIndex(terms)
     if (index.length > 0) parts.push(index)
   }
-  return { text: joinCompiledEntries(parts), stats: compiled.stats, capped: compiled.capped, tier, regionTokens, cap, dropped: dropped.length }
+  // `kind` is the dropSources key a user would have to remove: a plugin source
+  // is named by its plugin id, everything else by its own kind.
+  const droppedNodes = dropped.map(node => {
+    const source = node.message?.source
+    return { seq: node.seq, kind: source?.kind === 'plugin' ? source.plugin : source?.kind }
+  })
+  return { text: joinCompiledEntries(parts), stats: compiled.stats, capped: compiled.capped, tier, regionTokens, cap, dropped: dropped.length, droppedNodes }
 }
 
 /** True when the summary blocks carry at least one non-blank text block. */
@@ -429,11 +568,24 @@ export function apply(ctx, config) {
   const runId = `dsh-${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)}-${process.pid}`
   const pressureBySession = new WeakMap()
   const triggerBySession = new WeakMap()
+  // The plan of the append-only compaction in flight, per session: the summarize
+  // hook reads it to know that this checkpoint is being APPENDED after a chain
+  // head rather than replacing it.
+  const chainBySession = new WeakMap()
   // The host reports the model's real context window on every `request/context`
   // event; keep the last one per session and honour it for pressure and caps.
   const windowBySession = new WeakMap()
   const windowLogged = new WeakSet()
   const sessionWindow = (session) => effectiveWindow(options, windowBySession.get(session), options.numCtxExplicit)
+  // Durable memory for this run: one closure document, re-read from disk at
+  // every compaction so another process's writes are never clobbered.
+  let memory = emptyMemory()
+  // Per-session: what the last compaction was, per-agent: recalls this turn,
+  // per-session: drop-source kinds already warned about.
+  const lastCompaction = new WeakMap()
+  const recallCount = new WeakMap()
+  const droppedWarned = new WeakMap()
+  const keyable = (value) => value !== null && value !== undefined && typeof value === 'object'
 
   const record = (entry) => {
     try {
@@ -445,6 +597,69 @@ export function apply(ctx, config) {
   if (options.mode === 'off') {
     log.info('context-guardian engine: mode off -- summarize hook NOT installed; compaction-basic is unchanged')
     return
+  }
+
+  // ── durable memory ───────────────────────────────────────────────────────
+  if (options.memoryMaxTokens > 0) {
+    const loaded = loadMemory(options.memoryPath)
+    memory = loaded.memory
+    record({ event: 'memory-loaded', path: options.memoryPath, status: loaded.status, items: loaded.memory.items.length })
+    if (loaded.status === 'corrupt') {
+      log.warn(`context-guardian engine: memory at ${options.memoryPath} is unreadable (${loaded.error ?? 'corrupt'}); starting from an empty memory, and the bad file is moved aside when the filesystem allows it`)
+    }
+  }
+
+  const memoryBlockText = () => renderMemory(memory, { maxTokens: options.memoryMaxTokens })
+
+  /** Merge key of a memory item, the same key cg_memory.js merges on. */
+  const memoryKey = (item) => item.cat + '\u0000' + (item.cat === 'files' ? item.text : normalizeText(item.text))
+
+  /** The session nodes of the chain head an appended checkpoint keeps in front of it. */
+  const chainHeadNodes = (session, chain) => {
+    if (chain === undefined) return []
+    const wanted = new Set(chain.headSeqs ?? [])
+    return sessionNodes(session).filter(node => wanted.has(node.seq))
+  }
+
+  /**
+   * The memory block of an APPENDED checkpoint: only the notes this compaction
+   * actually touched. The chain head in front of it already carries the rest, so
+   * re-rendering the whole memory would grow the prompt prefix for nothing.
+   */
+  const deltaMemoryText = (touched) => renderMemory(
+    { ...memory, items: (memory.items ?? []).filter(item => touched?.has?.(memoryKey(item))) },
+    { maxTokens: options.memoryMaxTokens },
+  )
+
+  /**
+   * Extract the region's durable facts, merge them over the file on disk and
+   * write it back. Runs BEFORE any text is built, so the checkpoint renders
+   * what it just learned. Never throws: memory must not break compaction.
+   * Returns the merge keys this compaction touched, for the delta memory block.
+   */
+  const updateMemory = (session, regionNodes) => {
+    if (options.memoryMaxTokens <= 0) return new Set()
+    try {
+      const items = extractMemory(regionNodes ?? [], { session: String(session?.id ?? '') })
+      const reloaded = loadMemory(options.memoryPath)
+      const base = reloaded.status === 'loaded' ? reloaded.memory : memory
+      memory = mergeMemory(base, items)
+      const saved = saveMemory(options.memoryPath, memory)
+      record({ event: 'memory', session: String(session?.id ?? ''), extracted: items.length, total: memory.items.length, saved })
+      if (!saved) log.warn(`context-guardian engine: memory NOT written to ${options.memoryPath}; compaction proceeds`)
+      return new Set(items.map(item => memoryKey(item)))
+    } catch (error) {
+      log.warn(`context-guardian engine: memory not updated (${error.message}); compaction proceeds`)
+      return new Set()
+    }
+  }
+
+  const rememberCompaction = (session, entry) => {
+    if (keyable(session)) lastCompaction.set(session, entry)
+  }
+  const compactionLine = (session) => {
+    const last = keyable(session) ? lastCompaction.get(session) : undefined
+    return last === undefined ? 'none yet in this session' : `${last.kind} (${last.detail}) at ${last.at}, trigger ${last.trigger}`
   }
 
   // ── span archive (context_guardian.py `write_span` format) ───────────────
@@ -497,12 +712,46 @@ export function apply(ctx, config) {
   const deterministic = (input, agent, reason) => {
     const session = agent?.session
     const { nodes, unmatched } = mapRegionSeqs(session, input.messages)
+    const touched = updateMemory(session, nodes)
+    const chain = keyable(session) ? chainBySession.get(session) : undefined
+    const allNodes = session === undefined ? nodes : sessionNodes(session)
+    const extras = { memoryBlock: memoryBlockText() }
+    if (chain !== undefined) {
+      // Appended after a chain head: the head in front of this checkpoint already
+      // carries the goal and the older memory, so this one carries only the delta.
+      extras.goalBlock = renderGoalDelta(chainHeadNodes(session, chain), [...nodes, ...allNodes])
+      extras.memoryBlock = deltaMemoryText(touched)
+    }
     const pressure = pressureBySession.get(session) ?? measure(agent)?.pressure ?? 0.8
-    const checkpoint = buildCheckpoint(nodes, options, pressure, session === undefined ? nodes : sessionNodes(session))
+    const checkpoint = buildCheckpoint(nodes, options, pressure, allNodes, extras)
     const span = writeSpan(session, input.messages, checkpoint.text)
+    rememberCompaction(session, {
+      kind: String(reason).startsWith('llm summary cannot fit') ? 'overflow' : 'deterministic',
+      detail: reason, at: new Date().toISOString(), trigger: triggerBySession.get(session) ?? 'auto',
+    })
     record({ event: 'deterministic', session: String(session?.id ?? ''), reason, nodes: nodes.length, unmatched, tier: checkpoint.tier, regionTokens: checkpoint.regionTokens, checkpointTokens: checkpoint.stats.tokens, capped: checkpoint.capped, span })
+    reportDropped(session, checkpoint.droppedNodes)
     log.info(`context-guardian engine: deterministic checkpoint (${reason}) -- ${nodes.length} nodes, ~${checkpoint.regionTokens} -> ~${checkpoint.stats.tokens} tokens, tier ${checkpoint.tier}${unmatched > 0 ? `, ${unmatched} unmapped` : ''}`)
     return { summary: [{ type: 'text', text: checkpoint.text }], provider: 'context-guardian', model: COMPILER_REV, rawOutput: checkpoint.text }
+  }
+
+  /**
+   * Dropped harness injections are always recorded, but warned about once per
+   * session per source kind: a repeated reminder should not fill the log with
+   * the same sentence, while a NEW kind must always speak up once.
+   */
+  const reportDropped = (session, droppedNodes) => {
+    if (!Array.isArray(droppedNodes) || droppedNodes.length === 0) return
+    record({ event: 'dropped-injected', session: String(session?.id ?? ''), seqs: droppedNodes.map(node => node.seq), kinds: [...new Set(droppedNodes.map(node => node.kind))] })
+    const warned = keyable(session) ? (droppedWarned.get(session) ?? new Set()) : null
+    if (warned === null) return
+    for (const kind of new Set(droppedNodes.map(node => node.kind))) {
+      if (warned.has(kind)) continue
+      warned.add(kind)
+      const seqs = droppedNodes.filter(node => node.kind === kind).map(node => node.seq)
+      log.warn(`context-guardian engine: left ${seqs.length} user-role message(s) of source kind "${kind}" out of the checkpoint (seqs ${seqs.join(', ')}); they are still in the session log (recall them by seq). If that was real user text, remove "${kind}" from dropSources.`)
+    }
+    droppedWarned.set(session, warned)
   }
 
   const summarize = async function (input, agent, signal) {
@@ -516,17 +765,28 @@ export function apply(ctx, config) {
     try {
       const result = await original.call(this, input, agent, signal)
       if (hasText(result)) {
-        record({ event: 'llm', session: String(agent?.session?.id ?? ''), provider: result.provider, model: result.model })
+        const session = agent?.session
+        record({ event: 'llm', session: String(session?.id ?? ''), provider: result.provider, model: result.model })
+        let region = null
+        const chain = keyable(session) ? chainBySession.get(session) : undefined
         // Pin the goal on top of the stock summary too, as a NEW first text block.
         let goalBlock = ''
         try {
-          const region = mapRegionSeqs(agent?.session, input.messages).nodes
-          const session = agent?.session
+          region = mapRegionSeqs(session, input.messages).nodes
           const goalNodes = session === undefined || session === null ? region : [...region, ...sessionNodes(session)]
-          goalBlock = renderGoal(extractGoal(goalNodes))
+          goalBlock = chain === undefined ? renderGoal(extractGoal(goalNodes)) : renderGoalDelta(chainHeadNodes(session, chain), goalNodes)
         } catch { goalBlock = '' }
-        if (goalBlock.length > 0) {
-          return { ...result, summary: [{ type: 'text', text: goalBlock }, ...(Array.isArray(result.summary) ? result.summary : [])] }
+        const touched = updateMemory(session, region ?? [])
+        rememberCompaction(session, {
+          kind: 'llm', detail: `${result.provider}/${result.model}`, at: new Date().toISOString(), trigger: triggerBySession.get(session) ?? 'auto',
+        })
+        // Goal first, memory second, each its OWN text block, before the stock summary.
+        const prepended = []
+        if (goalBlock.length > 0) prepended.push({ type: 'text', text: goalBlock })
+        const memoryBlock = chain === undefined ? memoryBlockText() : deltaMemoryText(touched)
+        if (memoryBlock.length > 0) prepended.push({ type: 'text', text: memoryBlock })
+        if (prepended.length > 0) {
+          return { ...result, summary: [...prepended, ...(Array.isArray(result.summary) ? result.summary : [])] }
         }
         return result
       }
@@ -539,7 +799,59 @@ export function apply(ctx, config) {
 
   Object.defineProperty(service, 'summarize', { value: summarize, configurable: true, writable: true, enumerable: false })
   ctx.effect(() => () => { try { delete service.summarize } catch { /* realm already gone */ } })
-  record({ event: 'installed', engine: ENGINE_REV, mode: options.mode, numCtx: options.numCtx, idleCompactRatio: options.idleCompactRatio, tools: options.tools })
+
+  // ── append-only checkpoint chains ───────────────────────────────────────
+  // compaction-basic reaches this PUBLIC method by dynamic dispatch on its two
+  // automatic paths (pressure and context-overflow), so overriding it here is the
+  // only lever there is. The manual /compact, the idle trigger and context_compact
+  // go through compactNow instead, which keeps rolling the whole chain up: that
+  // is where a chain is retired.
+  if (options.appendOnly && typeof service.compactRegion === 'function') {
+    const originalRegion = service.compactRegion
+    const chained = async function (start, end, agent, signal) {
+      const session = agent?.session
+      // 0 means auto, resolved per session against that session's real window.
+      const chainMaxTokens = options.chainMaxTokens > 0
+        ? options.chainMaxTokens
+        : Math.min(2 * options.checkpointMaxTokens, Math.floor(sessionWindow(session) * 0.15))
+      const plan = planChainStart(session, start, end, {
+        chainMaxTokens,
+        chainMaxCheckpoints: options.chainMaxCheckpoints,
+        pressure: measure(agent)?.pressure ?? pressureBySession.get(session) ?? 0,
+      })
+      if (plan.start === start) {
+        if (plan.headSeqs.length > 0) {
+          record({ event: 'chain', session: String(session?.id ?? ''), action: plan.reason.startsWith('roll-up') ? 'roll-up' : 'full', reason: plan.reason, head: plan.headSeqs.length })
+        }
+        return originalRegion.call(this, start, end, agent, signal)
+      }
+      // Published so the summarize hook can see that this checkpoint is being
+      // appended after the head rather than replacing it.
+      chainBySession.set(session, plan)
+      try {
+        const result = await originalRegion.call(this, plan.start, end, agent, signal)
+        record({ event: 'chain', session: String(session?.id ?? ''), action: 'append', start: plan.start, originalStart: start, end, head: plan.headSeqs.length, chainTokens: plan.chainTokens })
+        return result
+      } catch (error) {
+        // DSH validates the range before anything durable happens, so a start it
+        // will not take costs nothing: retry the whole range and record why.
+        const message = String(error?.message ?? error)
+        if (message.startsWith('compactRegion: start seq')) {
+          record({ event: 'chain', session: String(session?.id ?? ''), action: 'fallback', reason: message.slice(0, 200) })
+          chainBySession.delete(session)
+          return await originalRegion.call(this, start, end, agent, signal)
+        }
+        throw error
+      } finally {
+        chainBySession.delete(session)
+      }
+    }
+    Object.defineProperty(service, 'compactRegion', { value: chained, configurable: true, writable: true, enumerable: false })
+    ctx.effect(() => () => { try { delete service.compactRegion } catch { /* realm already gone */ } })
+    log.info(`context-guardian engine: append-only chains enabled (max ${options.chainMaxCheckpoints} checkpoints, ${options.chainMaxTokens > 0 ? options.chainMaxTokens : 'auto'} tokens)`)
+  }
+
+  record({ event: 'installed', engine: ENGINE_REV, mode: options.mode, numCtx: options.numCtx, idleCompactRatio: options.idleCompactRatio, tools: options.tools, memory: options.memoryMaxTokens > 0 ? options.memoryPath : 'off', recallMaxPerTurn: options.recallMaxPerTurn, appendOnly: options.appendOnly })
   log.info(`context-guardian engine: summarize hook installed (mode ${options.mode}, window ${options.numCtx}, idle ${options.idleCompactRatio}, ${COMPILER_REV}, ${lib.RECALL_REV})`)
 
   // ── pressure, snapshot, outcome log ──────────────────────────────────────
@@ -595,6 +907,11 @@ export function apply(ctx, config) {
   })
 
   // ── idle pressure trigger ────────────────────────────────────────────────
+  // The per-turn recall counter resets on the same event, so it is registered
+  // ALWAYS -- it must not depend on the idle trigger being enabled.
+  ctx.on('agent/status', ({ agent, status }) => {
+    if (status === 'idle') recallCount.delete(agent)
+  })
   const idleTimers = new Map()
   const idleFloor = new WeakMap()
   const clearIdle = (agent) => { const timer = idleTimers.get(agent); if (timer !== undefined) { clearTimeout(timer); idleTimers.delete(agent) } }
@@ -656,6 +973,93 @@ export function apply(ctx, config) {
     // One recall may never take more than a quarter of THIS session's window.
     return lib.recall(sessionNodes(session), request, { maxTokens: Math.min(options.maxRecallTokens, Math.floor(sessionWindow(session) / 4)) })
   }
+  const recallCap = (session) => Math.min(options.maxRecallTokens, Math.floor(sessionWindow(session) / 4))
+
+  // ── status / digest ──────────────────────────────────────────────────────
+  const countSpans = () => {
+    try {
+      return readdirSync(join(options.spanDir, runId)).filter(file => /^\d+\.json$/.test(file)).length
+    } catch { return 0 }
+  }
+  /** One report line. A line that throws reads `label: unavailable (message)`. */
+  const line = (label, fn) => {
+    try { return `${label}: ${fn()}` } catch (error) { return `${label}: unavailable (${error.message})` }
+  }
+  const goalText = (session) => {
+    const nodes = sessionNodes(session)
+    return { goal: extractGoal(nodes).goal, origin: goalOrigin(nodes) }
+  }
+  const firstChars = (text, max) => {
+    const value = String(text ?? '')
+    return value.length > max ? value.slice(0, max - 3) + '...' : value
+  }
+
+  const statusReport = (agent) => {
+    const session = agent?.session
+    return [
+      `context-guardian ${ENGINE_REV} (memory ${MEMORY_REV}, ${COMPILER_REV}, ${lib.RECALL_REV}) mode ${options.mode}`,
+      line('window', () => {
+        const host = keyable(session) ? windowBySession.get(session) : undefined
+        const source = options.numCtxExplicit ? 'set by numCtx / GUARDIAN_NUM_CTX'
+          : Number.isInteger(host) && host > 0 ? 'reported by the model'
+            : 'default, the model has not reported one yet'
+        return `${sessionWindow(session)} tokens (${source})`
+      }),
+      line('pressure', () => {
+        const m = measure(agent)
+        if (m === undefined) return 'the token meter is not available in this preset'
+        return `~${m.tokens} of ${sessionWindow(session)} tokens (${(m.pressure * 100).toFixed(0)} %), tier ${tierOf(m.pressure)}`
+      }),
+      line('last compaction', () => compactionLine(session)),
+      line('goal', () => {
+        const { origin } = goalText(session)
+        const updates = ` (+${origin.updates} updates)`
+        if (origin.fromCheckpoint) return `pinned from a checkpoint${updates}`
+        if (origin.seq !== null) return `pinned from seq ${origin.seq}${updates}`
+        return 'none yet'
+      }),
+      line('memory', () => {
+        if (options.memoryMaxTokens <= 0) return 'off (memoryMaxTokens 0)'
+        const stats = memoryStats(memory)
+        const by = stats.byCategory
+        return `${stats.total} items (decisions ${by.decisions}, constraints ${by.constraints}, files ${by.files}, todos ${stats.openTodos} open, errors ${by.errors}, preferences ${by.preferences}) in ${options.memoryPath}`
+      }),
+      line('append-only', () => options.appendOnly
+        ? `on (chain max ${options.chainMaxCheckpoints} checkpoints, ${options.chainMaxTokens > 0 ? options.chainMaxTokens : 'auto'} tokens)`
+        : 'off'),
+      line('spans archived', () => `${countSpans()} in this run (${options.spanDir}/${runId})`),
+      line('recall this turn', () => `${keyable(agent) ? (recallCount.get(agent) ?? 0) : 0} of ${options.recallMaxPerTurn > 0 ? options.recallMaxPerTurn : 'unlimited'}`),
+    ].join('\n')
+  }
+
+  const digest = (session) => {
+    const out = ['DIGEST (context-guardian)']
+    const { goal, origin } = goalText(session)
+    out.push(goal === null || goal === undefined ? 'goal: none yet'
+      : `goal: ${firstChars(goal, 300)} (${origin.fromCheckpoint ? 'from a checkpoint' : `seq ${origin.seq}`}) +${origin.updates} updates`)
+
+    const mine = itemsForSession(memory, String(session?.id ?? ''))
+      .slice()
+      .sort((a, b) => (a.last || '').localeCompare(b.last || '') || (a.seq || 0) - (b.seq || 0))
+      .slice(-20)
+    out.push('memory updated this session:')
+    out.push(...(mine.length > 0 ? mine.map(item => `- [${item.cat}] ${item.text}`) : ['- none']))
+
+    const listed = filesWritten(sessionNodes(session), 30).map(file => file.path)
+    for (const item of memory.items ?? []) if (item?.cat === 'files' && !listed.includes(item.text)) listed.push(item.text)
+    out.push(listed.length > 0 ? `files written: ${listed.join(', ')}` : 'files written: none')
+
+    const todos = (memory.items ?? []).filter(item => item?.cat === 'todos' && item.done !== true).slice(0, 20)
+    out.push('open todos:')
+    out.push(...(todos.length > 0 ? todos.map(item => `- ${item.text}`) : ['- none']))
+
+    const errors = (memory.items ?? []).filter(item => item?.cat === 'errors')
+    const lastError = errors.slice().sort((a, b) => (a.last || '').localeCompare(b.last || '') || (a.seq || 0) - (b.seq || 0)).pop()
+    out.push(lastError === undefined ? 'last error: none' : `last error: ${lastError.text} (seq ${lastError.seq})`)
+
+    out.push(`last compaction: ${compactionLine(session)}`)
+    return out.join('\n')
+  }
 
   // ── model-facing tools ───────────────────────────────────────────────────
   const definitions = {
@@ -668,7 +1072,18 @@ export function apply(ctx, config) {
         required: ['id'],
       },
       output: TEXT_OUTPUT,
-      execute: async (args, exec) => doRecall(exec?.agent?.session, lib.parseRecallRequest(args?.type, args?.id)).text,
+      execute: async (args, exec) => {
+        const agent = exec?.agent
+        // Per-turn budget for the MODEL-facing tool only; /recall is never limited.
+        if (options.recallMaxPerTurn > 0 && keyable(agent)) {
+          const used = recallCount.get(agent) ?? 0
+          if (used >= options.recallMaxPerTurn) {
+            return `recall: limit of ${options.recallMaxPerTurn} recalls per turn reached (each one adds up to ${recallCap(agent.session)} tokens to the window). Use search to find the exact seq, then recall a narrow range in your next turn.`
+          }
+          recallCount.set(agent, used + 1)
+        }
+        return doRecall(agent?.session, lib.parseRecallRequest(args?.type, args?.id)).text
+      },
     },
     search: {
       name: 'search',
@@ -690,6 +1105,13 @@ export function apply(ctx, config) {
       parameters: { type: 'object', properties: {} },
       output: TEXT_OUTPUT,
       execute: async (_args, exec) => costReport(exec?.agent),
+    },
+    guardian_status: {
+      name: 'guardian_status',
+      description: 'Report Context Guardian status: engine revision, context window, pressure, last compaction, pinned goal, memory items and archived spans.',
+      parameters: { type: 'object', properties: {} },
+      output: TEXT_OUTPUT,
+      execute: async (_args, exec) => statusReport(exec?.agent),
     },
     context_compact: {
       name: 'context_compact',
@@ -728,13 +1150,14 @@ export function apply(ctx, config) {
   ctx.inject(['commands'], (inner) => {
     inner.commands.register({
       name: 'recall',
-      description: 'Show original history: /recall 3-7 · /recall result 3 · /recall checkpoint 1 · /recall find <text>',
+      description: 'Show original history: /recall 3-7 · /recall result 3 · /recall checkpoint 1 · /recall find <text> · /recall digest',
       // Without `input` DSH treats a command as argument-free: the web UI runs it bare on
       // select and sends "/recall result 42" typed in full to the MODEL (seen live 2026-09-20).
-      input: { hint: '<3-7 | result 3 | checkpoint 1 | find text>' },
+      input: { hint: '<3-7 | result 3 | checkpoint 1 | find text | digest>' },
       handler: async (invocation) => {
         const raw = String(invocation?.rawInput ?? '').trim()
         const session = invocation?.agent?.session
+        if (/^digest$/i.test(raw)) return { kind: 'success', text: digest(session) }
         const find = /^(?:find|search)\s+(.+)$/i.exec(raw)
         if (find !== null) {
           const result = lib.search(sessionNodes(session), find[1], { maxHits: options.maxSearchHits, regex: false, contextChars: 80 })
@@ -743,6 +1166,11 @@ export function apply(ctx, config) {
         const result = doRecall(session, lib.parseRecallCommand(raw))
         return { kind: result.ok ? 'success' : 'error', text: result.text }
       },
+    })
+    inner.commands.register({
+      name: 'guardian',
+      description: 'Context Guardian status: engine, window, pressure, last compaction, goal, memory, spans',
+      handler: async (invocation) => ({ kind: 'success', text: statusReport(invocation?.agent) }),
     })
     inner.commands.register({
       name: 'context',
