@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+**The Python proxy now measures instead of guessing.** Its token estimate (characters / 3.5) runs about 14 % high on
+purpose, which makes compaction fire earlier than it needs to. The proxy now reads the prompt-token figure the backend
+returns (`usage.prompt_tokens`, Ollama's `prompt_eval_count`, llama.cpp's `timings`) and learns a correction factor per
+model. It uses the largest recent ratio, not the average: Ollama and llama.cpp report only the tokens they actually
+evaluated, so a reused prompt cache produces small numbers that must never shrink the estimate. The factor stays at 1.0
+until five samples exist and is clamped to 0.7-1.3. Responses are passed through byte for byte. `/guardian/stats`
+shows `calibration` per model; `GUARDIAN_CALIBRATE=0` turns it off. Streaming requests teach it only when the client
+asks for usage (`stream_options.include_usage`); non-streaming requests always do.
+
 ## dsh-context-guardian 0.1.0-alpha.6 / PyPI context-guardian 0.6.0 (2026-09-26)
 
 **New: `npm run setup` (`setup.mjs`) adds the engine to your DSH agent preset.** A plugin's `cordis.patch.yml` cannot do this, because DSH composes it into the profile tree and never patches agent presets, so until now the compaction row was a hand-edit. `npm run setup`:

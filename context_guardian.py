@@ -104,6 +104,7 @@ HOW TO TEST BEFORE TRUSTING IT (same discipline as scrape_etsy_trends.py):
      proxy and test with a real OpenClaude session.
 """
 
+import collections
 import json
 import logging
 import os
@@ -369,6 +370,10 @@ _state = {
     # (before-minus-after, summed over every compaction this run). This is the
     # basis of the cost-compare figure -- see COST_PER_1M_INPUT_USD.
     "tokens_saved_total": 0,
+    # The estimate BEFORE the per-model calibration factor was applied. The
+    # comment above `last_known_total_tokens` is now only half true, so the raw
+    # figure is kept beside it rather than overwriting the only one on display.
+    "last_raw_estimate": 0,
 }
 
 # When this process started, for the health view's uptime line.
@@ -388,6 +393,206 @@ _update_notice: Optional[Dict[str, str]] = None
 # test. /guardian/stats worked because it's a separate route that never
 # touches this client at all.
 _http_client: Optional[httpx.AsyncClient] = None
+
+# --- Usage calibration ------------------------------------------------------------
+# The estimate above is characters / 3.5, and that constant is a guess that is
+# wrong by a different amount for every model: it assumes ~3.5 characters per
+# token, but the true figure is a property of the tokenizer. Measured on this
+# stack the error ran to ~14% on a real MCP tool payload, which is the safe
+# direction only by luck.
+#
+# The backend already knows the truth. Every OpenAI-compatible response carries
+# `usage.prompt_tokens`, Ollama's native endpoint carries `prompt_eval_count`,
+# and llama.cpp reports the split in `timings`. None of them were ever read --
+# the module docstring above used to CLAIM they were, in the very place a reader
+# looks for a fact. This block is that claim, implemented.
+#
+# WHAT THE RATIO IS NOT
+#     An average. Ollama and llama.cpp report only the prompt tokens they
+#     actually EVALUATED, so a reused KV cache produces a tiny number on an
+#     enormous prompt. Averaging those in would drag the estimate DOWN, and a
+#     shrinking estimate means compaction fires later than it did before --
+#     the exact hard-stop this proxy exists to prevent, reintroduced by the
+#     fix for it. The factor is therefore the MAX of the recent ratios, clamped:
+#     a cache-deflated sample can never pull the factor down past what a clean
+#     sample already established. A factor below 1.0 is still reachable and
+#     still correct -- it means the backend read FEWER prompt tokens than
+#     chars/3.5 predicted, and believing it makes the proxy compact earlier.
+#     What is not reachable is the opposite mistake.
+
+# Recent reported/estimated ratios kept per model. Bounded so a long session
+# cannot grow this without limit, and short enough to forget a model that was
+# swapped out or re-tuned.
+CALIBRATION_SAMPLE_WINDOW = 20
+# Ratios are not trusted until there are this many. Below it the factor is
+# exactly 1.0 -- a single sample is one request, and a request that hit a warm
+# cache is a worse one.
+CALIBRATION_MIN_SAMPLES = 5
+# The correction is bounded both ways. Past 1.3 the chars/token guess is not
+# the problem any more; something else is, and scaling the estimate by 30%
+# would make the window look fuller than it is.
+CALIBRATION_FACTOR_MIN = 0.7
+CALIBRATION_FACTOR_MAX = 1.3
+# How much of a response the tap will hold on to while looking for the usage
+# block. 4 MB is far larger than any usage figure, and the cap exists so a
+# large non-streaming response cannot turn into a memory leak.
+CALIBRATION_TAP_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _prompt_tokens_from(obj: Any) -> Optional[int]:
+    """The prompt-token count out of one decoded response object, or None.
+
+    Pure, and never raises: it runs against bytes off the wire on the response
+    path, where an exception is a failed request. The three shapes are tried in
+    order of how much we trust them -- an explicit usage block, then Ollama's
+    native field, then llama.cpp's timings -- and the first usable one wins.
+    """
+    try:
+        usage = obj.get("usage")
+        if isinstance(usage, dict):
+            n = usage.get("prompt_tokens")
+            if isinstance(n, int) and not isinstance(n, bool) and n > 0:
+                return n
+
+        n = obj.get("prompt_eval_count")
+        if isinstance(n, int) and not isinstance(n, bool) and n > 0:
+            return n
+
+        # llama.cpp splits the prompt into what it read from cache and what it
+        # evaluated. Only prompt_n is what it evaluated, so the two are summed:
+        # either alone is an undercount of the same prompt.
+        timings = obj.get("timings")
+        if isinstance(timings, dict):
+            prompt_n = timings.get("prompt_n")
+            if isinstance(prompt_n, int) and not isinstance(prompt_n, bool):
+                cache_n = timings.get("cache_n", 0)
+                if not isinstance(cache_n, int) or isinstance(cache_n, bool):
+                    cache_n = 0
+                return prompt_n + cache_n
+    except Exception:                                      # noqa: BLE001
+        return None
+    return None
+
+
+def usage_prompt_tokens(data: bytes, content_type: str) -> Optional[int]:
+    """How many prompt tokens the backend says it used, or None if it said nothing.
+
+    Handles both body shapes an OpenAI-compatible backend answers with: one JSON
+    document, or an SSE stream whose last data frame carries the usage block
+    (the `stream_options: {"include_usage": true}` convention, which OpenAI,
+    Ollama and llama.cpp all follow).
+
+    For a stream the frames are walked BACKWARDS. The usage block is by
+    convention last, but a backend that stops cleanly and never sent one must
+    not cost a full parse of every frame to discover that, and the earlier
+    frames of a real completion have no usage to find. A frame that is not a
+    JSON object is skipped rather than fatal: the stream may legitimately carry
+    comment/heartbeat lines and `[DONE]`.
+    """
+    try:
+        text = data.decode("utf-8", "replace")
+        is_stream = "event-stream" in content_type or text.startswith("data:")
+        if not is_stream:
+            try:
+                obj = json.loads(text)
+            except (ValueError, TypeError):
+                return None
+            if not isinstance(obj, dict):
+                return None
+            return _prompt_tokens_from(obj)
+
+        for line in reversed(text.splitlines()):
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                obj = json.loads(payload)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(obj, dict):
+                continue
+            found = _prompt_tokens_from(obj)
+            if found is not None:
+                return found
+        return None
+    except Exception:                                      # noqa: BLE001
+        return None
+
+
+def _clamped_factor(window) -> float:
+    """The factor implied by one model's ratio window. 1.0 until there are
+    enough samples to mean anything; then the MAX, clamped."""
+    if len(window) < CALIBRATION_MIN_SAMPLES:
+        return 1.0
+    return min(CALIBRATION_FACTOR_MAX, max(CALIBRATION_FACTOR_MIN, max(window)))
+
+
+class Calibrator:
+    """Per-model remembered estimate error, learned from what the backend reports.
+
+    One bounded window of recent `reported / estimated` ratios per model name.
+    Not thread-safe by inspection alone: the proxy observes from the streaming
+    generator while other requests are being estimated, so the deques are
+    guarded by a lock. No `await` appears inside these methods, so the critical
+    sections are a handful of instructions and cannot block the event loop.
+    """
+    def __init__(self) -> None:
+        self._ratios: Dict[str, collections.deque] = {}
+        self._lock = threading.Lock()
+
+    def observe(self, model: str, estimated: int, reported: int) -> None:
+        """Record one request's measured error. Silently ignores samples that
+        cannot teach anything: an estimate under 256 tokens is dominated by
+        request framing rather than by tokenizer width, and a backend that
+        reported nothing (0) has told us nothing."""
+        if estimated < 256 or reported <= 0:
+            return
+        with self._lock:
+            window = self._ratios.get(model)
+            if window is None:
+                window = collections.deque(maxlen=CALIBRATION_SAMPLE_WINDOW)
+                self._ratios[model] = window
+            window.append(reported / estimated)
+
+    def samples(self, model: str) -> int:
+        with self._lock:
+            window = self._ratios.get(model)
+            return len(window) if window is not None else 0
+
+    def factor(self, model: str) -> float:
+        """The multiplier to apply to this model's raw estimate. 1.0 = unchanged."""
+        with self._lock:
+            window = self._ratios.get(model)
+            if window is None:
+                return 1.0
+            return _clamped_factor(window)
+
+    def snapshot(self) -> Dict[str, Dict[str, Any]]:
+        # factor() is not called from under the lock: threading.Lock is not
+        # reentrant, so that would deadlock rather than merely nest.
+        with self._lock:
+            return {model: {"factor": round(_clamped_factor(window), 4),
+                            "samples": len(window)}
+                    for model, window in self._ratios.items()}
+
+
+CALIBRATOR = Calibrator()
+
+
+def calibration_enabled() -> bool:
+    """The GUARDIAN_CALIBRATE kill switch, read AT CALL TIME.
+
+    Read per call rather than at import, like no other knob here, and that is
+    deliberate: a process started with calibration on may need it turned off the
+    moment a backend turns out to report nonsense, without a restart that would
+    drop the client's in-flight session. Default on -- an uncalibrated estimate
+    is what this proxy has always had.
+    """
+    return os.environ.get("GUARDIAN_CALIBRATE", "1").strip().lower() not in (
+        "0", "false", "no")
 
 
 @app.on_event("startup")
@@ -994,6 +1199,14 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
     message_tokens = estimate_tokens(messages)
     tool_tokens = estimate_tool_tokens(payload)
     estimated = message_tokens + tool_tokens
+    # Raw first, corrected second. The raw figure is what the backend will be
+    # asked to confirm, so the sample that comes back from the response tap has
+    # to be divided by this and not by the number below -- otherwise the factor
+    # would be learning from its own output and would drift up every request.
+    _state["last_raw_estimate"] = estimated
+    calib_model = str(payload.get("model") or "")
+    if calibration_enabled():
+        estimated = int(estimated * CALIBRATOR.factor(calib_model))
     _state["last_known_total_tokens"] = estimated
     _state["last_tool_tokens"] = tool_tokens
     _state["last_message_tokens"] = message_tokens
@@ -1329,7 +1542,7 @@ async def stats():
                         "+renders-tool-calls+nonempty-summary-guard"
                         "+fenced-transcript+tool-pair-safe-cut+portable-paths"
                         "+verbose-banner+cost-compare+health-view+update-check"
-                        "+compaction-monitor+events-endpoint",
+                        "+compaction-monitor+events-endpoint+usage-calibration",
         "version": guardian_version(),
         "latest_version": (_update_notice or {}).get("latest"),
         "update_available": _update_notice is not None,
@@ -1348,6 +1561,11 @@ async def stats():
         "span_dir": str(SPAN_DIR),
         "upstream": UPSTREAM_URL,
         **_state,
+        # What the proxy has learned about its own estimate error, per model.
+        # `last_raw_estimate` above is the pre-correction figure; this is what
+        # turned it into `last_known_total_tokens`.
+        "calibration": CALIBRATOR.snapshot(),
+        "calibration_enabled": calibration_enabled(),
         "note": ("last_known_total_tokens now INCLUDES the tools array. "
                  "last_tool_tokens is the part compaction cannot touch."),
     })
@@ -1590,6 +1808,48 @@ async def health():
     return HTMLResponse(_HEALTH_HTML)
 
 
+async def _tapped_stream(chunks, upstream_resp: httpx.Response,
+                         model: str, estimated: int):
+    """Pass the upstream stream through untouched, and read the usage off it.
+
+    The client's bytes are this proxy's product, so the first and only rule is
+    that they come out exactly as they went in, in order, at the moment they
+    arrive: every chunk is yielded before anything is copied, and nothing is
+    buffered ahead of the client. The copy is a side effect of a chunk that has
+    already been handed on, capped at CALIBRATION_TAP_MAX_BYTES, and past the
+    cap the copy simply stops -- a huge response is not a reason to grow
+    without bound or to delay the stream.
+
+    Learning is done in the `finally`, so it also happens when the client
+    disconnects mid-stream: that sample is worth having too, and if the
+    generator is never closed at all nothing is lost but a calibration sample.
+    """
+    buffer = bytearray()
+    capped = False
+    try:
+        async for chunk in chunks:
+            if not capped and len(buffer) + len(chunk) <= CALIBRATION_TAP_MAX_BYTES:
+                buffer += chunk
+            else:
+                capped = True
+            yield chunk
+    finally:
+        # Everything below is best-effort bookkeeping on a path that has
+        # already delivered the response. It must never be able to raise into
+        # it, hence the blanket except: a proxy that breaks the response to
+        # report on the response has strictly lost.
+        try:
+            encoded = upstream_resp.headers.get("content-encoding")
+            if (not capped and upstream_resp.status_code == 200 and not encoded):
+                reported = usage_prompt_tokens(
+                    bytes(buffer),
+                    upstream_resp.headers.get("content-type", ""))
+                if reported is not None:
+                    CALIBRATOR.observe(model, estimated, reported)
+        except Exception as exc:                           # noqa: BLE001
+            log.debug("usage calibration tap failed, response unaffected: %s", exc)
+
+
 @app.api_route("/v1/{path:path}", methods=["GET", "POST"])
 async def proxy(path: str, request: Request):
     """Generic passthrough for everything except chat/completions, which
@@ -1615,6 +1875,10 @@ async def proxy(path: str, request: Request):
                                           "initialised.",
                                "type": "guardian_not_ready"}})
 
+    # Set only for a chat/completions POST whose body parsed to a dict with
+    # calibration switched on; `None` is the "stream it untouched" signal.
+    calib_model = None
+    calib_estimate = None
     if path == "chat/completions" and request.method == "POST" and body_bytes:
         try:
             payload = json.loads(body_bytes)
@@ -1630,6 +1894,16 @@ async def proxy(path: str, request: Request):
         if isinstance(payload, dict):
             payload = await maybe_compact(client, payload)
             body_bytes = json.dumps(payload).encode("utf-8")
+            # Grabbed HERE, immediately after the estimate was recorded and
+            # before anything else can touch _state. Only chat/completions
+            # gets a usage block back; every other route keeps the raw stream
+            # it has always forwarded.
+            if calibration_enabled():
+                calib_model = str(payload.get("model") or "")
+                # The FINAL payload's raw size: when compaction just ran, the pre-compaction
+                # estimate would make the backend's figure look far too small.
+                calib_estimate = (estimate_tokens(payload.get("messages") or [])
+                                  + estimate_tool_tokens(payload))
 
     upstream_url = f"{UPSTREAM_URL}/{path}"
 
@@ -1660,8 +1934,18 @@ async def proxy(path: str, request: Request):
     # Starlette has finished streaming it back to the caller -- releases
     # the connection back to the pool without tearing down the client
     # every other request depends on.
+    #
+    # The tap is the SAME generator wrapped in a pass-through, not a different
+    # one: there is no path here that re-encodes, re-chunks, re-times or holds
+    # a chunk back. Only the copy side effect is new, and it happens after the
+    # chunk is on its way to the client.
+    if calib_model is not None:
+        body_stream = _tapped_stream(upstream_resp.aiter_raw(), upstream_resp,
+                                     calib_model, calib_estimate)
+    else:
+        body_stream = upstream_resp.aiter_raw()
     return StreamingResponse(
-        upstream_resp.aiter_raw(),
+        body_stream,
         status_code=upstream_resp.status_code,
         headers={k: v for k, v in upstream_resp.headers.items() if k.lower() != "content-length"},
         background=BackgroundTask(upstream_resp.aclose),

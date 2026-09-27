@@ -1,0 +1,41 @@
+name: Feature Request
+description: Suggest an enhancement to context-guardian
+title: "[Enhancement] "
+labels: ["enhancement"]
+
+body:
+  - type: markdown
+    attributes:
+      value: "Tell us about a feature that would improve context-guardian."
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: "Problem or Limitation"
+      description: "What is the current limitation or pain point?"
+      placeholder: "The guardian compacts history but doesn't consider semantic importance of messages..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: "Proposed Solution"
+      description: "How would you solve this? What would the feature do?"
+      placeholder: "Add a scoring system to identify and preserve high-value turns in the conversation..."
+    validations:
+      required: true
+
+  - type: input
+    id: context
+    attributes:
+      label: "Context: Model, Backend, and Window Size"
+      description: "Where did you encounter this limitation?"
+      placeholder: "llama2 70B on vLLM, context window 4096"
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: "Expected Impact"
+      description: "What would improve? Token savings? Reliability? Include numbers if available."
+      placeholder: "Could save 20-30% of tokens while preserving conversation flow"
