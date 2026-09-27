@@ -169,6 +169,7 @@ With `appendOnly: true`, a compaction that DSH starts on its own under pressure 
 | memoryMaxTokens | 1200 | GUARDIAN_MEMORY_MAX_TOKENS | size of the memory block; 0 turns memory off |
 | memoryPath | `<spanDir>/memory.json` | GUARDIAN_MEMORY_PATH | where memory is kept between sessions |
 | appendOnly | false | GUARDIAN_APPEND_ONLY | append checkpoints after the existing ones on pressure/overflow compactions (experimental) |
+| anchorCheck | repair | GUARDIAN_ANCHOR_CHECK | after every compaction, find files, identifiers, URLs, code spans, constraints and decisions from the compacted turns that later turns still use but the checkpoint lost; `repair` appends them as a carried-facts block, `report` only logs and shows them in `/guardian`, `off` skips the check |
 | chainMaxCheckpoints | 4 | GUARDIAN_CHAIN_MAX_CHECKPOINTS | roll the chain up once it holds this many checkpoints |
 | chainMaxTokens | 0 (auto) | GUARDIAN_CHAIN_MAX_TOKENS | roll the chain up once it is this large; auto = min(2 × checkpointMaxTokens, 15% of the window) |
 | keepSpans | 500 | GUARDIAN_KEEP_SPANS | how many archived spans to keep on disk |

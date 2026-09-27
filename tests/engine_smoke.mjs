@@ -356,7 +356,7 @@ check('memory_saved_after_compaction', async () => {
 check('memory_prepended_to_llm_summary', async () => {
   const memoryPath = join(tmp, 'chk-llm', 'memory.json')
   seedMemory(memoryPath, { cat: 'preferences', text: 'prefer ruff over flake8', seq: 3, session: 'sess-smoke' })
-  const h = makeCtx({ llm: 'ok' }); engine.apply(h.ctx, baseConfig({ memoryPath }))
+  const h = makeCtx({ llm: 'ok' }); engine.apply(h.ctx, baseConfig({ memoryPath, anchorCheck: 'off' })) // exact block count: keep the anchor check out of it
   const session = makeSession()
   const result = await h.compaction.summarize(smallInput(session), { session })
   const texts = result.summary.map(block => block.text)

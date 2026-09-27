@@ -31,7 +31,8 @@
     "THIRD_PARTY_NOTICES.md",
     "README.md",
     "CHANGELOG.md",
-    "LICENSE"
+    "LICENSE",
+    "cg_anchors.js"
   ],
   "dsh": {
     "bundle": {
@@ -39,9 +40,9 @@
     }
   },
   "scripts": {
-    "check": "node --check index.js && node --check engine.js && node --check cg_recall.js && node --check cg_memory.js && node --check setup.mjs && node --check vendor/compiler.js",
+    "check": "node --check index.js && node --check engine.js && node --check cg_recall.js && node --check cg_memory.js && node --check setup.mjs && node --check vendor/compiler.js && node --check cg_anchors.js",
     "selftest": "python modules/cg_bridge.py --selftest",
-    "test:node": "node tests/probes/probe_cg_recall.mjs && node cg_recall.js --selftest && node tests/engine_smoke.mjs && node tests/goal_pin_smoke.mjs && node tests/memory_smoke.mjs && node tests/append_only_smoke.mjs && node tests/setup_smoke.mjs && node tests/update_check.test.mjs",
+    "test:node": "node tests/probes/probe_cg_recall.mjs && node cg_recall.js --selftest && node tests/engine_smoke.mjs && node tests/goal_pin_smoke.mjs && node tests/memory_smoke.mjs && node tests/append_only_smoke.mjs && node tests/setup_smoke.mjs && node tests/update_check.test.mjs && node tests/anchors_smoke.mjs && node tests/anchors_engine_smoke.mjs",
     "setup": "node setup.mjs"
   },
   "engines": {

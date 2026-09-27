@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+**A compaction can no longer quietly lose what the model still needs (DSH engine).** After every compaction the engine
+lists the files, identifiers, URLs and code spans from the compacted turns that later turns still use, plus every
+`constraint:` and `decision:` from those turns, and checks each one against what the model will actually see (goal,
+memory and summary). Anything missing is appended as a short **carried facts** block, capped at 1,600 characters. This
+matters most after a model-written summary, which can read well and still drop the one file path the next step needs.
+`/guardian` shows the last result (`anchors: last compaction N recurring, N kept, N carried`). Setting `anchorCheck`
+(`GUARDIAN_ANCHOR_CHECK`): `repair` (default), `report` (log only) or `off`. New module `cg_anchors.js`, pure, no I/O.
+
 **The Python proxy now measures instead of guessing.** Its token estimate (characters / 3.5) runs about 14 % high on
 purpose, which makes compaction fire earlier than it needs to. The proxy now reads the prompt-token figure the backend
 returns (`usage.prompt_tokens`, Ollama's `prompt_eval_count`, llama.cpp's `timings`) and learns a correction factor per

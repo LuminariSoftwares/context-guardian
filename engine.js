@@ -43,6 +43,7 @@ import { fileURLToPath } from 'node:url'
 import { COMPILER_REV, DEFAULT_NOISE_PATTERNS, RECALL_GUIDE, compileNoisePatterns, compileRegion, isCheckpointSource, joinCompiledEntries, parseToolArguments } from './vendor/compiler.js'
 import { MEMORY_REV, emptyMemory, extractMemory, itemsForSession, loadMemory, memoryStats, mergeMemory, normalizeText, renderMemory, saveMemory } from './cg_memory.js'
 import * as lib from './cg_recall.js'
+import { ANCHORS_REV, findLostAnchors, lostConstraints, renderCarried } from './cg_anchors.js'
 
 export const name = 'context-guardian-engine'
 export const inject = ['compaction']
@@ -57,6 +58,7 @@ export const GOAL_UPDATE_RE = /^\s*goal\s*:/i
 
 const PACKAGE_ROOT = dirname(fileURLToPath(import.meta.url))
 const MODES = ['llm-then-deterministic', 'deterministic', 'off']
+const ANCHOR_MODES = ['repair', 'report', 'off']
 const ALL_TOOLS = ['recall', 'search', 'context_rewrite_cost', 'context_compact', 'guardian_status']
 
 export const DEFAULTS = Object.freeze({
@@ -93,6 +95,7 @@ export const DEFAULTS = Object.freeze({
   appendOnly: false,
   chainMaxTokens: 0,
   chainMaxCheckpoints: 4,
+  anchorCheck: 'repair',
 })
 
 /**
@@ -169,6 +172,12 @@ export function resolveEngineOptions(config = {}, env = process.env) {
     appendOnly,
     chainMaxTokens: Math.floor(num('GUARDIAN_CHAIN_MAX_TOKENS', 'chainMaxTokens', 0, 1_000_000)),
     chainMaxCheckpoints: Math.floor(num('GUARDIAN_CHAIN_MAX_CHECKPOINTS', 'chainMaxCheckpoints', 1, 1000)),
+    anchorCheck: (() => {
+      const e = String(env.GUARDIAN_ANCHOR_CHECK ?? '').trim().toLowerCase()
+      if (ANCHOR_MODES.includes(e)) return e
+      const r = String(pick('anchorCheck') ?? '').trim().toLowerCase()
+      return ANCHOR_MODES.includes(r) ? r : 'repair'
+    })(),
   }
 }
 
@@ -709,6 +718,28 @@ export function apply(ctx, config) {
     return
   }
 
+  const anchorsBySession = new WeakMap()
+  const anchorPass = (session, regionNodes, finalText) => {
+    if (options.anchorCheck === 'off') return ''
+    try {
+      const real = (regionNodes ?? []).filter(node => node.seq >= 0).map(node => node.seq)
+      const maxSeq = real.length > 0 ? Math.max(...real) : Infinity
+      const all = session === undefined || session === null ? [] : sessionNodes(session)
+      const later = all.filter(node => node.seq > maxSeq).map(node => lib.renderMessage(node.message))
+      const goal = extractGoal(all).goal
+      if (typeof goal === 'string') later.push(goal)
+      const found = findLostAnchors({ regionTexts: (regionNodes ?? []).map(node => lib.renderMessage(node.message)), laterTexts: later, checkpointText: finalText, memoryTexts: [] })
+      const items = lostConstraints({ regionItems: extractMemory(regionNodes ?? [], { session: '' }), checkpointText: finalText })
+      const stats = { recurring: found.recurring.length, kept: found.kept.length, lost: found.lost.length, constraintsLost: items.length }
+      if (keyable(session)) anchorsBySession.set(session, stats)
+      record({ event: 'anchors', session: String(session?.id ?? ''), mode: options.anchorCheck, rev: ANCHORS_REV, ...stats })
+      return options.anchorCheck === 'repair' ? renderCarried(found.lost, items) : ''
+    } catch (error) {
+      record({ event: 'anchors-error', session: String(session?.id ?? ''), error: String(error?.message ?? error).slice(0, 200) })
+      return ''
+    }
+  }
+
   const deterministic = (input, agent, reason) => {
     const session = agent?.session
     const { nodes, unmatched } = mapRegionSeqs(session, input.messages)
@@ -724,6 +755,8 @@ export function apply(ctx, config) {
     }
     const pressure = pressureBySession.get(session) ?? measure(agent)?.pressure ?? 0.8
     const checkpoint = buildCheckpoint(nodes, options, pressure, allNodes, extras)
+    const carried = anchorPass(session, nodes, checkpoint.text)
+    if (carried.length > 0) checkpoint.text = checkpoint.text + '\n\n' + carried
     const span = writeSpan(session, input.messages, checkpoint.text)
     rememberCompaction(session, {
       kind: String(reason).startsWith('llm summary cannot fit') ? 'overflow' : 'deterministic',
@@ -785,8 +818,12 @@ export function apply(ctx, config) {
         if (goalBlock.length > 0) prepended.push({ type: 'text', text: goalBlock })
         const memoryBlock = chain === undefined ? memoryBlockText() : deltaMemoryText(touched)
         if (memoryBlock.length > 0) prepended.push({ type: 'text', text: memoryBlock })
-        if (prepended.length > 0) {
-          return { ...result, summary: [...prepended, ...(Array.isArray(result.summary) ? result.summary : [])] }
+        const stock = Array.isArray(result.summary) ? result.summary : []
+        const finalText = [...prepended, ...stock].filter(b => b?.type === 'text').map(b => String(b.text ?? '')).join('\n')
+        const carried = anchorPass(session, region ?? [], finalText)
+        const tail = carried.length > 0 ? [{ type: 'text', text: carried }] : []
+        if (prepended.length > 0 || tail.length > 0) {
+          return { ...result, summary: [...prepended, ...stock, ...tail] }
         }
         return result
       }
@@ -1023,6 +1060,12 @@ export function apply(ctx, config) {
         const stats = memoryStats(memory)
         const by = stats.byCategory
         return `${stats.total} items (decisions ${by.decisions}, constraints ${by.constraints}, files ${by.files}, todos ${stats.openTodos} open, errors ${by.errors}, preferences ${by.preferences}) in ${options.memoryPath}`
+      }),
+      line('anchors', () => {
+        if (options.anchorCheck === 'off') return 'off'
+        const st = keyable(session) ? anchorsBySession.get(session) : undefined
+        if (st === undefined) return 'no compaction yet'
+        return `last compaction ${st.recurring} recurring, ${st.kept} kept, ${st.lost + st.constraintsLost} carried (mode ${options.anchorCheck})`
       }),
       line('append-only', () => options.appendOnly
         ? `on (chain max ${options.chainMaxCheckpoints} checkpoints, ${options.chainMaxTokens > 0 ? options.chainMaxTokens : 'auto'} tokens)`
