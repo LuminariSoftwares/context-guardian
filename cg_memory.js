@@ -7,16 +7,17 @@ import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from '
 import { dirname } from 'node:path'
 
 /** Revision tag for this memory implementation. */
-export const MEMORY_REV = 'cg-memory-1'
+export const MEMORY_REV = 'cg-memory-2'  // 2026-10-01: pins category + session-scoped render
 
 /** Schema version of the on-disk memory document. */
 export const MEMORY_VERSION = 1
 
-/** The six memory categories, in canonical order. */
-export const CATEGORIES = Object.freeze(['decisions', 'constraints', 'files', 'todos', 'errors', 'preferences'])
+/** The seven memory categories, in canonical order. `pins` = facts the user explicitly asked to keep (2026-10-01). */
+export const CATEGORIES = Object.freeze(['pins', 'decisions', 'constraints', 'files', 'todos', 'errors', 'preferences'])
 
 /** Per-category item caps applied by mergeMemory. */
 export const DEFAULT_MAX_PER_CATEGORY = Object.freeze({
+  pins: 60,
   decisions: 40,
   constraints: 40,
   files: 200,
@@ -26,7 +27,10 @@ export const DEFAULT_MAX_PER_CATEGORY = Object.freeze({
 })
 
 /** Rendered block order: also the budget admission priority order. */
-const ORDER = Object.freeze(['constraints', 'preferences', 'decisions', 'todos', 'files', 'errors'])
+const ORDER = Object.freeze(['pins', 'constraints', 'preferences', 'decisions', 'todos', 'files', 'errors'])
+
+/** Categories that belong to ONE session: rendered only for that session, so one run's facts never leak into another. */
+const SESSION_SCOPED = new Set(['pins', 'files', 'errors', 'todos'])
 
 /** Default render budget, in estimated tokens. */
 const DEFAULT_MAX_TOKENS = 1200
@@ -35,6 +39,14 @@ const DEFAULT_MAX_TOKENS = 1200
 const HEADER = '[memory -- durable notes kept across compactions and sessions by context-guardian; newest last]'
 
 const MAX_TEXT = 300
+const MAX_PIN_TEXT = 400
+
+/**
+ * A user line that asks for something to be kept (2026-10-01, bench1001: 'Important, keep this for later in the
+ * conversation: ...' matched no pattern, so 12 user-declared facts were never saved and the stock summary lost them).
+ * Deliberately narrow: an explicit keep/remember request, not every line that says 'important'.
+ */
+const PIN_RE = /\b(?:keep\s+(?:this|that|these|it)(?:\s+\w+){0,3}\s+for\s+later|for\s+later\s+(?:use|reference)|remember\s+(?:this|that|these)|(?:do\s+not|don't)\s+forget|make\s+a\s+note|note\s+(?:this|that)\s+for\s+later|pin\s+(?:this|that))\b/i
 const MAX_ERROR_TEXT = 200
 
 /** Explicit `prefix: fact` markers, matched at line start after bullet removal. */
@@ -90,8 +102,9 @@ export function normalizeText(text) {
 }
 
 /** Merge key for an item: category plus normalized fact (paths stay case-sensitive). */
-function mergeKey(cat, text) {
-  return cat + '\u0000' + (cat === 'files' ? String(text) : normalizeText(text))
+function mergeKey(cat, text, session) {
+  const scope = cat === 'pins' ? String(session ?? '') : ''
+  return cat + '\u0000' + scope + '\u0000' + (cat === 'files' ? String(text) : normalizeText(text))
 }
 
 /** Oldest first: smaller `last`, then smaller seq. */
@@ -158,6 +171,15 @@ function fromText(text, seq, session, isUser, out) {
       continue
     }
     const bare = line.replace(BULLET_RE, '')
+    if (isUser) {
+      const pin = bare.match(PIN_RE)
+      if (pin) {
+        // Keep from the start of the sentence that holds the request: the facts follow it.
+        const cut = Math.max(bare.lastIndexOf('. ', pin.index) + 2, 0)
+        out.push(makeItem('pins', clamp(bare.slice(cut), MAX_PIN_TEXT), seq, session))
+        continue
+      }
+    }
     let hit = false
     for (const pair of PREFIXES) {
       const m = bare.match(pair[0])
@@ -270,12 +292,12 @@ export function mergeMemory(memory, items, opts = {}) {
   const caps = Object.assign({}, DEFAULT_MAX_PER_CATEGORY, (opts && opts.maxPerCategory) || {})
   const next = sanitizeMemory(memory)
   const index = new Map()
-  for (const it of next.items) index.set(mergeKey(it.cat, it.text), it)
+  for (const it of next.items) index.set(mergeKey(it.cat, it.text, it.session), it)
   if (Array.isArray(items)) {
     for (const raw of items) {
       const it = normalizeItem(raw)
       if (!it) continue
-      const key = mergeKey(it.cat, it.text)
+      const key = mergeKey(it.cat, it.text, it.session)
       const existing = index.get(key)
       if (existing) {
         existing.count += 1
@@ -324,21 +346,26 @@ function renderLine(cat, item) {
 /** Category header line, or '' when this category is not rendered. */
 function renderHeader(cat) {
   if (cat === 'errors') return 'errors (latest):'
+  if (cat === 'pins') return 'pinned by the user (verbatim -- keep; answer from these, never from memory of the summary):'
   return cat + ':'
 }
 
 /** Render the memory as a budgeted block for the top of a checkpoint. */
 export function renderMemory(memory, opts = {}) {
   const max = opts && Number.isFinite(opts.maxTokens) ? opts.maxTokens : DEFAULT_MAX_TOKENS
+  // A session id scopes pins/files/errors/todos to that session; no id keeps the old, unscoped behaviour.
+  const session = opts && typeof opts.session === 'string' && opts.session !== '' ? opts.session : null
   const items = []
   const raw = memory && typeof memory === 'object' && Array.isArray(memory.items) ? memory.items : []
   for (const r of raw) {
     const it = normalizeItem(r)
-    if (it) items.push(it)
+    if (!it) continue
+    if (session !== null && SESSION_SCOPED.has(it.cat) && it.session !== session && it.session !== '') continue
+    items.push(it)
   }
   if (items.length === 0) return ''
   const acc = [HEADER]
-  const admitted = { constraints: [], preferences: [], decisions: [], todos: [], errors: [], files: [] }
+  const admitted = { pins: [], constraints: [], preferences: [], decisions: [], todos: [], errors: [], files: [] }
   for (const cat of ORDER) {
     if (cat === 'files') {
       const cands = items.filter((it) => it.cat === 'files').sort(newestFirst)

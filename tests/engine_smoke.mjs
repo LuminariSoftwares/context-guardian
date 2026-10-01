@@ -154,7 +154,7 @@ check('mode_deterministic_never_calls_llm', async () => {
 check('env_overrides_row', () => {
   const o = engine.resolveEngineOptions({ mode: 'llm-then-deterministic', numCtx: 8192, maxRecallTokens: 16000 }, { GUARDIAN_DSH_MODE: 'deterministic', GUARDIAN_NUM_CTX: '65536', GUARDIAN_IDLE_COMPACT_RATIO: 'banana' })
   const p = engine.resolveEngineOptions({ numCtx: 8192, maxRecallTokens: 16000, tools: ['recall', 'nope'] }, {})
-  return o.mode === 'deterministic' && o.numCtx === 65536 && o.idleCompactRatio === 0.45 && p.maxRecallTokens === 2048 && JSON.stringify(p.tools) === '["recall"]'
+  return o.mode === 'deterministic' && o.numCtx === 65536 && o.idleCompactRatio === 0 && p.maxRecallTokens === 2048 && JSON.stringify(p.tools) === '["recall"]'
 })
 check('checkpoint_lists_files_and_keyword_index', async () => {
   const h = makeCtx({ llm: 'throw' }); engine.apply(h.ctx, baseConfig())
@@ -253,8 +253,8 @@ check('context_command_reports_pressure_cost_and_cache', async () => {
   return out.includes('tier compact') && out.includes('75 %') && out.includes('15000 of 20000') && out.includes('prefilled again') && missing.includes('token meter is not available')
 })
 check('idle_trigger_fires_above_ratio_only', async () => {
-  const high = makeCtx({ pressure: 0.5 }); engine.apply(high.ctx, baseConfig())
-  const low = makeCtx({ pressure: 0.2 }); engine.apply(low.ctx, baseConfig())
+  const high = makeCtx({ pressure: 0.5 }); engine.apply(high.ctx, baseConfig({ idleCompactRatio: 0.45 })) // default is 0 (off) since 2026-10-01
+  const low = makeCtx({ pressure: 0.2 }); engine.apply(low.ctx, baseConfig({ idleCompactRatio: 0.45 }))
   const off = makeCtx({ pressure: 0.9 }); engine.apply(off.ctx, baseConfig({ idleCompactRatio: 0 }))
   const session = makeSession()
   for (const h of [high, low, off]) h.emit('agent/status', { agent: { session }, status: 'idle' })
@@ -262,7 +262,7 @@ check('idle_trigger_fires_above_ratio_only', async () => {
   return high.calls.compactNow === 1 && low.calls.compactNow === 0 && off.calls.compactNow === 0
 })
 check('idle_trigger_cancelled_when_agent_becomes_busy', async () => {
-  const h = makeCtx({ pressure: 0.6 }); engine.apply(h.ctx, baseConfig({ idleDelayMs: 40 }))
+  const h = makeCtx({ pressure: 0.6 }); engine.apply(h.ctx, baseConfig({ idleDelayMs: 40, idleCompactRatio: 0.45 }))
   const agent = { session: makeSession() }
   h.emit('agent/status', { agent, status: 'idle' })
   h.emit('agent/status', { agent, status: 'running' })
@@ -270,7 +270,7 @@ check('idle_trigger_cancelled_when_agent_becomes_busy', async () => {
   return h.calls.compactNow === 0
 })
 check('idle_trigger_labels_the_snapshot', async () => {
-  const h = makeCtx({ pressure: 0.6 }); const config = baseConfig({ spanDir: join(tmp, 'spans-c') }); engine.apply(h.ctx, config)
+  const h = makeCtx({ pressure: 0.6 }); const config = baseConfig({ spanDir: join(tmp, 'spans-c'), idleCompactRatio: 0.45 }); engine.apply(h.ctx, config)
   const agent = { session: makeSession() }
   h.compaction.compactNow = async () => { h.emit('session/event', agent.session, { seq: 150, type: 'compaction/start', data: { compactionId: 'cmp-2', turn: null } }); return null }
   h.emit('agent/status', { agent, status: 'idle' })
@@ -360,9 +360,10 @@ check('memory_prepended_to_llm_summary', async () => {
   const session = makeSession()
   const result = await h.compaction.summarize(smallInput(session), { session })
   const texts = result.summary.map(block => block.text)
-  return result.llmStreamCall === true && texts.length === 3
+  // 2026-10-01: the LLM path now also carries the recovery note (search/recall before answering, inline text is not on disk)
+  return result.llmStreamCall === true && texts.length === 4
     && texts[0].includes("[pinned goal --") && texts[1].includes('[memory --') && texts[1].includes('prefer ruff over flake8')
-    && texts[2] === 'LLM SUMMARY'
+    && texts[2] === engine.RECOVERY_NOTE && texts[3] === 'LLM SUMMARY'
 })
 check('memory_off_writes_nothing', async () => {
   const memoryPath = join(tmp, 'chk-off', 'memory.json')

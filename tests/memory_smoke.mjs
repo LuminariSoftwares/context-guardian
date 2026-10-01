@@ -53,9 +53,9 @@ check('exports_exact', () => {
   const fns = ['emptyMemory', 'normalizeText', 'extractMemory', 'mergeMemory', 'renderMemory',
     'memoryStats', 'itemsForSession', 'loadMemory', 'saveMemory', 'estTokens']
   if (fns.some((n) => typeof mem[n] !== 'function')) return false
-  if (MEMORY_REV !== 'cg-memory-1' || MEMORY_VERSION !== 1) return false
-  if (!Array.isArray(CATEGORIES) || CATEGORIES.length !== 6) return false
-  if (!deep(CATEGORIES.slice(), ['decisions', 'constraints', 'files', 'todos', 'errors', 'preferences'])) return false
+  if (MEMORY_REV !== 'cg-memory-2' || MEMORY_VERSION !== 1) return false
+  if (!Array.isArray(CATEGORIES) || CATEGORIES.length !== 7) return false
+  if (!deep(CATEGORIES.slice(), ['pins', 'decisions', 'constraints', 'files', 'todos', 'errors', 'preferences'])) return false
   if (!Object.isFrozen(CATEGORIES) || !Object.isFrozen(DEFAULT_MAX_PER_CATEGORY)) return false
   if (!deep(emptyMemory(), { version: 1, updated: null, items: [] })) return false
   if (estTokens('abcd') !== Math.ceil(4 / 3.5)) return false
@@ -333,7 +333,7 @@ check('stats_and_session_filter', () => {
   const st = memoryStats(m)
   if (st.total !== 5) return false
   if (st.openTodos !== 1) return false
-  const want = { decisions: 1, constraints: 1, files: 1, todos: 2, errors: 0, preferences: 0 }
+  const want = { pins: 0, decisions: 1, constraints: 1, files: 1, todos: 2, errors: 0, preferences: 0 }
   if (JSON.stringify(st.byCategory) !== JSON.stringify(want)) return false
   const s1 = itemsForSession(m, 's1')
   if (s1.length !== 4 || !s1.every((it) => it.session === 's1')) return false

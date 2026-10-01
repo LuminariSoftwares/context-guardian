@@ -65,8 +65,11 @@ export const DEFAULTS = Object.freeze({
   mode: 'llm-then-deterministic',
   numCtx: 32768,
   reserveOutput: 8192,
-  idleCompactRatio: 0.45,
+  // 2026-10-01 (bench1001): 0.45 roughly doubled the lossy summary passes and started them after ~3 turns; recall
+  // got WORSE than no plugin. Off by default; when on, a cooldown spaces the passes.
+  idleCompactRatio: 0,
   idleDelayMs: 4000,
+  idleCooldownMs: 60000,
   checkpointMaxTokens: 3000,
   textTokens: 200,
   userTextTokens: 400,
@@ -144,6 +147,7 @@ export function resolveEngineOptions(config = {}, env = process.env) {
     reserveOutput: Math.floor(num('GUARDIAN_RESERVE_OUTPUT', 'reserveOutput', 0, 1_000_000)),
     idleCompactRatio: num('GUARDIAN_IDLE_COMPACT_RATIO', 'idleCompactRatio', 0, 0.99),
     idleDelayMs: Math.floor(num('GUARDIAN_IDLE_DELAY_MS', 'idleDelayMs', 0, 3_600_000)),
+    idleCooldownMs: Math.floor(num('GUARDIAN_IDLE_COOLDOWN_MS', 'idleCooldownMs', 0, 3_600_000)),
     checkpointMaxTokens: Math.floor(num('GUARDIAN_CHECKPOINT_MAX_TOKENS', 'checkpointMaxTokens', 200, 1_000_000)),
     textTokens: Math.floor(num('GUARDIAN_TEXT_TOKENS', 'textTokens', 8, 100_000)),
     userTextTokens: Math.floor(num('GUARDIAN_USER_TEXT_TOKENS', 'userTextTokens', 8, 100_000)),
@@ -569,6 +573,29 @@ function hasText(result) {
   return Array.isArray(result?.summary) && result.summary.some(block => block?.type === 'text' && String(block.text ?? '').trim().length > 0)
 }
 
+/** Recovery rule the LLM-summary path never carried before 2026-10-01 (only the deterministic path had RECALL_GUIDE). */
+export const RECOVERY_NOTE = '[recovery: if a fact you need is not in this checkpoint, call `search` then `recall` before answering; never guess or invent. Text the user pasted INLINE (documents, logs, listings) is not a file on disk -- restore it with recall, do not try to read it from disk.]'
+
+/**
+ * Hard cap on the FINAL checkpoint text, LLM path included (2026-10-01: checkpointMaxTokens bounded only the
+ * deterministic entries, so LLM checkpoints grew 3.1K -> 12.8K chars over 7 passes). Blocks are kept in order, so
+ * whatever is placed first (goal, pins, recovery note) survives; the first block that does not fit is cut with a marker.
+ */
+export function capSummaryBlocks(blocks, maxTokens) {
+  const out = []
+  let total = 0
+  for (const block of blocks) {
+    if (block?.type !== 'text') { out.push(block); continue }
+    const text = String(block.text ?? '')
+    const tokens = Math.ceil(text.length / 3.5)
+    if (total + tokens <= maxTokens) { out.push(block); total += tokens; continue }
+    const room = Math.max(0, maxTokens - total)
+    if (room > 50) out.push({ type: 'text', text: text.slice(0, Math.floor(room * 3.5)) + '\n[checkpoint truncated at checkpointMaxTokens; call search/recall for the rest]' })
+    break
+  }
+  return out
+}
+
 const TEXT_OUTPUT = { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: String(value) }] }
 
 export function apply(ctx, config) {
@@ -618,10 +645,10 @@ export function apply(ctx, config) {
     }
   }
 
-  const memoryBlockText = () => renderMemory(memory, { maxTokens: options.memoryMaxTokens })
+  const memoryBlockText = (session) => renderMemory(memory, { maxTokens: options.memoryMaxTokens, session: String(session?.id ?? '') })
 
   /** Merge key of a memory item, the same key cg_memory.js merges on. */
-  const memoryKey = (item) => item.cat + '\u0000' + (item.cat === 'files' ? item.text : normalizeText(item.text))
+  const memoryKey = (item) => item.cat + '\u0000' + (item.cat === 'pins' ? String(item.session ?? '') : '') + '\u0000' + (item.cat === 'files' ? item.text : normalizeText(item.text))
 
   /** The session nodes of the chain head an appended checkpoint keeps in front of it. */
   const chainHeadNodes = (session, chain) => {
@@ -635,9 +662,9 @@ export function apply(ctx, config) {
    * actually touched. The chain head in front of it already carries the rest, so
    * re-rendering the whole memory would grow the prompt prefix for nothing.
    */
-  const deltaMemoryText = (touched) => renderMemory(
+  const deltaMemoryText = (touched, session) => renderMemory(
     { ...memory, items: (memory.items ?? []).filter(item => touched?.has?.(memoryKey(item))) },
-    { maxTokens: options.memoryMaxTokens },
+    { maxTokens: options.memoryMaxTokens, session: String(session?.id ?? '') },
   )
 
   /**
@@ -746,12 +773,12 @@ export function apply(ctx, config) {
     const touched = updateMemory(session, nodes)
     const chain = keyable(session) ? chainBySession.get(session) : undefined
     const allNodes = session === undefined ? nodes : sessionNodes(session)
-    const extras = { memoryBlock: memoryBlockText() }
+    const extras = { memoryBlock: memoryBlockText(session) }
     if (chain !== undefined) {
       // Appended after a chain head: the head in front of this checkpoint already
       // carries the goal and the older memory, so this one carries only the delta.
       extras.goalBlock = renderGoalDelta(chainHeadNodes(session, chain), [...nodes, ...allNodes])
-      extras.memoryBlock = deltaMemoryText(touched)
+      extras.memoryBlock = deltaMemoryText(touched, session)
     }
     const pressure = pressureBySession.get(session) ?? measure(agent)?.pressure ?? 0.8
     const checkpoint = buildCheckpoint(nodes, options, pressure, allNodes, extras)
@@ -816,16 +843,21 @@ export function apply(ctx, config) {
         // Goal first, memory second, each its OWN text block, before the stock summary.
         const prepended = []
         if (goalBlock.length > 0) prepended.push({ type: 'text', text: goalBlock })
-        const memoryBlock = chain === undefined ? memoryBlockText() : deltaMemoryText(touched)
+        const memoryBlock = chain === undefined ? memoryBlockText(session) : deltaMemoryText(touched, session)
         if (memoryBlock.length > 0) prepended.push({ type: 'text', text: memoryBlock })
         const stock = Array.isArray(result.summary) ? result.summary : []
+        // Verify the user's pins survived (2026-10-01: hasText() proved only that SOME text came back). A delta
+        // memory block shows only touched notes, so check every pin of this session against the whole text.
+        const sid = String(session?.id ?? '')
+        const pins = (memory?.items ?? []).filter(it => it?.cat === 'pins' && (it.session === sid || it.session === ''))
+        const seen = [...prepended, ...stock].filter(b => b?.type === 'text').map(b => String(b.text ?? '')).join('\n')
+        const missing = pins.filter(it => !seen.includes(String(it.text)))
+        if (missing.length > 0) prepended.push({ type: 'text', text: '[pinned by the user -- verbatim, keep]\n' + missing.map(it => '- ' + it.text).join('\n') })
+        prepended.push({ type: 'text', text: RECOVERY_NOTE })
         const finalText = [...prepended, ...stock].filter(b => b?.type === 'text').map(b => String(b.text ?? '')).join('\n')
         const carried = anchorPass(session, region ?? [], finalText)
         const tail = carried.length > 0 ? [{ type: 'text', text: carried }] : []
-        if (prepended.length > 0 || tail.length > 0) {
-          return { ...result, summary: [...prepended, ...stock, ...tail] }
-        }
-        return result
+        return { ...result, summary: capSummaryBlocks([...prepended, ...stock, ...tail], options.checkpointMaxTokens) }
       }
       return deterministic(input, agent, 'llm summary was empty')
     } catch (error) {
@@ -951,6 +983,7 @@ export function apply(ctx, config) {
   })
   const idleTimers = new Map()
   const idleFloor = new WeakMap()
+  const idleLast = new WeakMap()
   const clearIdle = (agent) => { const timer = idleTimers.get(agent); if (timer !== undefined) { clearTimeout(timer); idleTimers.delete(agent) } }
   const runIdle = async (agent) => {
     idleTimers.delete(agent)
@@ -959,6 +992,9 @@ export function apply(ctx, config) {
     if (before === undefined || before.pressure < options.idleCompactRatio) return
     // After a failed or empty attempt, wait for the surface to grow 10 % before trying again.
     if (before.tokens < (idleFloor.get(agent.session) ?? 0)) return
+    // Space idle passes: every pass is another lossy summary of a summary.
+    if (Date.now() - (idleLast.get(agent.session) ?? 0) < options.idleCooldownMs) return
+    idleLast.set(agent.session, Date.now())
     triggerBySession.set(agent.session, 'idle')
     try {
       const result = await ctx.compaction.compactNow(agent, AbortSignal.timeout(600_000))
