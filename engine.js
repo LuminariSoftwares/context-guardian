@@ -96,6 +96,7 @@ export const DEFAULTS = Object.freeze({
   // what follows, so the prompt prefix never changes and the provider's KV/prefix cache
   // survives. Opt-in until it has a live proof; 0 chainMaxTokens = auto per session.
   appendOnly: false,
+  mustKeep: true,
   chainMaxTokens: 0,
   chainMaxCheckpoints: 4,
   anchorCheck: 'repair',
@@ -133,6 +134,11 @@ export function resolveEngineOptions(config = {}, env = process.env) {
   const appendOnly = envAppendOnly === '1' || envAppendOnly === 'true' ? true
     : envAppendOnly === '0' || envAppendOnly === 'false' ? false
       : pick('appendOnly') === true
+  // Default ON: only the four spellings turn it off (same switch shape as appendOnly).
+  const envMustKeep = String(env.GUARDIAN_MUST_KEEP ?? '').trim().toLowerCase()
+  const mustKeep = envMustKeep === '0' || envMustKeep === 'false' ? false
+    : envMustKeep === '1' || envMustKeep === 'true' ? true
+      : pick('mustKeep') !== false
   const numCtx = Math.floor(num('GUARDIAN_NUM_CTX', 'numCtx', 1024, 4_000_000))
   // Did the user pin the window themselves? An explicit numCtx (env or preset row)
   // must always win over what the host reports, so the window helper needs to know.
@@ -174,6 +180,7 @@ export function resolveEngineOptions(config = {}, env = process.env) {
     hideTools: list('GUARDIAN_HIDE_TOOLS', 'hideTools'),
     dropSources: list('GUARDIAN_DROP_SOURCES', 'dropSources'),
     appendOnly,
+    mustKeep,
     chainMaxTokens: Math.floor(num('GUARDIAN_CHAIN_MAX_TOKENS', 'chainMaxTokens', 0, 1_000_000)),
     chainMaxCheckpoints: Math.floor(num('GUARDIAN_CHAIN_MAX_CHECKPOINTS', 'chainMaxCheckpoints', 1, 1000)),
     anchorCheck: (() => {
@@ -581,6 +588,30 @@ export const RECOVERY_NOTE = '[recovery: if a fact you need is not in this check
  * deterministic entries, so LLM checkpoints grew 3.1K -> 12.8K chars over 7 passes). Blocks are kept in order, so
  * whatever is placed first (goal, pins, recovery note) survives; the first block that does not fit is cut with a marker.
  */
+/**
+ * Asked of the summary call that already runs (2026-10-01, DeepSeek review of bench1001): the model reading the span is
+ * the only thing that can tell which facts matter when nobody said "remember". Placed as a user message right before
+ * compaction-basic's own instruction, so the replayed prefix (and its KV cache) is unchanged.
+ */
+export const MUST_KEEP_INSTRUCTION = 'For the checkpoint you are about to write: after every section it asks for, add one more section headed exactly `## Must Keep`. List there, one bullet each, every fact a later step may need that the user stated or that was decided: names and their values, codes, ids, paths, numbers, decisions, constraints, open questions. Copy exact wording and exact values; never paraphrase a value. Carry forward every bullet of any earlier `## Must Keep` that is still true. Write "- (none)" if there is nothing.'
+
+/** The bullets under a `## Must Keep` heading, verbatim, without "(none)". */
+export function parseMustKeep(text) {
+  const out = []
+  let inside = false
+  for (const raw of String(text ?? '').split('\n')) {
+    const line = raw.trim()
+    if (/^#{1,4}\s/.test(line)) { inside = /^#{1,4}\s*must\s+keep\b/i.test(line); continue }
+    if (!inside) continue
+    const m = line.match(/^(?:[-*+]|\d+[.)])\s+(.*)$/)
+    if (!m) continue
+    const item = m[1].trim()
+    if (item === '' || /^\(?none\)?\.?$/i.test(item)) continue
+    out.push(item.length > 400 ? item.slice(0, 399) + '\u2026' : item)
+  }
+  return out
+}
+
 export function capSummaryBlocks(blocks, maxTokens) {
   const out = []
   let total = 0
@@ -823,7 +854,10 @@ export function apply(ctx, config) {
     const window = sessionWindow(agent?.session)
     if (need > window) return deterministic(input, agent, `llm summary cannot fit: ~${need} > ${window}`)
     try {
-      const result = await original.call(this, input, agent, signal)
+      const asked = options.mustKeep && Array.isArray(input?.messages)
+        ? { ...input, messages: [...input.messages, { role: 'user', content: [{ type: 'text', text: MUST_KEEP_INSTRUCTION }], source: { kind: 'plugin', plugin: 'context-guardian' } }] }
+        : input
+      const result = await original.call(this, asked, agent, signal)
       if (hasText(result)) {
         const session = agent?.session
         record({ event: 'llm', session: String(session?.id ?? ''), provider: result.provider, model: result.model })
@@ -849,9 +883,24 @@ export function apply(ctx, config) {
         // Verify the user's pins survived (2026-10-01: hasText() proved only that SOME text came back). A delta
         // memory block shows only touched notes, so check every pin of this session against the whole text.
         const sid = String(session?.id ?? '')
-        const pins = (memory?.items ?? []).filter(it => it?.cat === 'pins' && (it.session === sid || it.session === ''))
         const seen = [...prepended, ...stock].filter(b => b?.type === 'text').map(b => String(b.text ?? '')).join('\n')
-        const missing = pins.filter(it => !seen.includes(String(it.text)))
+        // The model's own `## Must Keep` bullets become pins of this session, so the NEXT pass carries them verbatim
+        // even if its summary drifts. Saved before the check below, which then finds them present in this checkpoint.
+        if (options.mustKeep && options.memoryMaxTokens > 0) {
+          const kept = parseMustKeep(seen)
+          if (kept.length > 0) {
+            try {
+              const now = new Date().toISOString()
+              memory = mergeMemory(memory, kept.map(text => ({ cat: 'pins', text, seq: 0, session: sid, first: now, last: now, count: 1, done: false })))
+              saveMemory(options.memoryPath, memory)
+              record({ event: 'must-keep', session: sid, kept: kept.length })
+            } catch (error) { log.warn(`context-guardian engine: must-keep not saved (${error.message})`) }
+          }
+        }
+        const pins = (memory?.items ?? []).filter(it => it?.cat === 'pins' && (it.session === sid || it.session === ''))
+        // Normalized (case, whitespace, trailing punctuation) so a reflowed sentence is not re-appended as a near-duplicate.
+        const seenNorm = normalizeText(seen)
+        const missing = pins.filter(it => !seenNorm.includes(normalizeText(it.text)))
         if (missing.length > 0) prepended.push({ type: 'text', text: '[pinned by the user -- verbatim, keep]\n' + missing.map(it => '- ' + it.text).join('\n') })
         prepended.push({ type: 'text', text: RECOVERY_NOTE })
         const finalText = [...prepended, ...stock].filter(b => b?.type === 'text').map(b => String(b.text ?? '')).join('\n')

@@ -36,9 +36,11 @@ function makeCtx({ llm = 'throw', pressure = 0.85, withMeter = true, tokens = nu
   const commands = new Map()
   const calls = { llm: 0, compactNow: 0 }
   class FakeEngine {
-    async summarize() {
+    async summarize(input) {
       calls.llm += 1
+      calls.lastInput = input
       if (llm === 'throw') throw new Error(LIVE_ERROR)
+      if (llm === 'mustkeep') return { summary: [T('## Primary Request and Intent\n- x\n\n## Must Keep\n- the release codename for project Heron is TUNNEL-611\n- (none)')], provider: 'p', model: 'm', rawOutput: '', llmStreamCall: true }
       if (llm === 'empty') return { summary: [T('   ')], provider: 'p', model: 'm', rawOutput: '', llmStreamCall: true }
       return { summary: [T('LLM SUMMARY')], provider: 'p', model: 'm', rawOutput: 'LLM SUMMARY', llmStreamCall: true }
     }
@@ -364,6 +366,20 @@ check('memory_prepended_to_llm_summary', async () => {
   return result.llmStreamCall === true && texts.length === 4
     && texts[0].includes("[pinned goal --") && texts[1].includes('[memory --') && texts[1].includes('prefer ruff over flake8')
     && texts[2] === engine.RECOVERY_NOTE && texts[3] === 'LLM SUMMARY'
+})
+check('must_keep_is_asked_and_pinned', async () => {
+  // 2026-10-01: the summary call is asked for `## Must Keep`; its bullets become pins of the session.
+  const memoryPath = join(tmp, 'chk-mk', 'memory.json')
+  const h = makeCtx({ llm: 'mustkeep' }); engine.apply(h.ctx, baseConfig({ memoryPath, anchorCheck: 'off' }))
+  const session = makeSession()
+  await h.compaction.summarize(smallInput(session), { session })
+  const last = h.calls.lastInput.messages.at(-1)
+  const asked = last.role === 'user' && last.content[0].text === engine.MUST_KEEP_INSTRUCTION
+  const saved = JSON.parse(readFileSync(memoryPath, 'utf8')).items.filter(it => it.cat === 'pins')
+  const off = makeCtx({ llm: 'mustkeep' }); engine.apply(off.ctx, baseConfig({ memoryPath: join(tmp, 'chk-mk2', 'memory.json'), mustKeep: false }))
+  await off.compaction.summarize(smallInput(session), { session })
+  const notAsked = off.calls.lastInput.messages.at(-1)?.content?.[0]?.text !== engine.MUST_KEEP_INSTRUCTION
+  return asked && notAsked && saved.length === 1 && saved[0].text.includes('TUNNEL-611') && saved[0].session === String(session.id)
 })
 check('memory_off_writes_nothing', async () => {
   const memoryPath = join(tmp, 'chk-off', 'memory.json')

@@ -1,5 +1,26 @@
 # Changelog
 
+## dsh-context-guardian 0.1.0-alpha.8 / PyPI context-guardian 0.7.1 (2026-10-01)
+
+**Recall fix (DSH engine).** Benchmark (48-prompt session, 12 facts, 3-7 compactions, qwen3-coder:30b): alpha.7 made
+recall WORSE than no plugin (0 of 3 runs right; one invented all 12 facts, two never finished) while stock compaction got 2 of 3 runs
+right. alpha.8: 12/12 with 0 invented in every run (3 runs, plus a different phrasing, plus 2 runs where the facts were
+never flagged as important -- stock compaction 0/12 there). The causes and fixes:
+- **Pinned facts.** User lines that ask to keep or remember something are saved verbatim in a new `pins` memory
+  category, rendered first in every checkpoint, scoped to their session (pins, files, errors and todos no longer leak
+  into other sessions).
+- **`## Must Keep`.** The summary call that already runs is asked for one more section listing every fact a later step
+  may need, quoted exactly; its bullets become pins of the session. No extra model call. `mustKeep: false` /
+  `GUARDIAN_MUST_KEEP=0` turns it off.
+- **Pins are verified.** After every LLM summary the engine checks each pin against the checkpoint (case and whitespace
+  insensitive) and appends any that are missing.
+- **Recovery note on the LLM path.** Checkpoints written by the model now say: search/recall before answering, never
+  guess, pasted text is not a file on disk (the model used to go looking for inline documents on disk).
+- **Final checkpoint capped** at `checkpointMaxTokens` on the LLM path too (it grew 3.1K -> 12.8K chars over 7 passes).
+- **Idle trigger off by default** (`idleCompactRatio` 0.45 -> 0) with a 60 s cooldown when enabled: it doubled the
+  number of lossy summary passes. If your preset row sets `idleCompactRatio: 0.45`, remove it.
+- `context_guardian.py` reported `__version__` 0.5.1 inside the 0.7.0 package; now 0.7.1.
+
 ## dsh-context-guardian 0.1.0-alpha.7 / PyPI context-guardian 0.7.0 (2026-09-27)
 
 **`pip install` now includes the doctor.** `cg_doctor.py` ships in the wheel with a `context-guardian-doctor` command.

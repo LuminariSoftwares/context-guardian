@@ -2,7 +2,7 @@
 // session, rendered first, survive the checkpoint cap, and the idle trigger must be off by default.
 import assert from 'node:assert/strict'
 import { extractMemory, mergeMemory, emptyMemory, renderMemory } from '../cg_memory.js'
-import { DEFAULTS, capSummaryBlocks, RECOVERY_NOTE } from '../engine.js'
+import { DEFAULTS, capSummaryBlocks, RECOVERY_NOTE, parseMustKeep } from '../engine.js'
 
 let n = 0
 const ok = (cond, msg) => { assert.ok(cond, msg); n += 1 }
@@ -31,5 +31,9 @@ ok(merged.items.filter(it => it.cat === 'pins' && it.text.includes('TUNNEL-611')
 const capped = capSummaryBlocks([{ type: 'text', text: 'PIN: TUNNEL-611' }, { type: 'text', text: RECOVERY_NOTE }, { type: 'text', text: 'x'.repeat(100000) }], 300)
 ok(capped[0].text.includes('TUNNEL-611') && capped[1].text === RECOVERY_NOTE, 'cap keeps the leading blocks')
 ok(capped.map(x => x.text).join('').length <= 300 * 3.5 + 120, 'cap truncates the rest')
+const mk = parseMustKeep('## Current Work\n- a\n## Must Keep\n- Heron = TUNNEL-611\n* port 6543\n- (none)\n## Next Step\n- b')
+ok(mk.length === 2 && mk[0] === 'Heron = TUNNEL-611' && mk[1] === 'port 6543', 'Must Keep bullets parsed, other sections and (none) ignored')
+ok(parseMustKeep('no such section\n- x').length === 0, 'no section -> no pins')
+ok(DEFAULTS.mustKeep === true, 'must-keep on by default')
 ok(DEFAULTS.idleCompactRatio === 0 && DEFAULTS.idleCooldownMs > 0, 'idle trigger off by default, cooldown set')
 console.log(`pins_smoke: ${n} checks, ${n} passed`)

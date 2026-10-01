@@ -69,7 +69,6 @@ A checkout works too: `git clone https://github.com/LuminariSoftwares/context-gu
          name: 'file:///C:/path/to/context-guardian/engine.js'
          config:
            mode: llm-then-deterministic
-           idleCompactRatio: 0.45
            tools: [recall, search]
    ```
    - `name` is a `file:///` URL to YOUR copy of `engine.js`, with forward slashes, on Windows too. For an npm install that is `file:///C:/Users/<you>/.dsh/profiles/<profile>/node_modules/dsh-context-guardian/engine.js`.
@@ -154,7 +153,9 @@ With `appendOnly: true`, a compaction that DSH starts on its own under pressure 
 | mode | llm-then-deterministic | GUARDIAN_DSH_MODE | try the LLM summary; fall back to deterministic on failure, empty output or overflow (`deterministic`, `off`) |
 | numCtx | the model's window, as DSH reports it | GUARDIAN_NUM_CTX | set only to force a smaller window |
 | reserveOutput | 8192 | GUARDIAN_RESERVE_OUTPUT | space held for the summarizer's output |
-| idleCompactRatio | 0.45 | GUARDIAN_IDLE_COMPACT_RATIO | compact when idle and pressure exceeds this fraction |
+| idleCompactRatio | 0 (off) | GUARDIAN_IDLE_COMPACT_RATIO | compact when idle and pressure exceeds this fraction. Off by default since 0.1.0-alpha.8: at 0.45 it doubled the lossy summary passes and made recall worse in our benchmark |
+| idleCooldownMs | 60000 | GUARDIAN_IDLE_COOLDOWN_MS | minimum time between two idle compactions of one session |
+| mustKeep | true | GUARDIAN_MUST_KEEP | ask the summary call for a `## Must Keep` section and pin its bullets for the rest of the session (`0` turns it off) |
 | idleDelayMs | 4000 | GUARDIAN_IDLE_DELAY_MS | wait this long after the agent goes idle before checking pressure |
 | checkpointMaxTokens | 3000 | GUARDIAN_CHECKPOINT_MAX_TOKENS | deterministic checkpoint length cap, lowered at high pressure |
 | textTokens | 200 | GUARDIAN_TEXT_TOKENS | tokens allowed per text block in a checkpoint |

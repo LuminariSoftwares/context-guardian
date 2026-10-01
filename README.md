@@ -105,6 +105,23 @@ The rest of this page is the **proxy**. The DSH engine has its own five-minute g
 
 "Tested on" means the repo's test suites plus daily use on the machine this was built on. "Expected to work" is not tested; please open an issue if it does not work for you.
 
+## Measured: does it keep what matters? (2026-10-01)
+
+A 48-prompt session on qwen3-coder:30b (Ollama, 64K window) under the DeepSeek Harness: 12 project codenames are given
+in the first 6 prompts, 40 filler reading tasks force 3-7 compactions, then the model is asked for all 12 (null allowed,
+guessing counted as wrong). Fresh random codenames every run.
+
+| how the facts were given | guardian off | 0.1.0-alpha.7 | **0.1.0-alpha.8** |
+|---|---|---|---|
+| "Important, keep this for later: ..." | 2 of 3 runs 12/12 (one run invented all 12) | 0 of 3 runs right (one invented all 12, two never finished) | **3 of 3 runs 12/12, 0 invented** |
+| "Please remember these for later: ..." | -- | -- | **12/12, 0 invented** |
+| "For reference: ..." (no request to keep) | 0/12 in 2 of 2 runs (one answered null, one invented all 12) | -- | **12/12 in 2 of 2 runs, 0 invented** |
+
+What changed: facts the user asks to keep are pinned verbatim; the summary call is also asked for a `## Must Keep`
+section whose bullets are pinned for the rest of the session; every checkpoint is checked for its pins; the idle trigger
+is off by default. What it does not fix yet: an early detail nobody flagged (a code on line 17 of the first document) is
+still lost in both arms -- the model does not call `recall` on its own.
+
 ## Why this exists
 
 Claude-Code-style coding CLIs (Claude Code itself, and OpenAI-compatible-backend tools like OpenClaude) ship with a built-in auto-compact feature. That feature depends on accurate, real-time token-usage accounting coming back from the API in the exact shape the CLI expects. Point one of these tools at a local model through an OpenAI-compatible bridge — Ollama's `/v1` endpoint, a LiteLLM proxy, a Headroom proxy — and that accounting is frequently missing, wrong, or shaped differently, so auto-compact silently never fires.
