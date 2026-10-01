@@ -12,7 +12,7 @@ manual, user-invoked action -- nothing found in its config or behavior
 suggests it fires itself automatically as the context fills. That gap
 between "the capability technically exists" and "it never runs unless you
 remember to type it" is exactly what produced the original hard-stop
-symptom. This script is the fallback TJ asked for: a small proxy that sits
+symptom. This script is the fallback: a small proxy that sits
 in front of Headroom, watches the running token count itself, and forces a
 compaction BEFORE the real backend ever has a chance to hard-error --
 automating what `/compact` would do manually, so it can't be forgotten.
@@ -179,10 +179,9 @@ KEEP_RECENT_MIN_MESSAGES = 4
 KEEP_RECENT_FRACTION = float(os.environ.get("GUARDIAN_KEEP_RECENT_FRACTION", "0.20"))
 KEEP_RECENT_MESSAGES = int(_KEEP_RECENT_ENV) if KEEP_RECENT_EXPLICIT else KEEP_RECENT_MIN_MESSAGES
 CHARS_PER_TOKEN_ESTIMATE = float(os.environ.get("GUARDIAN_CHARS_PER_TOKEN", "3.5"))
-# ^ backported 2026-08-20 from the public repo (ClaudeRepos/context-guardian),
-# which had this env override and this copy did not. The two files have drifted
-# in BOTH directions -- see the roadmap note. Over-reads by ~14% vs tiktoken on
-# a real MCP tool payload, which is the intended conservative direction.
+# ^ Over-reads by ~14% vs tiktoken on a real MCP tool payload, which is the
+# intended conservative direction. When the backend reports usage, the per-model
+# calibration (GUARDIAN_CALIBRATE, below) corrects the estimate.
 # Count the `tools` array against the budget. Default ON, because it IS in the
 # request and the model IS charged for it. Set GUARDIAN_COUNT_TOOLS=0 to get
 # the old messages-only behaviour back if this ever needs bisecting.
@@ -234,11 +233,10 @@ UPSTREAM_CONNECT_TIMEOUT_SECONDS = float(
 # PostgreSQL + pgvector + daemon, which a single-user stack does not need.
 # Relative to the repo, NOT an absolute path from one machine.
 #
-# This shipped as r"F:\AI\LuminariStudio\logs\guardian_spans" in a PUBLIC
+# This once shipped as a hard-coded Windows absolute path in a PUBLIC
 # repo. On Linux and macOS that string is not an absolute path at all -- it is
 # a single filename containing backslashes, so mkdir(parents=True) cheerfully
-# created a directory literally called `F:\AI\LuminariStudio\logs\
-# guardian_spans` in whatever the working directory happened to be, moved when
+# created a directory literally named after that Windows path in whatever the working directory happened to be, moved when
 # the proxy was started from elsewhere, and nothing warned. The archive that
 # 0.3.0 exists to provide was silently going somewhere nobody would look.
 SPAN_DIR = Path(os.environ.get(

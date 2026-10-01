@@ -330,7 +330,7 @@ function runSelftest() {
     return r
   }
 
-  // My own fixture set (distinct from the overseer probe's fixtures).
+  // My own fixture set (distinct from the contract probe's fixtures).
   const myNodes = [
     { seq: 10, message: null },
     { seq: 11, message: { role: 'user', content: [T('open config/app_settings.json and check retry_limit')] } },

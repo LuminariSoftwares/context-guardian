@@ -257,6 +257,7 @@ One command says what is configured, what is wrong, and how to fix each problem:
 
 ```bash
 python cg_doctor.py                          # from the repo, or the installed npm package folder
+context-guardian-doctor                      # after `pip install context-guardian` (0.7.0+)
 python cg_doctor.py --preset path/to/agent.cordis.yml   # also check the DSH preset that mounts engine.js
 python cg_doctor.py --json                   # the same findings as JSON
 ```

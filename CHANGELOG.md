@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## dsh-context-guardian 0.1.0-alpha.7 / PyPI context-guardian 0.7.0 (2026-09-27)
+
+**`pip install` now includes the doctor.** `cg_doctor.py` ships in the wheel with a `context-guardian-doctor` command.
 
 **A compaction can no longer quietly lose what the model still needs (DSH engine).** After every compaction the engine
 lists the files, identifiers, URLs and code spans from the compacted turns that later turns still use, plus every

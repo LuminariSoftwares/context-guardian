@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "context-guardian"
-version = "0.6.0"
+version = "0.7.0"
 description = "A tiny proxy in front of any OpenAI-compatible LLM backend that compacts conversation history before the context window fills, so local-model coding CLIs don't hard-die from overflow."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -38,9 +38,12 @@ Issues = "https://github.com/LuminariSoftwares/context-guardian/issues"
 
 [project.scripts]
 context-guardian = "context_guardian:main"
+context-guardian-doctor = "cg_doctor:main"
 
 [tool.setuptools]
-py-modules = ["context_guardian"]
+py-modules = ["context_guardian", "cg_doctor"]
+# configure.py stays out of the wheel on purpose: a top-level module named `configure`
+# would collide with other packages. pip users run it from a clone (README, Configure).
 
 # Pytest configuration.
 #

@@ -791,7 +791,7 @@ export function apply(ctx, config) {
     if (options.mode === 'deterministic') return deterministic(input, agent, 'mode deterministic')
     // The stock summarizer replays system + tools + the whole region and asks
     // for output on top. When that cannot fit in the window the call is
-    // doomed before it is made -- the failure TJ hit on 2026-09-19.
+    // doomed before it is made -- a failure seen in real use.
     const need = estRequestTokens(input.system) + estRequestTokens(input.tools) + estRequestTokens(input.messages) + options.reserveOutput
     const window = sessionWindow(agent?.session)
     if (need > window) return deterministic(input, agent, `llm summary cannot fit: ~${need} > ${window}`)
