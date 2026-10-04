@@ -24,8 +24,9 @@
         numCtx: 32768
         # Hard trigger (GUARDIAN_COMPACT_THRESHOLD).
         compactThreshold: 0.85
-        # Proactive trigger when the agent goes idle (Phase 3c).
-        idleCompactRatio: 0.45
+        # Proactive trigger when the agent goes idle (Phase 3c). 0 = off, the default since 0.1.0-alpha.8:
+        # an idle compaction rolls the whole chain up and bypasses append-only.
+        idleCompactRatio: 0
         # Most recent messages never compacted (GUARDIAN_KEEP_RECENT_MESSAGES).
         keepRecentMessages: 8
         # Tokens held back for the reply (GUARDIAN_RESERVE_OUTPUT).

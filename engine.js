@@ -44,6 +44,10 @@ import { COMPILER_REV, DEFAULT_NOISE_PATTERNS, RECALL_GUIDE, compileNoisePattern
 import { MEMORY_REV, emptyMemory, extractMemory, itemsForSession, loadMemory, memoryStats, mergeMemory, normalizeText, renderMemory, saveMemory } from './cg_memory.js'
 import * as lib from './cg_recall.js'
 import { ANCHORS_REV, findLostAnchors, lostConstraints, renderCarried } from './cg_anchors.js'
+import { buildHandoff, writeHandoff } from './cg_handoff.js'
+import { staleRecall } from './cg_autorecall.js'
+import { staleAssertions, steerText } from './cg_postcheck.js'
+import { randomUUID } from 'node:crypto'
 
 export const name = 'context-guardian-engine'
 export const inject = ['compaction']
@@ -100,6 +104,11 @@ export const DEFAULTS = Object.freeze({
   chainMaxTokens: 0,
   chainMaxCheckpoints: 4,
   anchorCheck: 'repair',
+  // C-Recall stage (a): ON by default since 0.1.0-alpha.9 -- the P44 variant bench cleared its bar (S1/S2/S3
+  // 12/12 current, 0 stale, early 3/3). `staleRecall: false` or GUARDIAN_STALE_RECALL=0 turns it off.
+  staleRecall: true,
+  // C-Recall stage (b): off until the variant bench shows it does not regress (P44 A4).
+  postAnswerCheck: false,
 })
 
 /**
@@ -139,6 +148,14 @@ export function resolveEngineOptions(config = {}, env = process.env) {
   const mustKeep = envMustKeep === '0' || envMustKeep === 'false' ? false
     : envMustKeep === '1' || envMustKeep === 'true' ? true
       : pick('mustKeep') !== false
+  const envStale = String(env.GUARDIAN_STALE_RECALL ?? '').trim().toLowerCase()
+  const staleRecallOn = envStale === '1' || envStale === 'true' ? true
+    : envStale === '0' || envStale === 'false' ? false
+      : pick('staleRecall') !== false
+  const envCheck = String(env.GUARDIAN_POST_ANSWER_CHECK ?? '').trim().toLowerCase()
+  const postAnswerCheckOn = envCheck === '1' || envCheck === 'true' ? true
+    : envCheck === '0' || envCheck === 'false' ? false
+      : pick('postAnswerCheck') === true
   const numCtx = Math.floor(num('GUARDIAN_NUM_CTX', 'numCtx', 1024, 4_000_000))
   // Did the user pin the window themselves? An explicit numCtx (env or preset row)
   // must always win over what the host reports, so the window helper needs to know.
@@ -189,6 +206,8 @@ export function resolveEngineOptions(config = {}, env = process.env) {
       const r = String(pick('anchorCheck') ?? '').trim().toLowerCase()
       return ANCHOR_MODES.includes(r) ? r : 'repair'
     })(),
+    staleRecall: staleRecallOn,
+    postAnswerCheck: postAnswerCheckOn,
   }
 }
 
@@ -721,6 +740,24 @@ export function apply(ctx, config) {
     }
   }
 
+  /**
+   * C-Handoff (P44 A2, 2026-10-03): after a compaction, write handoff_<session>.json/.md and handoff_latest.json
+   * beside memory.json, so another session -- or Claude through escalate_to_claude -- can pick the work up from
+   * the goal and pins alone. GUARDIAN_HANDOFF=0 (or config handoff: false) turns it off. Never throws.
+   */
+  const writeHandoffFor = (session) => {
+    if (process.env.GUARDIAN_HANDOFF === '0' || config?.handoff === false) return
+    const sid = String(session?.id ?? '')
+    if (!sid) return
+    try {
+      const h = buildHandoff(memory, sid, { goal: extractGoal(sessionNodes(session)).goal ?? '' })
+      const paths = writeHandoff(dirname(options.memoryPath), h)
+      record({ event: 'handoff', session: sid, path: paths.latest, pins: h.pins.length, decisions: h.decisions.length })
+    } catch (error) {
+      log.warn(`context-guardian engine: hand-off not written (${error.message})`)
+    }
+  }
+
   const rememberCompaction = (session, entry) => {
     if (keyable(session)) lastCompaction.set(session, entry)
   }
@@ -1009,6 +1046,7 @@ export function apply(ctx, config) {
     } else if (event?.type === 'compaction/end') {
       record({ event: 'compaction/end', session: String(session?.id ?? ''), compactionId: event.data?.compactionId, error: event.data?.error ?? null })
       if (event.data?.error) log.warn(`context-guardian engine: compaction ended with error: ${event.data.error}`)
+      else writeHandoffFor(session)
       triggerBySession.delete(session)
     } else if (event?.type === 'request/context') {
       const host = event.data?.contextWindow
@@ -1030,6 +1068,61 @@ export function apply(ctx, config) {
   ctx.on('agent/status', ({ agent, status }) => {
     if (status === 'idle') recallCount.delete(agent)
   })
+
+  // ── C-Recall stage (b) (P44 A4, 2026-10-03): a final answer that states an OLD value for a pinned subject is
+  // steered ONCE per turn with the current pinned value. Pins come from the whole session log (live and compacted),
+  // so an update still in the window counts. Opt-in (postAnswerCheck / GUARDIAN_POST_ANSWER_CHECK=1); never throws.
+  if (options.postAnswerCheck) {
+    const steeredTurn = new WeakMap()
+    ctx.on('agent/turn-stopping', ({ agent, turn } = {}) => {
+      try {
+        if (!agent || steeredTurn.get(agent) === turn) return
+        const session = agent.session
+        const sid = String(session?.id ?? '')
+        const nodes = sessionNodes(session)
+        let final = ''
+        for (let i = nodes.length - 1; i >= 0 && !final.trim(); i -= 1) {
+          if (nodes[i].message?.role === 'assistant') final = lib.renderMessage(nodes[i].message)
+        }
+        if (!final.trim()) return
+        const pins = extractMemory(nodes, { session: sid }).filter((it) => it.cat === 'pins')
+        const text = steerText(staleAssertions(final, pins))
+        if (!text) return
+        steeredTurn.set(agent, turn)
+        record({ event: 'post-answer-steer', session: sid, chars: text.length })
+        agent.steer({ id: `cg-check-${randomUUID()}`, role: 'user', content: [{ type: 'text', text }], source: { kind: 'plugin', plugin: 'context-guardian', form: 'notice', summary: 'pinned-fact check' } })
+      } catch (error) {
+        log.debug?.(`context-guardian post-answer check: ${error?.message ?? error}; turn unchanged`)
+      }
+    })
+  }
+
+  // ── C-Recall stage (a) (P44 A3, 2026-10-03): a name in the newest user message that only compacted
+  // turns still hold is shown again as ONE extra message. Opt-in (staleRecall / GUARDIAN_STALE_RECALL=1);
+  // any error leaves the step exactly as it was.
+  if (options.staleRecall) {
+    ctx.on('agent/pre-step', async (payload, next) => {
+      const decision = await next()
+      try {
+        if (decision?.kind !== 'enter' || !Array.isArray(decision.messages) || decision.messages.length === 0) return decision
+        const session = payload?.agent?.session
+        const surface = new Set(Array.from(session?.surface?.nodes ?? []))
+        const nodes = sessionNodes(session).filter((n) => n.message && n.message.role !== 'system')
+        const text = staleRecall({
+          userText: decision.messages.map((m) => lib.renderMessage(m)).join('\n'),
+          liveText: nodes.filter((n) => surface.has(n.seq)).map((n) => lib.renderMessage(n.message)).join('\n'),
+          nodes: nodes.filter((n) => !surface.has(n.seq)),
+        })
+        if (!text) return decision
+        record({ event: 'stale-recall', session: String(session?.id ?? ''), chars: text.length, hits: text.split('\n').length - 1 })
+        const recallMessage = { id: `cg-recall-${randomUUID()}`, role: 'user', content: [{ type: 'text', text }], source: { kind: 'plugin', plugin: 'context-guardian', form: 'recall' } }
+        return { ...decision, messages: [...decision.messages, recallMessage] }
+      } catch (error) {
+        log.debug?.(`context-guardian stale recall: ${error?.message ?? error}; step unchanged`)
+        return decision
+      }
+    })
+  }
   const idleTimers = new Map()
   const idleFloor = new WeakMap()
   const idleLast = new WeakMap()

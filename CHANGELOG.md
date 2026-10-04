@@ -1,5 +1,31 @@
 # Changelog
 
+## dsh-context-guardian 0.1.0-alpha.9 / PyPI context-guardian 0.8.0 (2026-10-04)
+
+**Stale recall is on by default (DSH engine).** When your newest message names something only compacted turns still
+hold -- a doc line (`doc01 L017`), a codename, a CamelCase name or a quoted string -- the engine adds ONE
+`[context-guardian recall]` message with up to 3 matching lines before the step runs. Benchmark (48-prompt session,
+12 facts, codenames changed mid-session, qwen3-coder:30b):
+
+| variant | runs | facts current | stale answers | early facts |
+|---|---|---|---|---|
+| pins only (alpha.8 behaviour) | 2 | 12/12, 9/12 | 0, 3 | 0/3, 0/3 |
+| pins + stale recall (this release) | 3 | 12/12 each | 0 each | 3/3 each |
+| pins + post-answer check | 1 | 10/12 | 2 | 0/3 |
+
+`staleRecall: false` or `GUARDIAN_STALE_RECALL=0` turns it off.
+
+- **Pins track which value is current.** A pinned fact that a later pin changed is no longer shown; a pin whose every
+  fact changed is retired from the checkpoint (memory.json keeps them all). "X is now Y" counts as a change.
+- **Hand-off files.** At every compaction the engine writes `handoff_<session>.json` / `.md` and `handoff_latest.json`
+  beside memory.json (goal, current pins, decisions) so another session can pick the work up. `GUARDIAN_HANDOFF=0`
+  turns it off.
+- **Post-answer check (opt-in).** `postAnswerCheck: true` / `GUARDIAN_POST_ANSWER_CHECK=1` steers the model once when
+  its final answer states an old value for a pinned subject. Off by default: no gain on the benchmark above.
+- **Idle trigger really off.** alpha.8 turned it off in engine.js but the npm schema and the bundle patch still
+  shipped 0.45; both now default to 0 (and the schema accepts 0).
+- **`context-guardian-configure`.** The setup wizard ships in the wheel; `python configure.py` in a clone still works.
+
 ## dsh-context-guardian 0.1.0-alpha.8 / PyPI context-guardian 0.7.1 (2026-10-01)
 
 **Recall fix (DSH engine).** Benchmark (48-prompt session, 12 facts, 3-7 compactions, qwen3-coder:30b): alpha.7 made

@@ -1,6 +1,6 @@
 {
   "name": "dsh-context-guardian",
-  "version": "0.1.0-alpha.8",
+  "version": "0.1.0-alpha.9",
   "description": "Context Guardian as a native DeepSeek Harness (DSH) bundle: deterministic, seq-pointer-preserving compaction with model-facing recall and search. Companion to dsh-tool-guardian.",
   "type": "module",
   "main": "index.js",
@@ -24,6 +24,11 @@
     "vendor/LICENSE.dsh-compaction-instant",
     "context_guardian.py",
     "configure.py",
+    "cg_configure.py",
+    "cg_handoff.js",
+    "cg_provenance.js",
+    "cg_autorecall.js",
+    "cg_postcheck.js",
     "cg_doctor.py",
     "requirements.txt",
     "docs/dsh-integration.md",
@@ -42,7 +47,7 @@
   "scripts": {
     "check": "node --check index.js && node --check engine.js && node --check cg_recall.js && node --check cg_memory.js && node --check setup.mjs && node --check vendor/compiler.js && node --check cg_anchors.js",
     "selftest": "python modules/cg_bridge.py --selftest",
-    "test:node": "node tests/probes/probe_cg_recall.mjs && node cg_recall.js --selftest && node tests/engine_smoke.mjs && node tests/goal_pin_smoke.mjs && node tests/memory_smoke.mjs && node tests/append_only_smoke.mjs && node tests/setup_smoke.mjs && node tests/update_check.test.mjs && node tests/anchors_smoke.mjs && node tests/anchors_engine_smoke.mjs && node tests/pins_smoke.mjs",
+    "test:node": "node tests/probes/probe_cg_recall.mjs && node cg_recall.js --selftest && node tests/engine_smoke.mjs && node tests/goal_pin_smoke.mjs && node tests/memory_smoke.mjs && node tests/append_only_smoke.mjs && node tests/setup_smoke.mjs && node tests/update_check.test.mjs && node tests/anchors_smoke.mjs && node tests/anchors_engine_smoke.mjs && node tests/pins_smoke.mjs && node tests/idle_default_smoke.mjs && node tests/handoff_engine_smoke.mjs && node tests/pins_provenance_smoke.mjs . && node tests/pins_render_smoke.mjs && node tests/autorecall_smoke.mjs . && node tests/autorecall_engine_smoke.mjs && node tests/config_schema_smoke.mjs && node tests/postcheck_smoke.mjs . && node tests/autorecall_steer_smoke.mjs && node tests/stale_default_smoke.mjs",
     "setup": "node setup.mjs"
   },
   "engines": {

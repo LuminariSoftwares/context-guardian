@@ -5,6 +5,7 @@
 // normalizeText, extractMemory, mergeMemory, renderMemory, memoryStats, itemsForSession, loadMemory, saveMemory.
 import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { applyProvenance, renderPinText } from './cg_provenance.js'
 
 /** Revision tag for this memory implementation. */
 export const MEMORY_REV = 'cg-memory-2'  // 2026-10-01: pins category + session-scoped render
@@ -362,6 +363,15 @@ export function renderMemory(memory, opts = {}) {
     if (!it) continue
     if (session !== null && SESSION_SCOPED.has(it.cat) && it.session !== session && it.session !== '') continue
     items.push(it)
+  }
+  // C-Pin provenance (P44 A1, 2026-10-03): a pinned value that a LATER pin changed never renders again,
+  // and a pin whose every keyed fact changed is retired. memory.json keeps them all (audit).
+  const provenance = applyProvenance(items.filter((it) => it.cat === 'pins'))
+  for (let i = items.length - 1, k = provenance.length - 1; i >= 0; i--) {
+    if (items[i].cat !== 'pins') continue
+    const p = provenance[k--]
+    if (p.superseded) items.splice(i, 1)
+    else items[i] = Object.assign({}, items[i], { text: renderPinText(p) })
   }
   if (items.length === 0) return ''
   const acc = [HEADER]

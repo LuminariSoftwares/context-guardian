@@ -56,8 +56,9 @@ export const Config = Schema.object({
     .description('Model context window the ratios are measured against (GUARDIAN_NUM_CTX overrides).'),
   compactThreshold: ratio().default(0.85)
     .description('Hard compaction trigger (GUARDIAN_COMPACT_THRESHOLD overrides).'),
-  idleCompactRatio: ratio().default(0.45)
-    .description('Proactive trigger when the agent goes idle (GUARDIAN_IDLE_COMPACT_RATIO overrides).'),
+  // 0 = off (the default since alpha.8); ratio() demands >= 0.05, so 0 needs its own bound (2026-10-03: a 0 default made the plugin unloadable)
+  idleCompactRatio: Schema.number().min(0).max(0.99).default(0)
+    .description('Proactive trigger when the agent goes idle; 0 = off, the default since 0.1.0-alpha.8 (GUARDIAN_IDLE_COMPACT_RATIO overrides).'),
   keepRecentMessages: Schema.natural().default(8)
     .description('Most recent messages never compacted (GUARDIAN_KEEP_RECENT_MESSAGES overrides).'),
   reserveOutput: Schema.natural().default(8192)
