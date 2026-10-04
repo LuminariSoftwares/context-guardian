@@ -51,7 +51,7 @@ def draw(p, chip, col, cap, events, final):
     im = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(im)
     d.text((40, 26), "Context Guardian", font=TITLE, fill=FG)
-    d.text((40 + d.textlength("Context Guardian", font=TITLE) + 12, 36), "inside DeepSeek Harness", font=SUB, fill=MUTED)
+    d.text((40 + d.textlength("Context Guardian", font=TITLE) + 12, 36), "how it works inside DeepSeek Harness (illustration)", font=SUB, fill=MUTED)
     cw = d.textlength(chip, font=SMALL) + 24
     d.rounded_rectangle((W - 40 - cw, 30, W - 40, 56), 12, fill=PANEL)
     d.text((W - 40 - cw + 12, 36), chip, font=SMALL, fill=col)
@@ -88,7 +88,7 @@ def draw(p, chip, col, cap, events, final):
             for x, t in zip(cols, cells):
                 d.text((x, yb + 24 + 22 * r), t, font=BODY, fill=c)
     else:
-        d.text((40, yb + 24), "illustration of one session; the benchmark result appears at the end", font=SMALL, fill=MUTED)
+        d.text((40, yb + 24), "illustration, not a DSH screen; the benchmark result appears at the end", font=SMALL, fill=MUTED)
     return im
 
 frames, durs = [], []

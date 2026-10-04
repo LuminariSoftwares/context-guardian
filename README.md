@@ -23,9 +23,9 @@
 
 Compaction for local models that actually fires, and never takes the conversation down with it. Two front doors, one idea: a **proxy** that sits in front of any OpenAI-compatible backend (Ollama, LiteLLM, Headroom, vLLM, LM Studio) for any CLI or agent, and a **native engine** for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). Both keep the full original on disk, and both fail **open**.
 
-![Context Guardian inside DeepSeek Harness: the context meter climbs to the 85 % line, compaction folds the old turns into a checkpoint with the pinned facts first, and later stale recall brings back an archived line](context_guardian_dsh_demo.gif)
+![Illustration of Context Guardian inside DeepSeek Harness: the context meter climbs to the 85 % line, compaction folds the old turns into a checkpoint with the pinned facts first, and later stale recall brings back an archived line](context_guardian_dsh_demo.gif)
 
-*The DSH engine (0.1.0-alpha.9): at 85 % of the window it compacts, the facts you asked it to keep lead every checkpoint, the old turns stay on disk, and when a later question needs a detail that was compacted away, stale recall puts the original line back before the model answers. The results line is the benchmark in [Measured](#measured-does-it-keep-what-matters-2026-10-01). The proxy has its own monitor: see [See it work](#see-it-work).*
+*An illustration of what the DSH engine (0.1.0-alpha.9) does, not a DSH screen. Inside DSH you see it as DSH's own "Context compacted" row and context meter, `/context` and `/guardian` for pressure and the last compaction, and the `[context-guardian recall]` message in the conversation. What happens: at 85 % of the window it compacts, the facts you asked it to keep lead every checkpoint, the old turns stay on disk, and when a later question needs a detail that was compacted away, stale recall puts the original line back before the model answers. The results line is the benchmark in [Measured](#measured-does-it-keep-what-matters-2026-10-01). The proxy has its own monitor: see [See it work](#see-it-work).*
 
 | | Without Context Guardian | With it |
 |---|---|---|
