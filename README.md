@@ -23,9 +23,9 @@
 
 Compaction for local models that actually fires, and never takes the conversation down with it. Two front doors, one idea: a **proxy** that sits in front of any OpenAI-compatible backend (Ollama, LiteLLM, Headroom, vLLM, LM Studio) for any CLI or agent, and a **native engine** for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). Both keep the full original on disk, and both fail **open**.
 
-![Context Guardian compaction monitor: a request climbs past the budget line, gets compacted, and drops back under it](context_guardian_demo.gif)
+![Context Guardian inside DeepSeek Harness: the context meter climbs to the 85 % line, compaction folds the old turns into a checkpoint with the pinned facts first, and later stale recall brings back an archived line](context_guardian_dsh_demo.gif)
 
-*The `/guardian/health` compaction monitor: a request grows past the window, Guardian compacts it, and the session keeps going instead of hard-erroring.*
+*The DSH engine (0.1.0-alpha.9): at 85 % of the window it compacts, the facts you asked it to keep lead every checkpoint, the old turns stay on disk, and when a later question needs a detail that was compacted away, stale recall puts the original line back before the model answers. The results line is the benchmark in [Measured](#measured-does-it-keep-what-matters-2026-10-01). The proxy has its own monitor: see [See it work](#see-it-work).*
 
 | | Without Context Guardian | With it |
 |---|---|---|
@@ -68,7 +68,7 @@ Not on DSH? Context Guardian's proxy (`python context_guardian.py`, see its READ
 | Who writes the summary | the same backend model, asked by the proxy | DSH's own summariser first; a deterministic compiler when that fails, returns nothing, or cannot fit |
 | Reads originals back | span archive on disk (plain JSON, one file per compaction) | `recall` / `search` tools for the model, `/recall` and `/context` for you |
 | Live view | **`/guardian/health` dashboard** with the compaction monitor, `/guardian/events` | DSH's own "Context compacted" row and context meter, plus one JSON line per decision in `guardian_dsh.jsonl` |
-| Compacts while idle | — | yes, above 45 % of the window |
+| Compacts while idle | — | off by default since 0.1.0-alpha.8; set `idleCompactRatio` (e.g. 0.45) to turn it on |
 | Archive format | `logs/guardian_spans/<run>/NNNN.json` | the same format, so the same tools read both |
 | Setup guide | this README | **[docs/dsh-integration.md](docs/dsh-integration.md)** |
 
@@ -119,8 +119,17 @@ guessing counted as wrong). Fresh random codenames every run.
 
 What changed: facts the user asks to keep are pinned verbatim; the summary call is also asked for a `## Must Keep`
 section whose bullets are pinned for the rest of the session; every checkpoint is checked for its pins; the idle trigger
-is off by default. What it does not fix yet: an early detail nobody flagged (a code on line 17 of the first document) is
-still lost in both arms -- the model does not call `recall` on its own.
+is off by default.
+
+**0.1.0-alpha.9 (2026-10-04): early details come back too.** Same session, but codenames change mid-session and the
+last questions ask for details from the first documents that nobody flagged. Stale recall (on by default) adds one
+`[context-guardian recall]` message with up to 3 matching original lines when your message names something only the
+compacted turns still hold.
+
+| variant | runs | facts current | stale answers | early facts |
+|---|---|---|---|---|
+| pins only (alpha.8) | 2 | 12/12, 9/12 | 0, 3 | 0/3, 0/3 |
+| **pins + stale recall (alpha.9)** | 3 | **12/12 each** | **0 each** | **3/3 each** |
 
 ## Why this exists
 
@@ -325,6 +334,10 @@ pytest
 ```
 
 ## See it work
+
+![Context Guardian proxy compaction monitor: a request climbs past the budget line, gets compacted, and drops back under it](context_guardian_demo.gif)
+
+*The proxy's `/guardian/health` compaction monitor: a request that arrives above the compaction threshold (`GUARDIAN_COMPACT_THRESHOLD`, 85 % of the window) is compacted before it is forwarded, so the backend never sees an over-long request.*
 
 - **Proxy:** open `http://localhost:8786/guardian/health` while a session runs. The compaction monitor replays every compaction as a before → after bar, with a per-compaction dropdown and an advice box when your fixed floor (tools + system prompt) is the real problem. `GET /guardian/events` returns the same records as JSON.
 - **DSH:** type `/context` in a session for pressure, cache hits and what compacting now would save; `/recall 3-7`, `/recall result 42` or `/recall find <text>` to read originals; `logs/guardian_dsh.jsonl` for the decision trail (`idle-check` → `compaction/start` → `deterministic` or `llm` → `compaction/end`).

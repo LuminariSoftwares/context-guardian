@@ -10,7 +10,7 @@
 - **`/guardian`.** Prints the engine revision, the window in use, pressure, the last compaction and why (llm / deterministic / overflow), the pinned goal, memory and archived spans. **`/recall digest`** answers "what did I miss?".
 - **A recall budget per turn.** The model cannot flood the window with recalls in one turn.
 - **Clean checkpoints.** Harness-injected context (workspace instructions, skill list, runtime notes) is left out of checkpoints and named by seq, with a warning in the log the first time each kind is dropped.
-- **An idle pressure trigger.** Above 45% of the window it compacts when the agent goes idle.
+- **An idle pressure trigger (off by default since 0.1.0-alpha.8).** Set `idleCompactRatio` (e.g. 0.45) and it compacts when the agent goes idle above that share of the window.
 - **An archive on disk.** Every compacted span is archived in the same format the Context Guardian proxy uses.
 - **Opt-in append-only checkpoints** (experimental): pressure compactions append a new checkpoint after the old ones instead of rewriting them, so the provider's prompt cache survives.
 
@@ -94,7 +94,7 @@ This walkthrough starts from a fresh DSH install and ends with a compaction you 
    ```
    The log file (`logs/guardian_dsh.jsonl` beside `engine.js`, or your `logPath`) has one `"event":"installed"` line.
 3. **Give it a task that reads a lot.** For example: "Read every file under src/ and summarise what each does. decision: keep the public API unchanged. todo: list the files without tests." Lines that start with `decision:`, `constraint:`, `todo:`, `error:` or `preference:` go into memory as written.
-4. **Let it go idle.** When the agent stops above 45% of the window, the idle trigger compacts after 4 seconds. The log shows, in order: `idle-check`, `compaction/start`, `memory`, `deterministic` (or `llm`), `compaction/end` (with `"error":null`), and `idle-compaction` (with `before`/`after` token counts). DSH shows its own "Context compacted" row.
+4. **Let it go idle** (only with `idleCompactRatio` set, e.g. `GUARDIAN_IDLE_COMPACT_RATIO=0.45`; it is off by default). When the agent stops above that share of the window, the idle trigger compacts after 4 seconds. The log shows, in order: `idle-check`, `compaction/start`, `memory`, `deterministic` (or `llm`), `compaction/end` (with `"error":null`), and `idle-compaction` (with `before`/`after` token counts). DSH shows its own "Context compacted" row.
 5. **See what survived.** `/recall digest` prints the pinned goal, the memory items this session added, the files written, open to-dos, the last error and the last compaction. `/guardian` now says `last compaction: deterministic (...)` or `llm (...)`.
 6. **Read an original back.** Take a seq from the checkpoint, e.g. `* read "src/app.py" (seq 29 -> result 42)`, and type `/recall result 42`. You get the full original tool result, straight from the session log.
 7. **Start a second session** with the same preset. At its first compaction, the memory block (`[memory -- durable notes ...]`) carries the decision and the to-do from session 1.
@@ -102,7 +102,7 @@ This walkthrough starts from a fresh DSH install and ends with a compaction you 
 ## Check it works
 
 1. In a session, type `/context` and pick it. You get a pressure line like `context: ~14089 of 32768 tokens (43%), tier watch`.
-2. Work until the agent goes idle above 45%. `guardian_dsh.jsonl` gets these lines:
+2. With `idleCompactRatio` set (e.g. 0.45), work until the agent goes idle above it. `guardian_dsh.jsonl` gets these lines:
    - `idle-check`;
    - `compaction/start`;
    - `memory`;
