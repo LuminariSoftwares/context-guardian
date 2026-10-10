@@ -3,6 +3,10 @@
 <p align="center"><b>Your local-model session hits the context limit and dies. This stops that.</b></p>
 
 <p align="center">
+  <a href="https://github.com/LuminariSoftwares/context-guardian/actions/workflows/test.yml"><img alt="tests (pytest) on Ubuntu, Windows, macOS" src="https://github.com/LuminariSoftwares/context-guardian/actions/workflows/test.yml/badge.svg"></a>
+  <a href="https://github.com/LuminariSoftwares/context-guardian/actions/workflows/node.yml"><img alt="node smoke tests on Ubuntu, Windows, macOS" src="https://github.com/LuminariSoftwares/context-guardian/actions/workflows/node.yml/badge.svg"></a>
+  <a href="https://pypi.org/project/context-guardian/"><img alt="PyPI" src="https://img.shields.io/pypi/v/context-guardian.svg"></a>
+  <a href="https://www.npmjs.com/package/dsh-context-guardian"><img alt="npm" src="https://img.shields.io/npm/v/dsh-context-guardian.svg"></a>
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-yellow.svg">
   <img alt="Python 3.11" src="https://img.shields.io/badge/python-3.11-blue.svg">
   <img alt="OpenAI-compatible proxy" src="https://img.shields.io/badge/OpenAI--compatible-proxy-2ea44f.svg">
@@ -11,6 +15,9 @@
 </p>
 
 <p align="center">
+  <a href="#quick-start">Quick start</a> &middot;
+  <a href="#works-with">Works with</a> &middot;
+  <a href="examples/">Examples</a> &middot;
   <a href="#install-both-deepseek-harness-about-5-minutes">Install both</a> &middot;
   <a href="#why-this-exists">Why</a> &middot;
   <a href="#two-ways-to-run-it">Two ways to run it</a> &middot;
@@ -22,6 +29,28 @@
 </p>
 
 Compaction for local models that actually fires, and never takes the conversation down with it. Two front doors, one idea: a **proxy** that sits in front of any OpenAI-compatible backend (Ollama, LiteLLM, Headroom, vLLM, LM Studio) for any CLI or agent, and a **native engine** for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). Both keep the full original on disk, and both fail **open**.
+
+**Measured:** in a 48-prompt DeepSeek Harness session on qwen3-coder:30b (Ollama, 64K window) with codenames changed mid-session, 0.1.0-alpha.9 kept 12/12 facts current with 0 stale answers and brought back 3/3 early details in every run (n = 3), where pins alone brought back 0/3 (n = 2). Details: [Measured](#measured-does-it-keep-what-matters-2026-10-01).
+
+## Works with
+
+| | how it hooks in | status | example |
+|---|---|---|---|
+| **Ollama** | proxy: `GUARDIAN_UPSTREAM_URL=http://localhost:11434/v1` | tested (daily use, Windows 11) | [examples/ollama-proxy](examples/ollama-proxy/) |
+| **LM Studio** | proxy: `GUARDIAN_UPSTREAM_URL=http://localhost:1234/v1` | expected to work, not tested against LM Studio itself | [examples/lmstudio-proxy](examples/lmstudio-proxy/) |
+| **vLLM** | proxy: `GUARDIAN_UPSTREAM_URL=http://localhost:8000/v1` | expected to work, untested | copy the Ollama example, change the URL |
+| **LiteLLM** | proxy: `GUARDIAN_UPSTREAM_URL=<your LiteLLM proxy>/v1` | expected to work, untested | copy the Ollama example, change the URL |
+| **DeepSeek Harness** | native engine: one row in your agent preset | tested on DSH 0.1.2-alpha.2 | [examples/dsh-preset](examples/dsh-preset/) |
+
+The proxy needs only an OpenAI-compatible `/v1/chat/completions`; your CLI points `OPENAI_BASE_URL` at it. "Expected" means not yet tested; please open an issue with what you saw. Full matrix: [Compatibility](#compatibility).
+
+## Quick start
+
+```bash
+pip install context-guardian && context-guardian   # proxy on :8786 in front of Ollama on :11434; set OPENAI_BASE_URL=http://localhost:8786/v1
+```
+
+Another backend or window: see [examples/](examples/) or [Configure](#configure). DeepSeek Harness users: install the native engine below.
 
 ![Illustration of Context Guardian inside DeepSeek Harness: the context meter climbs to the 85 % line, compaction folds the old turns into a checkpoint with the pinned facts first, and later stale recall brings back an archived line](context_guardian_dsh_demo.gif)
 
@@ -97,7 +126,7 @@ The rest of this page is the **proxy**. The DSH engine has its own five-minute g
 | DeepSeek Harness (engine) | 0.1.2-alpha.2 on Windows 11 | 0.1.2-alpha.2 and later 0.1.x | needs `compaction-basic` (the `standard` preset has it); `npm run setup` needs a user agent preset or DSH's shipped `standard` |
 | Node.js (engine, setup) | 22.23 on Windows 11; 22.x on Linux (test container) | `^22.19.0` or `>=24` | the `engines` field in package.json |
 | Python (proxy, bridge, `cg_doctor.py`) | 3.11 | 3.10 or later | the DSH engine itself needs no Python |
-| Operating system | Windows 11; Linux (tests) | macOS | macOS is untested |
+| Operating system | Windows 11 (daily use); Ubuntu, Windows and macOS (CI: pytest + node smoke tests on every push) | — | macOS runs the test suites in CI only; no daily use on a Mac yet |
 | Backend (proxy) | Ollama `/v1` | any OpenAI-compatible `/v1/chat/completions`: LiteLLM, vLLM, LM Studio, the llama.cpp server | the proxy estimates tokens itself, so it does not need the backend's usage numbers |
 | Backend (DSH engine) | Ollama models driven by DSH | any model DSH drives | the window is the one DSH reports for the model; set `numCtx` only to force a smaller one |
 | Client (proxy) | OpenClaude | Claude Code and other OpenAI-compatible CLIs | Cursor is untested |
@@ -331,7 +360,11 @@ Guardian's `GUARDIAN_NUM_CTX` is fixed for the lifetime of one running instance.
 ```bash
 pip install -r requirements-dev.txt
 pytest
+npm install --no-package-lock --legacy-peer-deps
+npm run check && npm run test:node
 ```
+
+CI runs both suites on Ubuntu, Windows and macOS ([tests](.github/workflows/test.yml), [node](.github/workflows/node.yml)).
 
 ## See it work
 

@@ -1,0 +1,6 @@
+# Check out text files with LF on every OS. The Windows runners set
+# core.autocrlf=true, which turns fixtures and docs into CRLF; the tests read
+# them as text and split on '\n'. Binary files are never converted.
+* text=auto eol=lf
+*.gif binary
+*.png binary

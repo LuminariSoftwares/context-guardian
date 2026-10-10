@@ -6,6 +6,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -35,7 +36,9 @@ const installedUrl = (() => {
   return null
 })()
 
-const root = mkdtempSync(join(tmpdir(), 'cg-setup-'))
+// realpath: on macOS tmpdir() is /var/..., a symlink to /private/var/..., and
+// setup realpaths the dsh bin before walking up, so compare like with like.
+const root = realpathSync(mkdtempSync(join(tmpdir(), 'cg-setup-')))
 const q = '\'' // the single quote the row name is wrapped in
 let passed = 0
 let failed = 0

@@ -1,0 +1,14 @@
+# The Context Guardian row for a DeepSeek Harness agent preset.
+# Put it at the END of the `config:` list of the group whose `id` is `compaction`
+# in <DSH_HOME>/.agent-presets/<your-id>/agent.cordis.yml, indented like its siblings.
+# `npm run setup -- --apply` writes exactly this row for you (with your real path).
+    - id: context-guardian
+      name: 'file:///C:/path/to/context-guardian/engine.js'
+      config:
+        mode: llm-then-deterministic
+        tools: [recall, search]
+        # Optional; each line below is the default. Leave numCtx out: the engine reads the window from DSH.
+        # staleRecall: true
+        # handoff: true
+        # postAnswerCheck: false
+        # idleCompactRatio: 0

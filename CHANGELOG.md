@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **CI on three OSes.** pytest and the node smoke tests (`npm run check`, `npm run test:node`) now run on Ubuntu,
+  Windows and macOS. Test-harness fixes only: `.gitattributes` checks text out as LF everywhere, and the setup smoke
+  test realpaths its temp folder (on macOS `/var` is a link to `/private/var`). No engine or proxy change.
+- **examples/.** Runnable configs for Ollama + proxy, LM Studio + proxy and the DSH preset row, each with a smoke
+  command (`examples/smoke_proxy.py`, `examples/dsh-preset/smoke.mjs`; standard library only).
+- **README.** A measured one-line result (n and model stated), a "Works with" table, a one-line quick start, CI badges.
 - **Docs.** The README's top GIF now shows the DSH engine as it works in 0.1.0-alpha.9 (85 % compaction, pins first,
   span archive, stale recall) with the real benchmark line; the proxy monitor GIF moved to "See it work" with its caption
   corrected (it compacts above the 85 % threshold, not past the window). The "compacts while idle" row and the DSH
