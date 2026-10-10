@@ -19,3 +19,4 @@ jobs:
       - run: npm install --no-package-lock --legacy-peer-deps
       - run: npm run check
       - run: npm run test:node
+      - run: node examples/dsh-preset/smoke.mjs
