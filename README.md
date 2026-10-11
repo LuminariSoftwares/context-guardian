@@ -17,6 +17,7 @@
 <p align="center">
   <a href="#quick-start">Quick start</a> &middot;
   <a href="#works-with">Works with</a> &middot;
+  <a href="#point-your-client-at-the-proxy">Client settings</a> &middot;
   <a href="examples/">Examples</a> &middot;
   <a href="#install-both-deepseek-harness-about-5-minutes">Install both</a> &middot;
   <a href="#why-this-exists">Why</a> &middot;
@@ -48,9 +49,25 @@ The proxy needs only an OpenAI-compatible `/v1/chat/completions`; your CLI point
 
 ```bash
 pip install context-guardian && context-guardian   # proxy on :8786 in front of Ollama on :11434; set OPENAI_BASE_URL=http://localhost:8786/v1
+context-guardian-doctor                            # second terminal: checks the install and the running proxy, prints a fix: line for anything wrong
 ```
 
-Another backend or window: see [examples/](examples/) or [Configure](#configure). DeepSeek Harness users: install the native engine below.
+Another backend or window: see [examples/](examples/) or [Configure](#configure). Your client's settings: [Point your client at the proxy](#point-your-client-at-the-proxy). DeepSeek Harness users: install the native engine below.
+
+After a compaction, `context-guardian-recall "<term>"` searches the archived originals (the summary the model receives names the exact command).
+
+## Point your client at the proxy
+
+The proxy compacts OpenAI-style `POST /v1/chat/completions` requests. Every client below is configured from its own documented settings; none of these four has been tested against the proxy yet, so please open an issue with what you see.
+
+| client | where | what to set |
+|---|---|---|
+| **Claude Code** | environment | Claude Code speaks the Anthropic Messages API (`/v1/messages`), which the proxy passes through **without compacting**. For compaction, use an OpenAI-compatible build such as OpenClaude: `CLAUDE_CODE_USE_OPENAI=1 OPENAI_BASE_URL=http://localhost:8786/v1 OPENAI_API_KEY=local OPENAI_MODEL=<model>` |
+| **Cline** | Settings → API Provider: **OpenAI Compatible** | Base URL `http://localhost:8786/v1` · API Key any non-empty text · Model ID `<model>` |
+| **Continue** | `~/.continue/config.yaml` | under `models:` add `- {name: Context Guardian, provider: openai, model: <model>, apiBase: "http://localhost:8786/v1", apiKey: local}` |
+| **OpenCode** | `opencode.json` | `"provider": {"guardian": {"npm": "@ai-sdk/openai-compatible", "name": "Context Guardian", "options": {"baseURL": "http://localhost:8786/v1"}, "models": {"<model>": {}}}}` |
+
+`<model>` is the name your backend serves (for Ollama, what `ollama list` shows). The proxy forwards the API key unchanged; a local backend ignores it. Then set `GUARDIAN_NUM_CTX` to that model's real window ([Configure](#configure)).
 
 ![Illustration of Context Guardian inside DeepSeek Harness: the context meter climbs to the 85 % line, compaction folds the old turns into a checkpoint with the pinned facts first, and later stale recall brings back an archived line](context_guardian_dsh_demo.gif)
 
@@ -92,7 +109,7 @@ Not on DSH? Context Guardian's proxy (`python context_guardian.py`, see its READ
 
 | | **Proxy** (`context_guardian.py`) | **DSH engine** (`engine.js`) |
 |---|---|---|
-| Works with | Claude Code, OpenClaude, anything that talks to an OpenAI-compatible `/v1/chat/completions` | [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 0.1.2+ |
+| Works with | anything that talks to an OpenAI-compatible `/v1/chat/completions`: OpenClaude, Cline, Continue, OpenCode ([settings](#point-your-client-at-the-proxy)); stock Claude Code passes through uncompacted | [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 0.1.2+ |
 | How it hooks in | you point `OPENAI_BASE_URL` at it | one row in your agent preset's `compaction` group |
 | Who writes the summary | the same backend model, asked by the proxy | DSH's own summariser first; a deterministic compiler when that fails, returns nothing, or cannot fit |
 | Reads originals back | span archive on disk (plain JSON, one file per compaction) | `recall` / `search` tools for the model, `/recall` and `/context` for you |
@@ -100,6 +117,9 @@ Not on DSH? Context Guardian's proxy (`python context_guardian.py`, see its READ
 | Compacts while idle | — | off by default since 0.1.0-alpha.8; set `idleCompactRatio` (e.g. 0.45) to turn it on |
 | Archive format | `logs/guardian_spans/<run>/NNNN.json` | the same format, so the same tools read both |
 | Setup guide | this README | **[docs/dsh-integration.md](docs/dsh-integration.md)** |
+
+**Hand-off files (DSH engine).** At every compaction the engine writes `handoff_<session>.json` and `.md`, plus `handoff_latest.json`, beside `memory.json`: the session's goal, its current pins and its decisions, so a new session or another agent can pick the work up from them alone.
+`GUARDIAN_HANDOFF=0` (or `handoff: false` on the engine row) turns them off; see [docs/dsh-integration.md](docs/dsh-integration.md#options).
 
 ```mermaid
 flowchart LR
