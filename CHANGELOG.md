@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## dsh-context-guardian 0.1.0-alpha.10 / PyPI context-guardian 0.9.0 (2026-10-10)
 
 - **`context-guardian-recall <term> [--run RUN_ID]`** (new console script, `cg_recall_cli.py`): searches the span
   archive under `GUARDIAN_SPAN_DIR`. The compaction summary used to point the model at `scripts/guardian_recall.py`,

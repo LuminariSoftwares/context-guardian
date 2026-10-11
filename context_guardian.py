@@ -88,7 +88,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 # PyPI, importlib.metadata reports the same string off the wheel; this constant
 # is the fallback for a bare `python context_guardian.py` run out of a checkout,
 # where no distribution metadata exists. Keep it in lockstep with pyproject.toml.
-__version__ = "0.8.0"  # 2026-10-04 release; 2026-10-01: was still "0.5.1" in the 0.7.0 release (update check reported the wrong version)
+__version__ = "0.9.0"  # keep equal to pyproject.toml version
 from starlette.background import BackgroundTask
 
 # Load .env BEFORE any config is read.
