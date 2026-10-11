@@ -1,4 +1,4 @@
-// DSH-side smoke for the bundle entry. Run from the repo root after `pnpm install`:
+// DSH-side smoke for the bundle entry (part of `npm run test:node`). Run from the repo root after `npm install`:
 //   node tests/dsh_smoke.mjs
 // Uses a fake ctx (no DSH boot) and the real Python bridge (hello + spans only).
 import * as plugin from 'dsh-context-guardian'
@@ -7,7 +7,7 @@ const check = (name, cond) => { total++; if (cond) pass++; console.log(`  ${cond
 const throws = (fn) => { try { fn(); return false } catch { return true } }
 const cfg = plugin.Config({})
 check('name_and_namespace', plugin.name === 'dsh-context-guardian' && plugin.SETTINGS_NAMESPACE === 'context-guardian')
-check('schema_defaults', cfg.numCtx === 32768 && cfg.compactThreshold === 0.85 && cfg.idleCompactRatio === 0.45 && cfg.maxRecallTokens === 16000 && cfg.maxSearchHits === 50)
+check('schema_defaults', cfg.numCtx === 32768 && cfg.compactThreshold === 0.85 && cfg.idleCompactRatio === 0 && cfg.maxRecallTokens === 16000 && cfg.maxSearchHits === 50)
 check('schema_refuses_out_of_range_ratio', throws(() => plugin.Config({ compactThreshold: 1.5 })))
 check('env_beats_section', plugin.resolveOptions(cfg, { GUARDIAN_NUM_CTX: '8192', GUARDIAN_COMPACT_THRESHOLD: '0.7' }).numCtx === 8192
   && plugin.resolveOptions(cfg, { GUARDIAN_COMPACT_THRESHOLD: '0.7' }).compactThreshold === 0.7)
