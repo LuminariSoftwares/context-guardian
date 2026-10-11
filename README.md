@@ -5,6 +5,7 @@
 <p align="center">
   <a href="https://github.com/LuminariSoftwares/context-guardian/actions/workflows/test.yml"><img alt="tests (pytest) on Ubuntu, Windows, macOS" src="https://github.com/LuminariSoftwares/context-guardian/actions/workflows/test.yml/badge.svg"></a>
   <a href="https://github.com/LuminariSoftwares/context-guardian/actions/workflows/node.yml"><img alt="node smoke tests on Ubuntu, Windows, macOS" src="https://github.com/LuminariSoftwares/context-guardian/actions/workflows/node.yml/badge.svg"></a>
+  <a href="https://github.com/LuminariSoftwares/context-guardian/actions/workflows/privacy.yml"><img alt="privacy scan of every tracked file" src="https://github.com/LuminariSoftwares/context-guardian/actions/workflows/privacy.yml/badge.svg"></a>
   <a href="https://pypi.org/project/context-guardian/"><img alt="PyPI" src="https://img.shields.io/pypi/v/context-guardian.svg"></a>
   <a href="https://www.npmjs.com/package/dsh-context-guardian"><img alt="npm" src="https://img.shields.io/npm/v/dsh-context-guardian.svg"></a>
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-yellow.svg">
