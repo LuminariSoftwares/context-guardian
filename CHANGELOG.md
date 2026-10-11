@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **`context-guardian-recall <term> [--run RUN_ID]`** (new console script, `cg_recall_cli.py`): searches the span
+  archive under `GUARDIAN_SPAN_DIR`. The compaction summary used to point the model at `scripts/guardian_recall.py`,
+  which never shipped; it now names this command with the run id.
+- **Span writes clean up after themselves.** When the JSON write fails after the span file was claimed, the proxy's
+  `write_span` and the DSH engine both remove the empty or half-written `NNNN.json` instead of leaving it to be read
+  as an archived span.
+- **One chars-per-token ratio.** `cg_recall.js` estimated chars/4 while everything else used 3.5; it now exports
+  `CHARS_PER_TOKEN = 3.5`, which `cg_memory.js` and `engine.js` import. Recall budgets therefore admit slightly
+  less text than before.
+- **Proxy startup line** names the keep-recent mode: `keep_recent=budget 20%` or `keep_recent=N messages (explicit)`.
+  `/guardian/stats` adds `keep_recent_label` and `calibration_min_samples`.
+- **Health dashboard:** an Estimate card (learned calibration factor per model, keep-recent mode); compaction events
+  record `kept_messages`.
+- **DSH settings half (`index.js`):** the header and load line no longer claim a Phase 1 scaffold; compaction is the
+  engine row `npm run setup` mounts. `keepRecentMessages` and `maxRecallTokens` were read by nothing there and are
+  removed from its schema and patch row (old settings files still load; the engine row keeps its own
+  `maxRecallTokens`).
+- **README:** settings for Claude Code, Cline, Continue and OpenCode (stock Claude Code speaks the Anthropic API and
+  is passed through uncompacted), the DSH hand-off files, `context-guardian-doctor` in Quick start.
+- **Tests:** pytest no longer writes spans into the repo's `logs/`; `tests/dsh_smoke.mjs` matches the idle default
+  and runs in `npm run test:node`, with two new node smokes (token estimate, health Estimate card).
+- **Privacy:** a `privacy` CI workflow scans every tracked file for private addresses, personal paths, API keys and
+  e-mail addresses; current files were scrubbed of private setup references and internal plan tags.
 - **CI on three OSes.** pytest and the node smoke tests (`npm run check`, `npm run test:node`) now run on Ubuntu,
   Windows and macOS. Test-harness fixes only: `.gitattributes` checks text out as LF everywhere, and the setup smoke
   test realpaths its temp folder (on macOS `/var` is a link to `/private/var`). No engine or proxy change.
