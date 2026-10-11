@@ -30,6 +30,7 @@
     "cg_autorecall.js",
     "cg_postcheck.js",
     "cg_doctor.py",
+    "cg_recall_cli.py",
     "requirements.txt",
     "docs/dsh-integration.md",
     "docs/dsh-upstream-append-only.md",

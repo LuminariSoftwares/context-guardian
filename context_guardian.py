@@ -255,9 +255,13 @@ MAX_SPAN_INDEX_PROBE = 50
 # shows up after several compactions in one session.
 #
 # Retired summaries are not discarded: they are folded into the next span, so
-# their text is on disk and reachable through guardian_recall.py.
+# their text is on disk and reachable through `context-guardian-recall`.
 # In-window count settles at KEEP_SUMMARIES + 1 (the kept ones plus the new).
 KEEP_SUMMARIES = int(os.environ.get("GUARDIAN_KEEP_SUMMARIES", "1"))
+# The search command the summary names (console script `context-guardian-recall`,
+# module cg_recall_cli.py beside this file). Spelled out as a path too, for a
+# checkout that was never pip-installed and so has no console script on PATH.
+RECALL_SCRIPT = REPO_DIR / "cg_recall_cli.py"
 # The condense instruction. FENCED, and the fencing is the whole fix.
 #
 # MEASURED 2026-08-26 by replaying real spans through scripts/
@@ -325,7 +329,7 @@ MIN_SUMMARY_CHARS = int(os.environ.get("GUARDIAN_MIN_SUMMARY_CHARS", "40"))
 MIN_TRANSCRIPT_CHARS = int(os.environ.get("GUARDIAN_MIN_TRANSCRIPT_CHARS", "80"))
 # How much of a tool call's arguments reaches the summariser. The summary needs
 # to say WHICH tool ran, not reproduce a 40 KB file write -- the full text is in
-# the span on disk, one guardian_recall.py away.
+# the span on disk, one `context-guardian-recall` away.
 TOOL_ARG_CHARS_IN_SUMMARY = int(
     os.environ.get("GUARDIAN_TOOL_ARG_CHARS", "300"))
 # One id per proxy process. Guardian cannot see OpenClaude's session id -- it
@@ -1338,7 +1342,9 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
                    f"{n_spans} span(s) so far this session, all under "
                    f"{SPAN_DIR / RUN_ID}. They are LARGER than the room that "
                    f"was freed -- do not read them whole. Search instead: "
-                   f"`python scripts/guardian_recall.py \"<term>\"`.]")
+                   f"`context-guardian-recall \"<term>\" --run {RUN_ID}` "
+                   f"(from a source checkout: `python {RECALL_SCRIPT} "
+                   f"\"<term>\" --run {RUN_ID}`).]")
 
     summary_message = {
         "role": "system",
