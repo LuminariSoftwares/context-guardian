@@ -1542,6 +1542,7 @@ async def stats():
         "keep_recent_messages": KEEP_RECENT_MESSAGES,
         "keep_recent_mode": "messages" if KEEP_RECENT_EXPLICIT else "budget",
         "keep_recent_fraction": KEEP_RECENT_FRACTION,
+        "keep_recent_label": keep_recent_label(),
         "count_tools": COUNT_TOOLS,
         "upstream_timeout_seconds": UPSTREAM_TIMEOUT_SECONDS,
         "upstream_connect_timeout_seconds": UPSTREAM_CONNECT_TIMEOUT_SECONDS,
@@ -1965,14 +1966,22 @@ async def proxy(path: str, request: Request):
     )
 
 
+def keep_recent_label() -> str:
+    """Which keep-recent mode is active, for the startup line and /guardian/stats."""
+    if KEEP_RECENT_EXPLICIT:
+        return "%d messages (explicit)" % KEEP_RECENT_MESSAGES
+    return "budget %g%%" % round(KEEP_RECENT_FRACTION * 100, 2)
+
+
 def main():
     """Console entry point (`context-guardian`) and `python context_guardian.py`."""
     import uvicorn
     log.info(
         "Starting Context Guardian v%s on port %d, forwarding to %s "
-        "(num_ctx=%d, threshold=%.2f). Health view: http://%s:%d/guardian/health",
+        "(num_ctx=%d, threshold=%.2f, keep_recent=%s). "
+        "Health view: http://%s:%d/guardian/health",
         guardian_version(), GUARDIAN_PORT, UPSTREAM_URL, NUM_CTX,
-        COMPACT_THRESHOLD, GUARDIAN_HOST, GUARDIAN_PORT,
+        COMPACT_THRESHOLD, keep_recent_label(), GUARDIAN_HOST, GUARDIAN_PORT,
     )
     # Fire-and-forget PyPI update check on a daemon thread. Only from main(), so
     # importing `app` in the test suite never reaches the network.
