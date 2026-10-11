@@ -910,3 +910,32 @@ def test_the_documented_defaults_match_the_code(guardian):
     used = set(re.findall(r'os\.environ\.get\(\s*"(GUARDIAN_[A-Z_]+)"', src))
     undocumented = sorted(v for v in used if v not in readme)
     assert not undocumented, "env vars the code reads but the README never mentions: %s" % undocumented
+
+
+@pytest.mark.asyncio
+async def test_compaction_event_records_kept_messages(guardian, monkeypatch):
+    """The compaction event says how many recent messages were kept verbatim,
+    so the log (and the dashboard) can show what keep-recent actually did."""
+    import json as _json
+
+    async def _fake_summarize(client, model, older_messages):
+        return "condensed summary of the older turns, long enough to be accepted"
+    monkeypatch.setattr(guardian, "summarize_older_messages", _fake_summarize)
+
+    messages = [{"role": "user", "content": "x" * 4000} for _ in range(5)]
+    await guardian.maybe_compact(client=object(), payload={"model": "m", "messages": messages})
+
+    events = [_json.loads(line) for line in
+              Path(guardian.LOG_PATH).read_text(encoding="utf-8").splitlines()]
+    compaction = [e for e in events if e.get("event") == "compaction"]
+    assert len(compaction) == 1
+    assert compaction[0]["kept_messages"] == 2  # GUARDIAN_KEEP_RECENT_MESSAGES=2
+
+
+def test_stats_carry_what_the_estimate_card_shows(guardian):
+    from fastapi.testclient import TestClient
+
+    data = TestClient(guardian.app).get("/guardian/stats").json()
+    assert data["keep_recent_label"] == "2 messages (explicit)"
+    assert data["calibration_min_samples"] == guardian.CALIBRATION_MIN_SAMPLES
+    assert isinstance(data["calibration"], dict)

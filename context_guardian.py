@@ -1379,6 +1379,8 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
         "compaction_index": _state["compactions_performed"],
         "messages_before": len(messages),
         "messages_after": len(new_messages),
+        # Recent messages forwarded verbatim (what keep-recent actually kept).
+        "kept_messages": len(to_keep),
         "estimated_tokens_before": estimated,
         "estimated_tokens_after": tokens_after,
         "message_tokens_before": message_tokens,
@@ -1580,6 +1582,7 @@ async def stats():
         # turned it into `last_known_total_tokens`.
         "calibration": CALIBRATOR.snapshot(),
         "calibration_enabled": calibration_enabled(),
+        "calibration_min_samples": CALIBRATION_MIN_SAMPLES,
         "note": ("last_known_total_tokens now INCLUDES the tools array. "
                  "last_tool_tokens is the part compaction cannot touch."),
     })
@@ -1726,6 +1729,26 @@ function card(title,big,sub,bar){
     h+=`<div class="bar ${c}"><i style="width:${Math.min(100,bar)}%"></i></div>`;}
   return h+`</div>`;
 }
+function esc(t){return String(t).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
+}
+// The estimate behind every number above: the per-model factor learned from the
+// usage the backend reports (1.00 until enough samples), and the keep-recent mode.
+function estimateCard(s){
+  const cal=s.calibration||{}, need=s.calibration_min_samples||5;
+  const models=Object.keys(cal).sort((a,b)=>cal[b].samples-cal[a].samples);
+  const fac=c=>"&times;"+Number(c.factor).toFixed(2);
+  const lines=[];
+  let big="&times;1.00";
+  if(s.calibration_enabled===false){big="off";lines.push("calibration off (GUARDIAN_CALIBRATE=0)");}
+  else if(!models.length){lines.push("no usage reported yet - the factor learns from it");}
+  else{
+    big=cal[models[0]].samples>=need?fac(cal[models[0]]):"learning";
+    for(const m of models){const c=cal[m];
+      lines.push(c.samples>=need?`${esc(m)} ${fac(c)} (${c.samples} samples)`:`${esc(m)} learning (${c.samples}/${need})`);}
+  }
+  lines.push(`keep recent: ${esc(s.keep_recent_label||s.keep_recent_mode||"-")}`);
+  return card("Estimate",big,lines.join("<br>"));
+}
 function pct(t){return Math.round(100*t/budget);}
 function tfmt(ts){try{return new Date(ts).toLocaleTimeString();}catch(e){return ts||"";}}
 
@@ -1738,7 +1761,8 @@ function play(ev){
     setTimeout(()=>{ f.style.width=w(ap); f.classList.toggle("over",ap>=100); },850);
   }));
   $("mono-sub").innerHTML=`Compaction <b>#${ev.compaction_index}</b> &middot; ${tfmt(ev.timestamp)} `+
-    `&middot; ${ev.messages_before}&rarr;${ev.messages_after} messages`;
+    `&middot; ${ev.messages_before}&rarr;${ev.messages_after} messages`+
+    (ev.kept_messages!=null?` &middot; ${ev.kept_messages} kept verbatim`:"");
   $("nums").innerHTML=
     `<span>before <b>${fmt(ev.estimated_tokens_before)}</b> (${bp}%)</span>`+
     `<span class="arrow">&rarr;</span>`+
@@ -1774,7 +1798,8 @@ async function tick(){
                             :"set GUARDIAN_COST_PER_1M_INPUT_USD to price it"),
     card("Tool definitions",fmt(s.last_tool_tokens||0),"fixed floor - compaction can't touch it"),
     card("Rejected summaries",fmt(rejected),rejected?"empty/degenerate - investigate":"none - healthy"),
-    card("Uptime",human(s.uptime_seconds),`run ${s.run_id||""}`)
+    card("Uptime",human(s.uptime_seconds),`run ${s.run_id||""}`),
+    estimateCard(s)
   ].join("");
   if(rejected){$("cards").children[4].querySelector(".big").style.color="#f85149";}
 
