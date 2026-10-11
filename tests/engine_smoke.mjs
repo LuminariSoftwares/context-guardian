@@ -207,6 +207,22 @@ check('span_archived_in_write_span_format', async () => {
   const span = JSON.parse(readFileSync(join(config.spanDir, run, '0001.json'), 'utf8'))
   return ['run_id', 'index', 'at', 'num_ctx', 'message_count', 'summary', 'messages'].every(key => key in span) && span.index === 1 && span.message_count === 30 && span.messages.length === 30
 })
+check('span_write_failure_leaves_no_file', async () => {
+  // The span file is claimed with openSync('wx') before the JSON is written. A message that cannot be
+  // serialised INSIDE the span (toJSON throws for any non-root key) makes that write fail after the claim;
+  // the claimed file must be removed, not left empty for recall/prune to read as an archived span.
+  const h = makeCtx({ llm: 'throw' }); const config = baseConfig({ mode: 'deterministic', spanDir: join(tmp, 'spans-fail'), logPath: join(tmp, 'log-fail.jsonl') }); engine.apply(h.ctx, config)
+  const session = makeSession()
+  const input = smallInput(session)
+  const poison = { role: 'user', content: [T('unserialisable in a span')] }
+  Object.defineProperty(poison, 'toJSON', { enumerable: false, value: (key) => { if (key !== '') throw new Error('cannot serialise'); return { role: poison.role, content: poison.content } } })
+  input.messages.push(poison)
+  await h.compaction.summarize(input, { session })
+  const runs = existsSync(config.spanDir) ? readdirSync(config.spanDir, { withFileTypes: true }).filter(d => d.isDirectory()).map(d => d.name) : []
+  const left = runs.flatMap(run => readdirSync(join(config.spanDir, run)).filter(f => /^\d{4}\.json$/.test(f)))
+  if (left.length) console.log('    left behind:', left.join(', '))
+  return left.length === 0 && h.logs.some(line => line.includes('span NOT archived'))
+})
 check('precompact_snapshot_and_outcome_log', () => {
   const h = makeCtx(); const config = baseConfig({ spanDir: join(tmp, 'spans-b'), logPath: join(tmp, 'log-b.jsonl') }); engine.apply(h.ctx, config)
   const session = makeSession()

@@ -119,19 +119,40 @@ def test_write_span_puts_the_messages_on_disk(guardian, tmp_path):
 
 
 def test_write_span_leaves_no_partial_file(guardian):
-    """It writes .part then os.replace. A leftover .part means a reader can see
-    a half-written span and treat it as the archive."""
-    guardian.write_span([{"role": "user", "content": "x"}], "s", 2)
-    assert list(Path(guardian.SPAN_DIR).glob("*/*.part")) == []
+    """The span file is claimed with an exclusive create ("x" mode) and written
+    in place; there is no .part file any more. Nothing but the finished
+    NNNN.json may be left in the run directory."""
+    path = guardian.write_span([{"role": "user", "content": "x"}], "s", 2)
+    assert [str(p) for p in Path(guardian.SPAN_DIR).glob("*/*")] == [path]
 
 
 def test_write_span_returns_none_instead_of_raising(guardian, monkeypatch):
     """Called on the request path. Losing the archive is bad; losing the user's
-    request is worse -- so a failure must be reported, never raised."""
+    request is worse -- so a failure must be reported, never raised.
+
+    And it must not leave the claimed file behind: an empty or half-written
+    NNNN.json looks like an archived span to anything that reads the directory
+    (recall, prune, the DSH bridge)."""
     def boom(*a, **k):
         raise OSError("disk full")
     monkeypatch.setattr(guardian.json, "dump", boom)
     assert guardian.write_span([{"role": "user", "content": "x"}], "s", 3) is None
+    assert list(Path(guardian.SPAN_DIR).glob("*/*.json")) == []
+
+
+def test_a_write_that_fails_midway_leaves_no_partial_span(guardian, monkeypatch):
+    """Same, for a write that got some bytes onto disk before failing."""
+    real_dump = guardian.json.dump
+
+    def half(obj, fh, **kw):
+        fh.write('{"run_id": "')
+        raise OSError("disk full")
+    monkeypatch.setattr(guardian.json, "dump", half)
+    assert guardian.write_span([{"role": "user", "content": "x"}], "s", 4) is None
+    monkeypatch.setattr(guardian.json, "dump", real_dump)
+    assert list(Path(guardian.SPAN_DIR).glob("*/*.json")) == []
+    # The index is free again for the next compaction.
+    assert guardian.write_span([{"role": "user", "content": "y"}], "s", 4).endswith("0004.json")
 
 
 def test_prune_keeps_at_most_keep_spans(guardian, monkeypatch):

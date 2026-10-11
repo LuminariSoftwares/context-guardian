@@ -875,6 +875,7 @@ def write_span(messages: List[Dict[str, Any]], summary: str,
     is recorded in the compaction log so a missing span is visible rather than
     silently assumed to exist.
     """
+    path = None
     try:
         d = SPAN_DIR / RUN_ID
         d.mkdir(parents=True, exist_ok=True)
@@ -919,13 +920,21 @@ def write_span(messages: List[Dict[str, Any]], summary: str,
             "messages": messages,
         }
         # The file is already created and held open, so the atomic-rename
-        # dance is gone: the exclusive create IS the claim, and a torn write
-        # is handled by the caller seeing None rather than by a .part file.
+        # dance is gone: the exclusive create IS the claim. A torn write is
+        # handled below: the claimed file is removed and the caller sees None.
         with fh:
             json.dump(payload, fh, ensure_ascii=False, indent=1)
+        written, path = path, None
         prune_spans()
-        return str(path)
+        return str(written)
     except Exception as exc:                               # noqa: BLE001
+        # The claimed file is empty or half-written. Left in place it would
+        # read as an archived span to recall, prune and the DSH bridge.
+        if path is not None:
+            try:
+                path.unlink()
+            except OSError:
+                pass
         log.warning("could not write span %d: %s. The compaction still "
                     "proceeds; this span is LOST, not deferred.", index, exc)
         return None

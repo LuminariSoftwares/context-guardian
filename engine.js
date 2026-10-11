@@ -782,7 +782,12 @@ export function apply(ctx, config) {
             run_id: runId, index, at: new Date().toISOString().replace('T', ' ').slice(0, 19), num_ctx: options.numCtx,
             message_count: messages.length, summary, messages, session_id: String(session?.id ?? ''), engine: ENGINE_REV,
           }, null, 1))
-        } finally { closeSync(fd) }
+        } catch (error) {
+          // The claimed file is empty or half-written; left in place it reads as an archived span.
+          closeSync(fd); fd = undefined
+          try { unlinkSync(path) } catch { /* already gone */ }
+          throw error
+        } finally { if (fd !== undefined) closeSync(fd) }
         spanIndex = index
         pruneSpans()
         return path
