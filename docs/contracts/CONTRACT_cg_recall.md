@@ -17,8 +17,8 @@ A CHECKPOINT node is a user message whose `source.kind === 'plugin' && source.pl
 
 ## Exports
 
-1. `RECALL_REV` — the string `'cg-recall-1'`.
-2. `estTokens(text)` → `Math.ceil(String(text).length / 4)`; `''`/null/undefined → 0.
+1. `RECALL_REV` — the string `'cg-recall-1'`. `CHARS_PER_TOKEN` — the number `3.5`, the one chars-per-token ratio for the whole package (cg_memory.js and engine.js import it; context_guardian.py's `GUARDIAN_CHARS_PER_TOKEN` defaults to it).
+2. `estTokens(text)` → `Math.ceil(String(text).length / CHARS_PER_TOKEN)`; `''`/null/undefined → 0.
 3. `parseRecallRequest(type, id)` →
    `{ok:true, type:'seq'|'result'|'checkpoint', from:<int>, to:<int>}` or `{ok:false, error:<string>}`.
    - `type` missing/empty → `'seq'`. Case-insensitive, trimmed. Any other type → error.
@@ -37,7 +37,7 @@ A CHECKPOINT node is a user message whose `source.kind === 'plugin' && source.pl
    `{ok:boolean, text:string, seqs:number[], truncated:boolean, tokens:number}`.
    - type `seq`: every node with `from <= seq <= to` and a non-null message, in seq order, each rendered
      `[seq <N> <role>]\n<renderMessage>`; nodes joined by a blank line.
-     Budget: add whole nodes while `estTokens(text so far + next)` <= maxTokens. If the FIRST node alone exceeds the budget, include it cut to `maxTokens*4` characters.
+     Budget: add whole nodes while `estTokens(text so far + next)` <= maxTokens. If the FIRST node alone exceeds the budget, include it cut to `Math.floor(maxTokens * CHARS_PER_TOKEN)` characters.
      When anything was left out: `truncated:true` and the text ends with the line
      `[recall truncated — next: recall(type="seq", id="<firstOmittedSeq>-<to>")]`. `seqs` lists only the included seqs.
    - type `result`: if node `from` is a tool-result message → return it. If node `from` is an assistant message with tool-call blocks → return the tool-result node(s) whose `toolCallId` matches any of its call ids. Same budget rule.

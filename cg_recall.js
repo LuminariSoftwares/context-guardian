@@ -5,10 +5,17 @@ import { pathToFileURL } from 'node:url'
 /** Revision tag for this recall implementation. */
 export const RECALL_REV = 'cg-recall-1'
 
-/** Rough token estimate: ceil(chars/4); '', null, undefined => 0. */
+/**
+ * Characters per token for every estimate in this package (cg_memory.js and engine.js import it; the
+ * Python proxy's GUARDIAN_CHARS_PER_TOKEN defaults to the same 3.5). Over-reads slightly for English
+ * text, which is the safe direction for "will this fit".
+ */
+export const CHARS_PER_TOKEN = 3.5
+
+/** Rough token estimate: ceil(chars / CHARS_PER_TOKEN); '', null, undefined => 0. */
 export function estTokens(text) {
   if (text === null || text === undefined || text === '') return 0
-  return Math.ceil(String(text).length / 4)
+  return Math.ceil(String(text).length / CHARS_PER_TOKEN)
 }
 
 const VALID_TYPES = ['seq', 'result', 'checkpoint']
@@ -126,7 +133,7 @@ function renderNodesWithBudget(matched, maxTokens, to) {
       continue
     }
     if (i === 0) {
-      text = candidate.slice(0, maxTokens * 4)
+      text = candidate.slice(0, Math.floor(maxTokens * CHARS_PER_TOKEN))
       seqs.push(matched[0].seq)
       truncated = matched.length > 1 || candidate.length > text.length
     } else {
@@ -359,7 +366,7 @@ function runSelftest() {
   ]
 
   check('rev_and_estTokens', () =>
-    RECALL_REV === 'cg-recall-1' && estTokens('abcd') === 1 && estTokens('') === 0 && estTokens(null) === 0 && estTokens(undefined) === 0)
+    RECALL_REV === 'cg-recall-1' && estTokens('abcd') === 2 && estTokens('abcdefg') === 2 && estTokens('') === 0 && estTokens(null) === 0 && estTokens(undefined) === 0)
 
   check('parse_default_type_and_range_forms', () => {
     const a = parseRecallRequest(undefined, '2-9')

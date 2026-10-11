@@ -6,6 +6,7 @@
 import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { applyProvenance, renderPinText } from './cg_provenance.js'
+import { CHARS_PER_TOKEN } from './cg_recall.js'
 
 /** Revision tag for this memory implementation. */
 export const MEMORY_REV = 'cg-memory-2'  // 2026-10-01: pins category + session-scoped render
@@ -91,9 +92,9 @@ export function emptyMemory() {
   return { version: MEMORY_VERSION, updated: null, items: [] }
 }
 
-/** Rough token estimate: ceil(chars / 3.5). */
+/** Rough token estimate: ceil(chars / CHARS_PER_TOKEN), the package-wide constant from cg_recall.js. */
 export function estTokens(text) {
-  return Math.ceil(String(text).length / 3.5)
+  return Math.ceil(String(text).length / CHARS_PER_TOKEN)
 }
 
 /** Lowercase, collapse whitespace runs, trim, strip trailing sentence punctuation. */

@@ -226,11 +226,11 @@ export function effectiveWindow(options, hostWindow, explicit) {
   return fallback
 }
 
-/** Conservative token estimate for "will this request fit": chars / 3.5. */
+/** Conservative token estimate for "will this request fit": chars / CHARS_PER_TOKEN (cg_recall.js). */
 export function estRequestTokens(value) {
   if (value === undefined || value === null) return 0
   const text = typeof value === 'string' ? value : JSON.stringify(value)
-  return Math.ceil(text.length / 3.5)
+  return Math.ceil(text.length / lib.CHARS_PER_TOKEN)
 }
 
 /** Pressure tier of the 30/50/70/90 ladder. */
@@ -637,10 +637,10 @@ export function capSummaryBlocks(blocks, maxTokens) {
   for (const block of blocks) {
     if (block?.type !== 'text') { out.push(block); continue }
     const text = String(block.text ?? '')
-    const tokens = Math.ceil(text.length / 3.5)
+    const tokens = Math.ceil(text.length / lib.CHARS_PER_TOKEN)
     if (total + tokens <= maxTokens) { out.push(block); total += tokens; continue }
     const room = Math.max(0, maxTokens - total)
-    if (room > 50) out.push({ type: 'text', text: text.slice(0, Math.floor(room * 3.5)) + '\n[checkpoint truncated at checkpointMaxTokens; call search/recall for the rest]' })
+    if (room > 50) out.push({ type: 'text', text: text.slice(0, Math.floor(room * lib.CHARS_PER_TOKEN)) + '\n[checkpoint truncated at checkpointMaxTokens; call search/recall for the rest]' })
     break
   }
   return out
