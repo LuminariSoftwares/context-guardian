@@ -1,7 +1,7 @@
-"""Contract probe for P36 C1 -- the Python proxy learns its token-estimate error
+"""Contract probe for usage calibration -- the Python proxy learns its token-estimate error
 from the backend's own usage figures.
 
-Written by the overseer FROM THE CONTRACT before the code existed; seen red first.
+Written FROM THE CONTRACT before the code existed; seen red first.
 
 The seam this guards (not in the original review): Ollama and llama.cpp report
 only the prompt tokens they actually EVALUATED. When the KV cache is reused, that

@@ -104,10 +104,10 @@ export const DEFAULTS = Object.freeze({
   chainMaxTokens: 0,
   chainMaxCheckpoints: 4,
   anchorCheck: 'repair',
-  // C-Recall stage (a): ON by default since 0.1.0-alpha.9 -- the P44 variant bench cleared its bar (S1/S2/S3
+  // C-Recall stage (a): ON by default since 0.1.0-alpha.9 -- the variant benchmark cleared its bar (S1/S2/S3
   // 12/12 current, 0 stale, early 3/3). `staleRecall: false` or GUARDIAN_STALE_RECALL=0 turns it off.
   staleRecall: true,
-  // C-Recall stage (b): off until the variant bench shows it does not regress (P44 A4).
+  // C-Recall stage (b): off until the variant benchmark shows it does not regress.
   postAnswerCheck: false,
 })
 
@@ -179,7 +179,7 @@ export function resolveEngineOptions(config = {}, env = process.env) {
     // One recall may never take more than a quarter of the window it lands in.
     // One recall may never take more than a quarter of the window it lands in. When the user pinned the window,
     // cap here; otherwise the quarter cap is applied per session at use (doRecall) against the model's real window --
-    // capping by the default numCtx would pin every big-model user at 8192 (O5 2026-09-25).
+    // capping by the default numCtx would pin every big-model user at 8192 (2026-09-25).
     maxRecallTokens: numCtxExplicit
       ? Math.min(Math.floor(num('GUARDIAN_MAX_RECALL_TOKENS', 'maxRecallTokens', 100, 1_000_000)), Math.floor(numCtx / 4))
       : Math.floor(num('GUARDIAN_MAX_RECALL_TOKENS', 'maxRecallTokens', 100, 1_000_000)),
@@ -226,11 +226,11 @@ export function effectiveWindow(options, hostWindow, explicit) {
   return fallback
 }
 
-/** Conservative token estimate for "will this request fit": chars / 3.5. */
+/** Conservative token estimate for "will this request fit": chars / CHARS_PER_TOKEN (cg_recall.js). */
 export function estRequestTokens(value) {
   if (value === undefined || value === null) return 0
   const text = typeof value === 'string' ? value : JSON.stringify(value)
-  return Math.ceil(text.length / 3.5)
+  return Math.ceil(text.length / lib.CHARS_PER_TOKEN)
 }
 
 /** Pressure tier of the 30/50/70/90 ladder. */
@@ -637,10 +637,10 @@ export function capSummaryBlocks(blocks, maxTokens) {
   for (const block of blocks) {
     if (block?.type !== 'text') { out.push(block); continue }
     const text = String(block.text ?? '')
-    const tokens = Math.ceil(text.length / 3.5)
+    const tokens = Math.ceil(text.length / lib.CHARS_PER_TOKEN)
     if (total + tokens <= maxTokens) { out.push(block); total += tokens; continue }
     const room = Math.max(0, maxTokens - total)
-    if (room > 50) out.push({ type: 'text', text: text.slice(0, Math.floor(room * 3.5)) + '\n[checkpoint truncated at checkpointMaxTokens; call search/recall for the rest]' })
+    if (room > 50) out.push({ type: 'text', text: text.slice(0, Math.floor(room * lib.CHARS_PER_TOKEN)) + '\n[checkpoint truncated at checkpointMaxTokens; call search/recall for the rest]' })
     break
   }
   return out
@@ -741,7 +741,7 @@ export function apply(ctx, config) {
   }
 
   /**
-   * C-Handoff (P44 A2, 2026-10-03): after a compaction, write handoff_<session>.json/.md and handoff_latest.json
+   * C-Handoff (2026-10-03): after a compaction, write handoff_<session>.json/.md and handoff_latest.json
    * beside memory.json, so another session -- or Claude through escalate_to_claude -- can pick the work up from
    * the goal and pins alone. GUARDIAN_HANDOFF=0 (or config handoff: false) turns it off. Never throws.
    */
@@ -782,7 +782,12 @@ export function apply(ctx, config) {
             run_id: runId, index, at: new Date().toISOString().replace('T', ' ').slice(0, 19), num_ctx: options.numCtx,
             message_count: messages.length, summary, messages, session_id: String(session?.id ?? ''), engine: ENGINE_REV,
           }, null, 1))
-        } finally { closeSync(fd) }
+        } catch (error) {
+          // The claimed file is empty or half-written; left in place it reads as an archived span.
+          closeSync(fd); fd = undefined
+          try { unlinkSync(path) } catch { /* already gone */ }
+          throw error
+        } finally { if (fd !== undefined) closeSync(fd) }
         spanIndex = index
         pruneSpans()
         return path
@@ -1069,7 +1074,7 @@ export function apply(ctx, config) {
     if (status === 'idle') recallCount.delete(agent)
   })
 
-  // ── C-Recall stage (b) (P44 A4, 2026-10-03): a final answer that states an OLD value for a pinned subject is
+  // ── C-Recall stage (b) (2026-10-03): a final answer that states an OLD value for a pinned subject is
   // steered ONCE per turn with the current pinned value. Pins come from the whole session log (live and compacted),
   // so an update still in the window counts. Opt-in (postAnswerCheck / GUARDIAN_POST_ANSWER_CHECK=1); never throws.
   if (options.postAnswerCheck) {
@@ -1097,7 +1102,7 @@ export function apply(ctx, config) {
     })
   }
 
-  // ── C-Recall stage (a) (P44 A3, 2026-10-03): a name in the newest user message that only compacted
+  // ── C-Recall stage (a) (2026-10-03): a name in the newest user message that only compacted
   // turns still hold is shown again as ONE extra message. Opt-in (staleRecall / GUARDIAN_STALE_RECALL=1);
   // any error leaves the step exactly as it was.
   if (options.staleRecall) {

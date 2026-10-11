@@ -1,5 +1,5 @@
-// @studio: QA | Overseer probe for cg_autorecall.js (P44 A3 C-Recall stage a), written from the contract before dispatch 2026-10-03
-// @job: none -- overseer-written contract probe. Usage: node autorecall_smoke.mjs <dir>  (dir holds cg_autorecall.js + cg_recall.js)
+// Contract probe for cg_autorecall.js (C-Recall stage a), written from the contract before the module, 2026-10-03.
+// Usage: node autorecall_smoke.mjs <dir>  (dir holds cg_autorecall.js + cg_recall.js)
 import { spawnSync } from 'node:child_process'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'

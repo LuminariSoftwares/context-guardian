@@ -1,11 +1,16 @@
 /**
  * dsh-context-guardian -- Context Guardian as a native DSH bundle plugin.
  *
- * PHASE 1 SCAFFOLD. This file wires the plugin into DSH (config schema,
- * settings section, the vendored compiler, the optional Python bridge). It
- * does NOT touch compaction yet: no listener, no provider, no tools. Those
- * are Phase 3 / 3b and are marked below where they land. Until then
- * @deepseek-ai/dsh-compaction-basic behaves exactly as the profile has it.
+ * This is the SETTINGS HALF of the bundle, loaded in the DSH profile plane:
+ * config schema, the `context-guardian` settings section, the update notice
+ * and the optional Python bridge. It does not compact anything and registers
+ * no listener, provider or tool.
+ *
+ * Compaction, recall, search, memory and hand-off live in engine.js, which
+ * DSH mounts as ONE row in the agent preset's `compaction` group -- a plane
+ * this file cannot see. `npm run setup` (setup.mjs) writes that row; see
+ * docs/dsh-integration.md. Without it @deepseek-ai/dsh-compaction-basic
+ * behaves exactly as the profile has it.
  *
  * Written against DSH 0.1.2-alpha.2 (source read 2026-09-19):
  *   - settings:    packages/settings/settings -> ctx.settings.installSection(owner, ns, schema, entry, hooks)
@@ -18,8 +23,8 @@
  * vendor/compiler.js and vendor/region.js are unmodified from
  * dsh-compaction-instant@0.1.4 (MIT, TsFreddie; VCC principle by lllyasviel) --
  * see vendor/LICENSE.dsh-compaction-instant. region.js imports
- * @deepseek-ai/dsh-compaction and @deepseek-ai/dsh-llm, so it is loaded only
- * where Phase 3b needs it, never at plugin load.
+ * @deepseek-ai/dsh-compaction and @deepseek-ai/dsh-llm, so this file never
+ * loads it.
  *
  * MIT licensed.
  */
@@ -34,7 +39,7 @@ import { COMPILER_REV, DEFAULT_ARG_TOOLS } from './vendor/compiler.js'
 
 export const name = 'dsh-context-guardian'
 
-/** Nothing is required at load in Phase 1; settings attaches when present. */
+/** Nothing is required at load; settings attaches when present. */
 export const inject = []
 
 /** Settings namespace (must match /^[a-z][a-z0-9-]*$/). */
@@ -59,14 +64,10 @@ export const Config = Schema.object({
   // 0 = off (the default since alpha.8); ratio() demands >= 0.05, so 0 needs its own bound (2026-10-03: a 0 default made the plugin unloadable)
   idleCompactRatio: Schema.number().min(0).max(0.99).default(0)
     .description('Proactive trigger when the agent goes idle; 0 = off, the default since 0.1.0-alpha.8 (GUARDIAN_IDLE_COMPACT_RATIO overrides).'),
-  keepRecentMessages: Schema.natural().default(8)
-    .description('Most recent messages never compacted (GUARDIAN_KEEP_RECENT_MESSAGES overrides).'),
   reserveOutput: Schema.natural().default(8192)
     .description('Tokens held back for the reply (GUARDIAN_RESERVE_OUTPUT overrides).'),
   spanDir: Schema.string().default('')
     .description('Span archive. Empty = $GUARDIAN_SPAN_DIR, then the proxy\'s own default.'),
-  maxRecallTokens: Schema.natural().default(16000)
-    .description('Cap on one recall restore (GUARDIAN_MAX_RECALL_TOKENS overrides).'),
   maxSearchHits: Schema.natural().default(50)
     .description('Cap on one search (GUARDIAN_MAX_SEARCH_HITS overrides).'),
   toolArgTools: Schema.array(Schema.string()).default([])
@@ -95,10 +96,8 @@ export function resolveOptions(section, env = process.env) {
     numCtx: int('GUARDIAN_NUM_CTX', section.numCtx),
     compactThreshold: frac('GUARDIAN_COMPACT_THRESHOLD', section.compactThreshold),
     idleCompactRatio: frac('GUARDIAN_IDLE_COMPACT_RATIO', section.idleCompactRatio),
-    keepRecentMessages: int('GUARDIAN_KEEP_RECENT_MESSAGES', section.keepRecentMessages),
     reserveOutput: int('GUARDIAN_RESERVE_OUTPUT', section.reserveOutput),
     spanDir: env.GUARDIAN_SPAN_DIR?.trim() || section.spanDir || '',
-    maxRecallTokens: int('GUARDIAN_MAX_RECALL_TOKENS', section.maxRecallTokens),
     maxSearchHits: int('GUARDIAN_MAX_SEARCH_HITS', section.maxSearchHits),
     toolArgTools: section.toolArgTools?.length > 0 ? [...section.toolArgTools] : [...DEFAULT_ARG_TOOLS],
     hideTools: [...(section.hideTools ?? [])],
@@ -215,10 +214,10 @@ export function apply(ctx, config) {
     bridge = null
   }
 
-  /** Current options; every Phase 3 consumer reads through this, never a copy. */
+  /** Current options; read through this, never a copy. */
   const options = () => resolveOptions(source())
 
-  /** Spawned on first use only -- Phase 1 never calls it on its own. */
+  /** Spawned on first use only -- nothing in this file calls it on its own. */
   // eslint-disable-next-line no-unused-vars
   const getBridge = () => {
     bridge ??= new PythonBridge(options(), ctx.logger)
@@ -244,7 +243,7 @@ export function apply(ctx, config) {
   ctx.effect(() => stopBridge)
 
   const now = options()
-  ctx.logger.info(`context-guardian scaffold loaded (compiler ${COMPILER_REV}; window ${now.numCtx}, hard ${now.compactThreshold}, idle ${now.idleCompactRatio}) -- compaction untouched in Phase 1`)
+  ctx.logger.info(`context-guardian settings loaded (compiler ${COMPILER_REV}; window ${now.numCtx}, hard ${now.compactThreshold}, idle ${now.idleCompactRatio}) -- compaction is the engine row in the agent preset (npm run setup), not this plugin`)
 
   // Fire-and-forget: the update notice is a courtesy line, never a reason to wait.
   void checkForUpdate({
@@ -253,14 +252,4 @@ export function apply(ctx, config) {
     cacheFile: defaultCacheFile(name),
     log: (line) => ctx.logger.info(line),
   }).catch(() => {})
-
-  // ── PHASE 3 lands here ────────────────────────────────────────────────────
-  // 3.1  snapshot on ctx.on('session/event', ...) where event type is
-  //      'compaction/start' (absorbing dsh-openwolf's compactionSurvival, 3d)
-  // 3.2  compaction: subclass @deepseek-ai/dsh-compaction-basic and override
-  //      summarize() with vendor/compiler.js compileRegion() -- 3b / 3c
-  // 3b   recall + search tools via ctx.tools.register(defineTool(...)), the
-  //      /recall command, toolArgTools / hideTools, recall + search budgets
-  // 3c   context_rewrite_cost, idle trigger, tier ladder, keyword index,
-  //      context_compact
 }

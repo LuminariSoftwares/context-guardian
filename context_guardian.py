@@ -1,107 +1,73 @@
 """
 context_guardian.py
 =====================
-*** VERIFIED WORKING 2026-08-12 -- see "VERIFICATION RESULT" below. ***
+A small proxy in front of any OpenAI-compatible backend (Ollama, LM Studio,
+vLLM, LiteLLM, Headroom, ...) that compacts the conversation before it
+overflows the model's context window.
 
-Built in response to a real, repeated, first-hand symptom: OpenClaude
-hitting "token limit reached", refusing to continue, and losing the whole
-session -- with no compaction attempt in between. OpenClaude (confirmed to
-be Gitlawb/openclaude, NOT Anthropic's Claude Code) does have a real
-`/compact` command (confirmed via its own /help output), but it is a
-manual, user-invoked action -- nothing found in its config or behavior
-suggests it fires itself automatically as the context fills. That gap
-between "the capability technically exists" and "it never runs unless you
-remember to type it" is exactly what produced the original hard-stop
-symptom. This script is the fallback: a small proxy that sits
-in front of Headroom, watches the running token count itself, and forces a
-compaction BEFORE the real backend ever has a chance to hard-error --
-automating what `/compact` would do manually, so it can't be forgotten.
+Agentic CLIs resend the whole conversation on every request. On a local model
+with a fixed window, the request eventually exceeds it and the backend either
+errors or silently truncates, and the session dies. This proxy sits in the
+chain:
 
-VERIFICATION RESULT (2026-08-12): Passthrough test passed after fixing a
-real bug (see FIXED BUG note below). Forced low-threshold test
-(NUM_CTX=2000, THRESHOLD=0.5) triggered a genuine compaction: 11 messages
--> 10, ~1851 -> ~1626 estimated tokens, logged to
-logs/context_guardian_log.json, and the model's next response correctly
-referenced content from the summarized portion -- proving the summary
-carried real information through, not just a token-count reduction. Now
-wired into luminari_launch.bat and start_openclaude.py in place of a
-direct-to-Headroom connection.
+    your CLI  ->  Context Guardian (:8786)  ->  your backend (/v1)
 
-FIXED BUG (2026-08-12): the original proxy() handler opened its httpx
-client with `async with httpx.AsyncClient() as client:`, which closed the
-client (and its connections) the moment the function returned -- but
-StreamingResponse doesn't actually read the upstream body until AFTER the
-function returns, so every single request through /v1/{path} failed with
-a generic "Internal Server Error" (confirmed live: the passthrough test
-failed this way before the fix). Replaced with one long-lived
-httpx.AsyncClient created at app startup and reused for every request,
-with each individual streamed response closed via a BackgroundTask once
-Starlette finishes sending it, instead of tearing down the shared client.
+and, on every POST /v1/chat/completions:
 
-FIXED BUG #2 (2026-08-12): the shared httpx.AsyncClient() above was
-created with NO timeout override, so it silently inherited httpx's
-default -- 5 seconds per read. Fine for a trivial "say hi" test, fatal for
-a real task: gpt-oss:20b is a reasoning/"thinking" model, and any request
-that spends more than 5 seconds thinking before the first output token
-streams out trips httpx.ReadTimeout, which Guardian returns as a 500.
-Confirmed live: asking OpenClaude to write a real script produced a
-ReadTimeout, OpenClaude retried ~10 times over 4+ minutes hitting the same
-5-second wall every attempt, then gave up with "Provider is temporarily
-unavailable." Fixed by giving the shared client a generous, LLM-appropriate
-timeout instead of the tiny generic-HTTP-API default.
+  1. Estimates the request size: characters / GUARDIAN_CHARS_PER_TOKEN (3.5),
+     counting message text, tool calls and the `tools` array.
+  2. Calibrates that estimate per model. When the backend reports real usage
+     (usage.prompt_tokens), the proxy keeps a short window of
+     reported / estimated ratios per model and multiplies later estimates by
+     that factor (clamped to 0.7-1.3, 1.0 until 5 samples).
+     GUARDIAN_CALIBRATE=0 turns it off.
+  3. Compares it with the input budget: GUARDIAN_NUM_CTX x
+     GUARDIAN_COMPACT_THRESHOLD, minus GUARDIAN_RESERVE_OUTPUT for the reply.
+  4. Over budget: asks the same backend to summarise the older messages
+     (fenced as data, so the model describes them instead of acting on them),
+     archives the originals to GUARDIAN_SPAN_DIR/<run>/NNNN.json, and forwards
+     [system] + [summary + a pointer to the archive] + the recent messages.
+     Recent messages are kept within ~20% of the usable window by default, or
+     exactly GUARDIAN_KEEP_RECENT_MESSAGES when that is set. Tool calls and
+     their results are never split.
+  5. Everything else (GET /v1/models, embeddings, ...) passes through as-is.
 
-WHERE THIS SITS IN THE CHAIN (this is a new link, not a replacement):
-  OpenClaude (Claude Code)
-      -> Context Guardian   (this script,  port 8786)   <-- NEW
-      -> Headroom proxy     (already exists, port 8787)
-      -> Ollama              (already exists, port 11434)
+FAIL-OPEN
+  Compaction only replaces messages when the summary actually came back. A
+  failed, empty or degenerate summary (under GUARDIAN_MIN_SUMMARY_CHARS), or a
+  span the summariser could not read, leaves the request untouched: it goes
+  upstream as the client sent it, and the refusal is logged. A failed span
+  write never fails the request. The proxy may be unable to help; it never
+  deletes the conversation on a guess.
 
-To wire it in: change OPENAI_BASE_URL in luminari_launch.bat and
-start_openclaude.py from "http://localhost:8787/v1" to
-"http://localhost:8786/v1". Headroom keeps doing exactly what it already
-does (compression) -- this just adds a layer in front of it that watches
-cumulative token usage and, before the real ceiling, rewrites the outgoing
-request to fold older turns into a summary instead of letting the raw
-request grow until Ollama rejects it outright.
+WHAT IT DOES NOT DO
+  - It does not count with a real tokenizer; the estimate errs high on purpose.
+  - It cannot shrink the `tools` array; that is a fixed floor under the budget.
+  - Your CLI's own token counter does not know the proxy exists, so it drifts
+    after a compaction.
 
-WHAT THIS DOES NOT DO:
-- It does not touch Headroom's own compression at all -- forwards to it
-  as-is once it's decided whether to compact first.
-- It does not make Claude Code's own "x/128k" counter accurate after a
-  compaction happens -- Claude Code doesn't know this proxy exists, so its
-  own token tally will drift from reality post-compaction. What matters is
-  that the session keeps working instead of hard-stopping; the displayed
-  counter being slightly wrong afterward is a known, accepted tradeoff of
-  doing this invisibly at the proxy layer rather than inside Claude Code
-  itself (which isn't something we can modify).
-- It is NOT a tokenizer-accurate counter. Token count is estimated from
-  character length (a conservative ~3.5 chars/token). It is NOT corrected
-  against real `usage.total_tokens` / `prompt_eval_count` figures -- an
-  earlier version of this file said it was; that was never implemented
-  whenever a backend response actually includes them -- Ollama's OpenAI-
-  compatible endpoint often does. Treat the estimate as a safety-margin
-  trigger, not a precise count.
+SEE IT, SEARCH IT
+  GET /guardian/health   dashboard (latest request, compactions, estimate)
+  GET /guardian/stats    every setting and counter, as JSON
+  GET /guardian/events   this run's compaction events
+  context-guardian-recall "<term>" [--run RUN_ID]   search the archived spans
 
-REQUIRED BEFORE RUNNING:
-  pip install fastapi uvicorn httpx   (into luminari_env, not globally --
-  matches the project's one-venv-per-app rule)
+HOW TO TEST BEFORE TRUSTING IT
+  1. Start your backend, then this proxy:  context-guardian
+     (or `python context_guardian.py` from a checkout).
+  2. Passthrough:
+       curl http://localhost:8786/v1/chat/completions -H "Content-Type: application/json" -d "{\"model\":\"<model>\",\"messages\":[{\"role\":\"user\",\"content\":\"say hi\"}]}"
+     A normal reply means requests reach the backend unchanged.
+  3. Force a compaction: restart with GUARDIAN_NUM_CTX=2000
+     GUARDIAN_COMPACT_THRESHOLD=0.5 and send several long messages. Check that
+     a "compaction" line appears in logs/context_guardian_log.json, a span file
+     appears under logs/guardian_spans/, and the model's next answer still uses
+     facts from the summarised part.
+  4. `context-guardian-doctor` checks the install and the running proxy.
+  5. Then point your CLI's OPENAI_BASE_URL at http://localhost:8786/v1.
 
-HOW TO TEST BEFORE TRUSTING IT (same discipline as scrape_etsy_trends.py):
-  1. Start Ollama and Headroom as normal (start_ollama.py, start_headroom.py).
-  2. Run this script directly:  python context_guardian.py
-  3. Point a single manual request at it instead of the real OpenClaude:
-       curl http://localhost:8786/v1/chat/completions -H "Content-Type: application/json" -d "{\"model\":\"gpt-oss:20b\",\"messages\":[{\"role\":\"user\",\"content\":\"say hi\"}]}"
-     Confirm you get a normal response back (proves passthrough works)
-     before testing compaction specifically.
-  4. Check GET http://localhost:8786/guardian/stats for the running token
-     estimate and compaction count.
-  5. Force a compaction test: temporarily set GUARDIAN_NUM_CTX and
-     GUARDIAN_COMPACT_THRESHOLD low (e.g. NUM_CTX=2000, THRESHOLD=0.5) and
-     send a conversation with several long messages -- confirm a compaction
-     log entry appears in logs/context_guardian_log.json and the request
-     that actually reaches Headroom/Ollama is smaller than what was sent in.
-  6. Only after that, point luminari_launch.bat's OPENAI_BASE_URL at this
-     proxy and test with a real OpenClaude session.
+Configuration is environment variables (or a .env beside this file, written
+by `context-guardian-configure`); see the README for the full list.
 """
 
 import collections
@@ -145,10 +111,10 @@ except ImportError:  # pragma: no cover -- optional, never fatal
 GUARDIAN_PORT = int(os.environ.get("GUARDIAN_PORT", "8786"))
 GUARDIAN_HOST = os.environ.get("GUARDIAN_HOST", "127.0.0.1")
 # Ollama's OpenAI-compatible endpoint -- the default a stranger cloning this
-# repo can actually use. It shipped as http://localhost:8787/v1, which is the
-# maintainer's own Headroom layer and answers on nobody else's machine, while
-# the README documented 11434. The README was right and the code was not.
-# Studio launchers set this explicitly, so they are unaffected.
+# repo can actually use. It shipped as http://localhost:8787/v1, a Headroom
+# layer that only existed on the machine it was written on, while the README
+# documented 11434. The README was right and the code was not. Set
+# GUARDIAN_UPSTREAM_URL for any other backend.
 UPSTREAM_URL = os.environ.get("GUARDIAN_UPSTREAM_URL", "http://localhost:11434/v1")
 NUM_CTX = int(os.environ.get("GUARDIAN_NUM_CTX", "32768"))  # keep in sync with OLLAMA_CONTEXT_LENGTH
 COMPACT_THRESHOLD = float(os.environ.get("GUARDIAN_COMPACT_THRESHOLD", "0.85"))
@@ -255,13 +221,17 @@ MAX_SPAN_INDEX_PROBE = 50
 # shows up after several compactions in one session.
 #
 # Retired summaries are not discarded: they are folded into the next span, so
-# their text is on disk and reachable through guardian_recall.py.
+# their text is on disk and reachable through `context-guardian-recall`.
 # In-window count settles at KEEP_SUMMARIES + 1 (the kept ones plus the new).
 KEEP_SUMMARIES = int(os.environ.get("GUARDIAN_KEEP_SUMMARIES", "1"))
+# The search command the summary names (console script `context-guardian-recall`,
+# module cg_recall_cli.py beside this file). Spelled out as a path too, for a
+# checkout that was never pip-installed and so has no console script on PATH.
+RECALL_SCRIPT = REPO_DIR / "cg_recall_cli.py"
 # The condense instruction. FENCED, and the fencing is the whole fix.
 #
-# MEASURED 2026-08-26 by replaying real spans through scripts/
-# guardian_summary_probe.py --span. The old unfenced prompt ended "...not a
+# MEASURED 2026-08-26 by replaying real archived spans through the
+# summariser. The old unfenced prompt ended "...not a
 # transcript.\n\n---\n\n" and then pasted 31,000 characters of agent
 # conversation. The model did not summarise it. It STARTED DOING IT:
 #
@@ -269,7 +239,7 @@ KEEP_SUMMARIES = int(os.environ.get("GUARDIAN_KEEP_SUMMARIES", "1"))
 #                  headroom_retrieve on the snip placeholders in the transcript
 #   via Ollama   : finish_reason "stop", content "", 6,809 chars of reasoning
 #                  beginning "We need to do tasks: call tool
-#                  mcp__luminari-scripts__vault_path..."
+#                  mcp__<server>__<tool>..."
 #
 # A 380-character instruction does not outrank 31,000 characters of imperative
 # text. Either way `content` came back "" and -- before 0.3.1 -- Guardian
@@ -325,7 +295,7 @@ MIN_SUMMARY_CHARS = int(os.environ.get("GUARDIAN_MIN_SUMMARY_CHARS", "40"))
 MIN_TRANSCRIPT_CHARS = int(os.environ.get("GUARDIAN_MIN_TRANSCRIPT_CHARS", "80"))
 # How much of a tool call's arguments reaches the summariser. The summary needs
 # to say WHICH tool ran, not reproduce a 40 KB file write -- the full text is in
-# the span on disk, one guardian_recall.py away.
+# the span on disk, one `context-guardian-recall` away.
 TOOL_ARG_CHARS_IN_SUMMARY = int(
     os.environ.get("GUARDIAN_TOOL_ARG_CHARS", "300"))
 # One id per proxy process. Guardian cannot see OpenClaude's session id -- it
@@ -622,7 +592,7 @@ def estimate_tool_tokens(payload: Dict[str, Any]) -> int:
     conversation from `messages` alone and never looked at `tools` -- so it was
     blind to the single largest fixed cost in every request.
 
-    Measured the same day with scripts/mcp_context_cost.py: the five MCP servers
+    Measured the same day: the five MCP servers
     are 21,995 tokens, 67.1% of a 32,768 window, BEFORE the first user message.
     A guardian that starts counting at zero when the request already contains
     21,995 tokens does not fire late -- it fires at the wrong time entirely, and
@@ -653,9 +623,9 @@ def effective_threshold(num_ctx: int = None, threshold: float = None,
         window of 8192 or less produced a budget of exactly 1 token -- and
         `estimated < 1` is never true, so the proxy compacted on EVERY request,
         forever: a summariser round-trip per turn, the conversation pinned at
-        KEEP_RECENT_MESSAGES and unable to grow, a span written each time. The
-        file's own docstring describes an 8192-context devstral path, so this
-        was reachable by following the documentation.
+        KEEP_RECENT_MESSAGES and unable to grow, a span written each time.
+        8192-token models are common, so this was reachable by an ordinary
+        configuration.
 
         A reserve that does not fit in the window is an operator error. Clamp it
         to half the window, say so once, and carry on with a sane budget --
@@ -875,6 +845,7 @@ def write_span(messages: List[Dict[str, Any]], summary: str,
     is recorded in the compaction log so a missing span is visible rather than
     silently assumed to exist.
     """
+    path = None
     try:
         d = SPAN_DIR / RUN_ID
         d.mkdir(parents=True, exist_ok=True)
@@ -919,13 +890,21 @@ def write_span(messages: List[Dict[str, Any]], summary: str,
             "messages": messages,
         }
         # The file is already created and held open, so the atomic-rename
-        # dance is gone: the exclusive create IS the claim, and a torn write
-        # is handled by the caller seeing None rather than by a .part file.
+        # dance is gone: the exclusive create IS the claim. A torn write is
+        # handled below: the claimed file is removed and the caller sees None.
         with fh:
             json.dump(payload, fh, ensure_ascii=False, indent=1)
+        written, path = path, None
         prune_spans()
-        return str(path)
+        return str(written)
     except Exception as exc:                               # noqa: BLE001
+        # The claimed file is empty or half-written. Left in place it would
+        # read as an archived span to recall, prune and the DSH bridge.
+        if path is not None:
+            try:
+                path.unlink()
+            except OSError:
+                pass
         log.warning("could not write span %d: %s. The compaction still "
                     "proceeds; this span is LOST, not deferred.", index, exc)
         return None
@@ -1078,15 +1057,15 @@ def extract_assistant_text(data: Any,
     The original guess was "a reasoning model emits no final channel, so read
     `reasoning` instead". Measurement killed it. Raw Ollama on a real span DID
     put 6,809 chars in `reasoning` -- and they read "We need to do tasks: call
-    tool mcp__luminari-scripts__vault_path...". That is the model planning to
+    tool mcp__<server>__<tool>...". That is the model planning to
     EXECUTE the transcript, not a summary of it. Reading that field would have
     sailed past MIN_SUMMARY_CHARS and pasted the model's private monologue into
     the context window as the record of the conversation: plausible, long, and
     wrong -- strictly worse than the empty string, which at least fails open.
 
-    The flag stays because the field-walk is genuinely useful elsewhere (see
-    probe_thinking.py, 2026-08-24, where four qwen3.5 models scored 0/20
-    because the harness could not read them). It is just never right for THIS
+    The flag stays because the field-walk is genuinely useful elsewhere (a
+    2026-08-24 probe had four qwen3.5 models score 0/20 because the harness
+    could not read their reasoning channel). It is just never right for THIS
     call.
     """
     if not isinstance(data, dict):
@@ -1329,7 +1308,9 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
                    f"{n_spans} span(s) so far this session, all under "
                    f"{SPAN_DIR / RUN_ID}. They are LARGER than the room that "
                    f"was freed -- do not read them whole. Search instead: "
-                   f"`python scripts/guardian_recall.py \"<term>\"`.]")
+                   f"`context-guardian-recall \"<term>\" --run {RUN_ID}` "
+                   f"(from a source checkout: `python {RECALL_SCRIPT} "
+                   f"\"<term>\" --run {RUN_ID}`).]")
 
     summary_message = {
         "role": "system",
@@ -1364,6 +1345,8 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
         "compaction_index": _state["compactions_performed"],
         "messages_before": len(messages),
         "messages_after": len(new_messages),
+        # Recent messages forwarded verbatim (what keep-recent actually kept).
+        "kept_messages": len(to_keep),
         "estimated_tokens_before": estimated,
         "estimated_tokens_after": tokens_after,
         "message_tokens_before": message_tokens,
@@ -1527,6 +1510,7 @@ async def stats():
         "keep_recent_messages": KEEP_RECENT_MESSAGES,
         "keep_recent_mode": "messages" if KEEP_RECENT_EXPLICIT else "budget",
         "keep_recent_fraction": KEEP_RECENT_FRACTION,
+        "keep_recent_label": keep_recent_label(),
         "count_tools": COUNT_TOOLS,
         "upstream_timeout_seconds": UPSTREAM_TIMEOUT_SECONDS,
         "upstream_connect_timeout_seconds": UPSTREAM_CONNECT_TIMEOUT_SECONDS,
@@ -1564,6 +1548,7 @@ async def stats():
         # turned it into `last_known_total_tokens`.
         "calibration": CALIBRATOR.snapshot(),
         "calibration_enabled": calibration_enabled(),
+        "calibration_min_samples": CALIBRATION_MIN_SAMPLES,
         "note": ("last_known_total_tokens now INCLUDES the tools array. "
                  "last_tool_tokens is the part compaction cannot touch."),
     })
@@ -1710,6 +1695,26 @@ function card(title,big,sub,bar){
     h+=`<div class="bar ${c}"><i style="width:${Math.min(100,bar)}%"></i></div>`;}
   return h+`</div>`;
 }
+function esc(t){return String(t).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
+}
+// The estimate behind every number above: the per-model factor learned from the
+// usage the backend reports (1.00 until enough samples), and the keep-recent mode.
+function estimateCard(s){
+  const cal=s.calibration||{}, need=s.calibration_min_samples||5;
+  const models=Object.keys(cal).sort((a,b)=>cal[b].samples-cal[a].samples);
+  const fac=c=>"&times;"+Number(c.factor).toFixed(2);
+  const lines=[];
+  let big="&times;1.00";
+  if(s.calibration_enabled===false){big="off";lines.push("calibration off (GUARDIAN_CALIBRATE=0)");}
+  else if(!models.length){lines.push("no usage reported yet - the factor learns from it");}
+  else{
+    big=cal[models[0]].samples>=need?fac(cal[models[0]]):"learning";
+    for(const m of models){const c=cal[m];
+      lines.push(c.samples>=need?`${esc(m)} ${fac(c)} (${c.samples} samples)`:`${esc(m)} learning (${c.samples}/${need})`);}
+  }
+  lines.push(`keep recent: ${esc(s.keep_recent_label||s.keep_recent_mode||"-")}`);
+  return card("Estimate",big,lines.join("<br>"));
+}
 function pct(t){return Math.round(100*t/budget);}
 function tfmt(ts){try{return new Date(ts).toLocaleTimeString();}catch(e){return ts||"";}}
 
@@ -1722,7 +1727,8 @@ function play(ev){
     setTimeout(()=>{ f.style.width=w(ap); f.classList.toggle("over",ap>=100); },850);
   }));
   $("mono-sub").innerHTML=`Compaction <b>#${ev.compaction_index}</b> &middot; ${tfmt(ev.timestamp)} `+
-    `&middot; ${ev.messages_before}&rarr;${ev.messages_after} messages`;
+    `&middot; ${ev.messages_before}&rarr;${ev.messages_after} messages`+
+    (ev.kept_messages!=null?` &middot; ${ev.kept_messages} kept verbatim`:"");
   $("nums").innerHTML=
     `<span>before <b>${fmt(ev.estimated_tokens_before)}</b> (${bp}%)</span>`+
     `<span class="arrow">&rarr;</span>`+
@@ -1758,7 +1764,8 @@ async function tick(){
                             :"set GUARDIAN_COST_PER_1M_INPUT_USD to price it"),
     card("Tool definitions",fmt(s.last_tool_tokens||0),"fixed floor - compaction can't touch it"),
     card("Rejected summaries",fmt(rejected),rejected?"empty/degenerate - investigate":"none - healthy"),
-    card("Uptime",human(s.uptime_seconds),`run ${s.run_id||""}`)
+    card("Uptime",human(s.uptime_seconds),`run ${s.run_id||""}`),
+    estimateCard(s)
   ].join("");
   if(rejected){$("cards").children[4].querySelector(".big").style.color="#f85149";}
 
@@ -1950,27 +1957,33 @@ async def proxy(path: str, request: Request):
     )
 
 
+def keep_recent_label() -> str:
+    """Which keep-recent mode is active, for the startup line and /guardian/stats."""
+    if KEEP_RECENT_EXPLICIT:
+        return "%d messages (explicit)" % KEEP_RECENT_MESSAGES
+    return "budget %g%%" % round(KEEP_RECENT_FRACTION * 100, 2)
+
+
 def main():
     """Console entry point (`context-guardian`) and `python context_guardian.py`."""
     import uvicorn
     log.info(
         "Starting Context Guardian v%s on port %d, forwarding to %s "
-        "(num_ctx=%d, threshold=%.2f). Health view: http://%s:%d/guardian/health",
+        "(num_ctx=%d, threshold=%.2f, keep_recent=%s). "
+        "Health view: http://%s:%d/guardian/health",
         guardian_version(), GUARDIAN_PORT, UPSTREAM_URL, NUM_CTX,
-        COMPACT_THRESHOLD, GUARDIAN_HOST, GUARDIAN_PORT,
+        COMPACT_THRESHOLD, keep_recent_label(), GUARDIAN_HOST, GUARDIAN_PORT,
     )
     # Fire-and-forget PyPI update check on a daemon thread. Only from main(), so
     # importing `app` in the test suite never reaches the network.
     start_version_check()
     # BIND 127.0.0.1, NOT 0.0.0.0 (fixed 2026-08-22, bandit B104).
-    # This proxy fronts Headroom -> Ollama with NO authentication. Bound to
-    # 0.0.0.0 it accepted /v1/chat/completions from anyone on the LAN: free use
-    # of this GPU, and a path straight to the local model. Verified before
-    # changing it -- n8n runs NATIVE ("n8n Start.bat": port 5679, native), and
-    # every caller of :8786 (OpenClaude, discord_approval_bot) uses localhost.
-    # Nothing containerised needs it, so loopback costs nothing.
-    # If a container ever does need it, set GUARDIAN_HOST deliberately rather
-    # than reverting this line.
+    # This proxy fronts the backend with NO authentication. Bound to 0.0.0.0
+    # it accepted /v1/chat/completions from anyone on the LAN: free use of the
+    # GPU, and a path straight to the local model. Clients on the same machine
+    # reach it on localhost, so loopback costs them nothing.
+    # If a container or another host does need it, set GUARDIAN_HOST
+    # deliberately rather than reverting this line.
     uvicorn.run(app, host=GUARDIAN_HOST, port=GUARDIAN_PORT)
 
 

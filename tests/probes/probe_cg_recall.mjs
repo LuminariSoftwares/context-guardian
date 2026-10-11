@@ -1,4 +1,4 @@
-// Overseer contract probe for cg_recall.js. READ-ONLY for the module author.
+// Contract probe for cg_recall.js, written from docs/contracts/CONTRACT_cg_recall.md. READ-ONLY for the module author.
 // usage: node tests/probes/probe_cg_recall.mjs [path-to-cg_recall.js]
 import { pathToFileURL } from 'node:url'
 import { resolve } from 'node:path'

@@ -1,4 +1,4 @@
-// cg_handoff.mjs -- context-guardian hand-off writer (TJ plan P44 A2, C-Handoff)
+// cg_handoff.js -- context-guardian hand-off writer (C-Handoff)
 //
 // Turns the context-guardian per-session memory (pinned facts, decisions, files)
 // into a hand-off file another session -- or Claude, via the escalate_to_claude

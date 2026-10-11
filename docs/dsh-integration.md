@@ -180,9 +180,9 @@ With `appendOnly: true`, a compaction that DSH starts on its own under pressure 
 | toolArgTools | [] (the compiler's default list) | GUARDIAN_TOOL_ARG_TOOLS | tools whose checkpoint line keeps its key argument (comma-separated in the env var) |
 | hideTools | [] | GUARDIAN_HIDE_TOOLS | tools that get no checkpoint line at all |
 | dropSources | agent-instructions, skill-catalog, @deepseek-ai/dsh-system-prompt, repeat-tool-reminder | GUARDIAN_DROP_SOURCES | harness-injected message kinds left out of checkpoints; the first drop of each kind per session is logged as a warning |
-| handoff | true | GUARDIAN_HANDOFF | write `handoff_<session>.json` + `.md` and `handoff_latest.json` beside memory.json at every compaction (goal + current pins + decisions); `0` turns it off (P44 A2) |
-| staleRecall | true | GUARDIAN_STALE_RECALL | before a step, when the newest user message names a doc line (`doc01 L017`), a codename, a CamelCase name or a quoted string that only compacted turns still hold, append ONE `[context-guardian recall]` message (≤3 hits, ≤600 chars). On by default since 0.1.0-alpha.9 (P44 bench: 12/12 current, 0 stale, early 3/3 over 3 runs); `0` turns it off |
-| postAnswerCheck | false | GUARDIAN_POST_ANSWER_CHECK | before a turn closes, if the final answer states an OLD value for a pinned subject (a later pin changed it), steer the model ONCE with the current pinned value. Off until the P44 variant bench shows no regression |
+| handoff | true | GUARDIAN_HANDOFF | write `handoff_<session>.json` + `.md` and `handoff_latest.json` beside memory.json at every compaction (goal + current pins + decisions); `0` turns it off |
+| staleRecall | true | GUARDIAN_STALE_RECALL | before a step, when the newest user message names a doc line (`doc01 L017`), a codename, a CamelCase name or a quoted string that only compacted turns still hold, append ONE `[context-guardian recall]` message (≤3 hits, ≤600 chars). On by default since 0.1.0-alpha.9 (benchmark: 12/12 current, 0 stale, early 3/3 over 3 runs); `0` turns it off |
+| postAnswerCheck | false | GUARDIAN_POST_ANSWER_CHECK | before a turn closes, if the final answer states an OLD value for a pinned subject (a later pin changed it), steer the model ONCE with the current pinned value. Off until the variant benchmark shows no regression |
 
 Precedence: environment variable > preset row config > default.
 

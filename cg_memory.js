@@ -6,6 +6,7 @@
 import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { applyProvenance, renderPinText } from './cg_provenance.js'
+import { CHARS_PER_TOKEN } from './cg_recall.js'
 
 /** Revision tag for this memory implementation. */
 export const MEMORY_REV = 'cg-memory-2'  // 2026-10-01: pins category + session-scoped render
@@ -91,9 +92,9 @@ export function emptyMemory() {
   return { version: MEMORY_VERSION, updated: null, items: [] }
 }
 
-/** Rough token estimate: ceil(chars / 3.5). */
+/** Rough token estimate: ceil(chars / CHARS_PER_TOKEN), the package-wide constant from cg_recall.js. */
 export function estTokens(text) {
-  return Math.ceil(String(text).length / 3.5)
+  return Math.ceil(String(text).length / CHARS_PER_TOKEN)
 }
 
 /** Lowercase, collapse whitespace runs, trim, strip trailing sentence punctuation. */
@@ -364,7 +365,7 @@ export function renderMemory(memory, opts = {}) {
     if (session !== null && SESSION_SCOPED.has(it.cat) && it.session !== session && it.session !== '') continue
     items.push(it)
   }
-  // C-Pin provenance (P44 A1, 2026-10-03): a pinned value that a LATER pin changed never renders again,
+  // C-Pin provenance (2026-10-03): a pinned value that a LATER pin changed never renders again,
   // and a pin whose every keyed fact changed is retired. memory.json keeps them all (audit).
   const provenance = applyProvenance(items.filter((it) => it.cat === 'pins'))
   for (let i = items.length - 1, k = provenance.length - 1; i >= 0; i--) {

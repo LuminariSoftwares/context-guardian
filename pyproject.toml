@@ -40,12 +40,13 @@ Issues = "https://github.com/LuminariSoftwares/context-guardian/issues"
 context-guardian = "context_guardian:main"
 context-guardian-doctor = "cg_doctor:main"
 context-guardian-configure = "cg_configure:main"
+context-guardian-recall = "cg_recall_cli:main"
 
 [tool.setuptools]
-py-modules = ["context_guardian", "cg_doctor", "cg_configure"]
+py-modules = ["context_guardian", "cg_doctor", "cg_configure", "cg_recall_cli"]
 # configure.py stays out of the wheel on purpose: a top-level module named `configure` would collide with
 # other packages. The wizard ships as cg_configure (console script `context-guardian-configure`); configure.py
-# is a 3-line shim for clones (P44 A0, 2026-10-03).
+# is a 3-line shim for clones (2026-10-03).
 
 # Pytest configuration.
 #

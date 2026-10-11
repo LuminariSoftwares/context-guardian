@@ -1,5 +1,5 @@
-// @studio: QA | Overseer probe for cg_provenance.js (P44 A1, C-Pin provenance), written from the contract before dispatch 2026-10-03
-// @job: none -- overseer-written contract probe, reference-checked before dispatch. Usage: node pins_provenance_smoke.mjs <dir>
+// Contract probe for cg_provenance.js (C-Pin provenance), written from the contract before the module, 2026-10-03.
+// Reference-checked before the module was written. Usage: node pins_provenance_smoke.mjs <dir>
 import { spawnSync } from 'node:child_process'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'

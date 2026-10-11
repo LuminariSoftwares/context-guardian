@@ -1,0 +1,91 @@
+name: privacy
+
+# Fails when a tracked file carries a private network address, a personal
+# Windows path, an API key or an e-mail address that should not be public.
+#
+# CI logs on a public repo are public, so this job prints ONLY file:line and
+# the NUMBER of the pattern that matched -- never the matched text and never
+# the pattern. Extra patterns (one regex per line) come from the repository
+# secret PRIVACY_EXTRA_PATTERNS; they are numbered after the built-in ones and
+# skipped quietly when the secret is empty (e.g. on a pull request from a fork).
+#
+# This file is excluded from the scan because it defines the patterns.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  privacy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: scan tracked files
+        env:
+          PRIVACY_EXTRA_PATTERNS: ${{ secrets.PRIVACY_EXTRA_PATTERNS }}
+        run: |
+          python3 - <<'PY'
+          import os, re, subprocess, sys
+
+          SELF = ".github/workflows/privacy.yml"
+
+          def tailnet(m):
+              # 100.64.0.0/10, except the documented placeholders 100.64.0.1-100.64.0.20
+              a, b, c, d = (int(x) for x in m.group(0).split("."))
+              return not (b == 64 and c == 0 and 1 <= d <= 20)
+
+          ALLOWED_EMAIL = re.compile(
+              r"^(luminarientertainment@gmail\.com"
+              r"|[^@]+@users\.noreply\.github\.com"
+              r"|[^@]+@(?:[a-z0-9-]+\.)*example\.com)$", re.I)
+
+          def email(m):
+              return not ALLOWED_EMAIL.match(m.group(0))
+
+          # (number, regex, extra check on the match or None)
+          PATTERNS = [
+              (1, re.compile(r"(?<![\d.])100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}(?![\d])"), tailnet),
+              (2, re.compile(r"\.ts\.net\b", re.I), None),
+              (3, re.compile(r"\bc:\\+users\\+", re.I), None),
+              (4, re.compile(r"\b[A-Za-z]:\\+AI"), None),
+              (5, re.compile(r"(?<![A-Za-z0-9_])(?:sk-or-|sk-|tvly-|ghp_|github_pat_|nvapi-|gsk_)[A-Za-z0-9_\-]{16,}"), None),
+              (6, re.compile(r"(?<![A-Za-z0-9_])AIza[0-9A-Za-z_\-]{20,}"), None),
+              (7, re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"), email),
+          ]
+
+          extra = [ln.strip() for ln in os.environ.get("PRIVACY_EXTRA_PATTERNS", "").splitlines() if ln.strip()]
+          bad_extra = False
+          for i, raw in enumerate(extra, start=len(PATTERNS) + 1):
+              try:
+                  PATTERNS.append((i, re.compile(raw), None))
+              except re.error:
+                  print(f"extra pattern {i} does not compile")
+                  bad_extra = True
+
+          files = subprocess.run(["git", "ls-files", "-z"], capture_output=True, check=True).stdout.split(b"\0")
+          hits = 0
+          scanned = 0
+          for f in files:
+              path = f.decode("utf-8", "replace")
+              if not path or path == SELF:
+                  continue
+              try:
+                  data = open(path, "rb").read()
+              except OSError:
+                  continue
+              if b"\0" in data[:8192]:
+                  continue  # binary
+              scanned += 1
+              text = data.decode("utf-8", "replace")
+              for lineno, line in enumerate(text.splitlines(), start=1):
+                  for num, rx, keep in PATTERNS:
+                      if any(keep is None or keep(m) for m in rx.finditer(line)):
+                          print(f"{path}:{lineno}: pattern {num}")
+                          hits += 1
+
+          print(f"privacy scan: {scanned} files, {len(PATTERNS)} patterns ({len(extra)} extra), {hits} hit(s)")
+          sys.exit(1 if hits or bad_extra else 0)
+          PY

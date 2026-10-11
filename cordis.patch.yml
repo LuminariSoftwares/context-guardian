@@ -9,9 +9,12 @@
 # names, so the proxy's .env and .bat launchers mean the same thing here) >
 # DSH settings namespace `context-guardian` > this row's config > default.
 #
-# PHASE 1 SCAFFOLD: this row loads the plugin shell only. It does not yet
-# touch compaction -- @deepseek-ai/dsh-compaction-basic stays exactly as the
-# profile has it.
+# This row loads the SETTINGS half only (index.js). Compaction is engine.js,
+# mounted as a row in the agent preset's `compaction` group by `npm run setup`
+# (see docs/dsh-integration.md); without that row
+# @deepseek-ai/dsh-compaction-basic stays exactly as the profile has it.
+# keepRecentMessages and maxRecallTokens were removed from this row: nothing
+# here read them. The engine row takes maxRecallTokens.
 - insert:
     - id: context-guardian
       name: dsh-context-guardian
@@ -24,16 +27,13 @@
         numCtx: 32768
         # Hard trigger (GUARDIAN_COMPACT_THRESHOLD).
         compactThreshold: 0.85
-        # Proactive trigger when the agent goes idle (Phase 3c). 0 = off, the default since 0.1.0-alpha.8:
+        # Proactive trigger when the agent goes idle. 0 = off, the default since 0.1.0-alpha.8:
         # an idle compaction rolls the whole chain up and bypasses append-only.
         idleCompactRatio: 0
-        # Most recent messages never compacted (GUARDIAN_KEEP_RECENT_MESSAGES).
-        keepRecentMessages: 8
         # Tokens held back for the reply (GUARDIAN_RESERVE_OUTPUT).
         reserveOutput: 8192
         # Span archive. '' = $GUARDIAN_SPAN_DIR, then the proxy's own default.
         spanDir: ''
-        maxRecallTokens: 16000
         maxSearchHits: 50
         # Tools whose compiled line keeps its key argument; [] = the compiler's
         # DEFAULT_ARG_TOOLS.

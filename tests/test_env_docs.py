@@ -1,6 +1,6 @@
 """Every GUARDIAN_* environment variable either engine reads is documented.
 
-P36 C3 (as re-scoped 2026-09-26): the Python proxy and the DSH engine are different
+As re-scoped 2026-09-26: the Python proxy and the DSH engine are different
 programs with different jobs, so behavioural parity reduces to one promise a user relies
 on -- a knob that exists in either front door is written down. This test reads the
 sources, not a hand-kept list, so a new env var without a docs row fails CI.

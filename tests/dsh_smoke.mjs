@@ -1,13 +1,23 @@
-// DSH-side smoke for the bundle entry. Run from the repo root after `pnpm install`:
+// DSH-side smoke for the bundle entry (part of `npm run test:node`). Run from the repo root after `npm install`:
 //   node tests/dsh_smoke.mjs
 // Uses a fake ctx (no DSH boot) and the real Python bridge (hello + spans only).
+import { readFileSync } from 'node:fs'
 import * as plugin from 'dsh-context-guardian'
 let pass = 0, total = 0
 const check = (name, cond) => { total++; if (cond) pass++; console.log(`  ${cond ? 'ok  ' : 'FAIL'} ${name}`) }
 const throws = (fn) => { try { fn(); return false } catch { return true } }
 const cfg = plugin.Config({})
 check('name_and_namespace', plugin.name === 'dsh-context-guardian' && plugin.SETTINGS_NAMESPACE === 'context-guardian')
-check('schema_defaults', cfg.numCtx === 32768 && cfg.compactThreshold === 0.85 && cfg.idleCompactRatio === 0.45 && cfg.maxRecallTokens === 16000 && cfg.maxSearchHits === 50)
+check('schema_defaults', cfg.numCtx === 32768 && cfg.compactThreshold === 0.85 && cfg.idleCompactRatio === 0 && cfg.maxSearchHits === 50)
+// keepRecentMessages and maxRecallTokens were read by nothing in the settings half (the engine row has its own
+// maxRecallTokens). They are gone from the schema, and a settings file that still carries them must still load.
+check('dead_options_removed', !('keepRecentMessages' in cfg) && !('maxRecallTokens' in cfg)
+  && !('keepRecentMessages' in plugin.resolveOptions(cfg, {})) && !('maxRecallTokens' in plugin.resolveOptions(cfg, {})))
+check('old_settings_with_dead_keys_still_load', !throws(() => plugin.Config({ keepRecentMessages: 8, maxRecallTokens: 16000 })))
+const indexSrc = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
+const patchSrc = readFileSync(new URL('../cordis.patch.yml', import.meta.url), 'utf8')
+check('header_is_honest', !/PHASE 1|Phase 3/i.test(indexSrc) && indexSrc.includes('engine.js') && !/PHASE 1/i.test(patchSrc)
+  && !/^\s+(keepRecentMessages|maxRecallTokens):/m.test(patchSrc))
 check('schema_refuses_out_of_range_ratio', throws(() => plugin.Config({ compactThreshold: 1.5 })))
 check('env_beats_section', plugin.resolveOptions(cfg, { GUARDIAN_NUM_CTX: '8192', GUARDIAN_COMPACT_THRESHOLD: '0.7' }).numCtx === 8192
   && plugin.resolveOptions(cfg, { GUARDIAN_COMPACT_THRESHOLD: '0.7' }).compactThreshold === 0.7)
@@ -18,16 +28,17 @@ check('empty_toolArgTools_means_compiler_default', plugin.resolveOptions(cfg, {}
 check('idle_must_be_below_hard', throws(() => plugin.validateSection({ ...cfg, idleCompactRatio: 0.9 })) && !throws(() => plugin.validateSection(cfg)))
 const disposers = []; const injected = []; const logs = []; const listeners = []
 const logger = Object.fromEntries(['debug', 'info', 'warn', 'error'].map(l => [l, m => logs.push(`${l}: ${m}`)]))
-const refuse = what => () => { throw new Error(`phase 1 must not ${what}`) }
+const refuse = what => () => { throw new Error(`the settings half must not ${what}`) }
 const ctx = { logger, inject: (deps, cb) => injected.push({ deps, cb }), effect: fn => disposers.push(fn()), on: (...a) => listeners.push(a), tools: { register: refuse('register tools') } }
 process.chdir('/')
 plugin.apply(ctx, cfg)
 check('apply_refuses_bad_row', throws(() => plugin.apply(ctx, { ...cfg, idleCompactRatio: 0.95 })))
-check('no_listeners_in_phase_1', listeners.length === 0)
+check('no_listeners_in_settings_half', listeners.length === 0)
 let section = null
 injected[0].cb({ settings: { installSection: (owner, ns, schema, entry, hooks) => { section = { owner, ns, hooks } } } })
 check('settings_section_with_validate', injected[0].deps.join() === 'settings' && section.ns === 'context-guardian' && typeof section.hooks.validate === 'function')
-check('load_line_names_compiler_rev', logs.some(l => l.startsWith('info: context-guardian scaffold loaded (compiler vcc-')))
+check('load_line_names_compiler_rev', logs.some(l => l.startsWith('info: context-guardian settings loaded (compiler vcc-')))
+check('load_line_is_honest', logs.some(l => l.includes('compaction is the engine row')) && !logs.some(l => /phase 1/i.test(l)))
 const bridge = new plugin.PythonBridge(plugin.resolveOptions(cfg, {}), logger)
 const hello = await bridge.request('hello')
 const spans = await bridge.request('spans', { limit: 3 })

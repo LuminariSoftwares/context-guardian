@@ -1,4 +1,4 @@
-// P44 A3 seam (2026-10-03, written before the engine.js splice -- red first): with staleRecall on, agent/pre-step
+// C-Recall stage (a) seam (2026-10-03, written before the engine.js splice -- red first): with staleRecall on, agent/pre-step
 // appends ONE recall message for a doc line that lives only in compacted turns; off by default; never breaks a step.
 // usage: node tests/autorecall_engine_smoke.mjs   (exit 0 iff "0 failed")
 import { mkdtempSync, rmSync } from 'node:fs'
@@ -42,7 +42,7 @@ const run = async (cfg) => {
 }
 try {
   delete process.env.GUARDIAN_STALE_RECALL
-  // 0.1.0-alpha.9 (2026-10-04): ON by default (P44 bench); `staleRecall: false` is the opt-out.
+  // 0.1.0-alpha.9 (2026-10-04): ON by default (benchmark); `staleRecall: false` is the opt-out.
   const dflt = await run({})
   check('default_is_on_and_appends_one_recall', dflt.decision.messages.length === 2)
   const off = await run({ staleRecall: false })

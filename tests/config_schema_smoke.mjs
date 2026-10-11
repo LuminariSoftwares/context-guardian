@@ -1,5 +1,5 @@
 // The bundle's own patch row must pass its own Config schema (2026-10-03: idleCompactRatio defaulted to 0 while
-// ratio() demanded >= 0.05, so DSH refused to load the plugin -- "invalid config" -- on the bench1003 profile).
+// ratio() demanded >= 0.05, so DSH refused to load the plugin -- "invalid config" -- on a benchmark profile).
 // usage: node tests/config_schema_smoke.mjs
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
