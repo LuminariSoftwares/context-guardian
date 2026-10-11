@@ -203,7 +203,7 @@ async def test_the_users_task_survives_a_refused_compaction(guardian, monkeypatc
 
     monkeypatch.setattr(guardian, "summarize_older_messages", _empty_summarize)
 
-    task = "TASK: write n8n_task_broker_port.md and set the port to 5680"
+    task = "TASK: write docs/port_settings.md and set the port to 5680"
     messages = [{"role": "user", "content": task + " " + "x" * 4000}]
     messages += [{"role": "assistant", "content": "x" * 4000} for _ in range(4)]
     payload = {"model": "test-model", "messages": messages}
@@ -271,10 +271,10 @@ def test_stats_exposes_the_new_guard(guardian):
 # ---------------------------------------------------------------------------
 # The transcript is DATA, not instructions. 2026-08-26.
 #
-# Measured by replaying real spans (scripts/guardian_summary_probe.py --span):
-# the unfenced prompt made the summariser ACT on the conversation it was asked
+# Measured by replaying real archived spans through the summariser: the
+# unfenced prompt made the summariser ACT on the conversation it was asked
 # to condense -- a headroom_retrieve tool call via Headroom, and 6.8k chars of
-# "We need to do tasks: call tool mcp__luminari-scripts__vault_path..." via raw
+# "We need to do tasks: call tool mcp__<server>__<tool>..." via raw
 # Ollama. Both returned content "". Fenced, same span, same backend: 581 chars
 # of real summary, finish_reason "stop", no tool calls.
 #
@@ -548,15 +548,15 @@ def test_a_window_smaller_than_the_reserve_does_not_collapse_to_one(guardian, nu
 def test_the_shipped_defaults_are_not_one_persons_machine(guardian):
     r"""A public repo must not default to one maintainer's absolute path.
 
-    It shipped as r"F:\AI\LuminariStudio\logs\guardian_spans". On Linux and
-    macOS that is not an absolute path at all -- it is a SINGLE filename
-    containing backslashes, so mkdir(parents=True) created a directory called
-    `F:\AI\LuminariStudio\logs\guardian_spans` in the working directory, moved
+    It shipped as a Windows absolute path, e.g. r"C:\\example\\logs\\guardian_spans".
+    On Linux and macOS that is not an absolute path at all -- it is a SINGLE
+    filename containing backslashes, so mkdir(parents=True) created a directory
+    called `C:\\example\\logs\\guardian_spans` in the working directory, moved
     whenever the proxy was started from elsewhere, and warned about nothing.
 
-    The property is DERIVED FROM THE REPO, not "not on drive F:" -- this repo
-    legitimately lives on F: on the maintainer's box, and the first version of
-    this test failed for exactly that reason.
+    The property is DERIVED FROM THE REPO, not "not on drive C:" -- a checkout
+    can legitimately live on any drive, and the first version of this test
+    failed for exactly that reason.
     """
     # Re-import with the overrides REMOVED. The shared fixture points both of
     # these at tmp_path, so asserting on `guardian.SPAN_DIR` tests the override
@@ -578,17 +578,17 @@ def test_the_shipped_defaults_are_not_one_persons_machine(guardian):
     # And the literal must be gone from the CODE -- not from the commentary.
     #
     # Checking the whole file failed here, because the comment explaining this
-    # very bug quotes the old path. That is the third time in one day this
-    # codebase has been bitten by a detector matching prose (selftest_sweep on
-    # the word "--selftest", backup_state greping itself for "rmtree"). The
-    # rule earned its place: A DETECTOR MUST NOT BE FINDABLE BY ITSELF.
+    # very bug quoted the old path: a detector matching prose instead of code.
+    # The rule earned its place: A DETECTOR MUST NOT BE FINDABLE BY ITSELF.
     #
-    # Needle built by concatenation for the same reason.
-    needle = "Luminari" + "Studio"
+    # Any drive-letter path (X:\) in executable code is the bug, whatever the
+    # folder. Comments are skipped; the module docstring contains none.
+    import re as _re
+    drive_path = _re.compile(r"[A-Za-z]:" + _re.escape("\\"))
     code = "\n".join(ln for ln in Path(fresh.__file__)
                      .read_text(encoding="utf-8").splitlines()
                      if not ln.strip().startswith("#"))
-    offenders = [ln for ln in code.splitlines() if needle in ln]
+    offenders = [ln for ln in code.splitlines() if drive_path.search(ln)]
     assert not offenders, (
         "a machine-specific path is hardcoded in executable code: %s"
         % offenders[:3])
@@ -893,7 +893,7 @@ def test_the_documented_defaults_match_the_code(guardian):
     """README/code drift is a real bug in a repo people clone.
 
     Three defaults disagreed with the README: the upstream URL (code pointed
-    at the maintainer's private Headroom layer on :8787, README said Ollama on
+    at a Headroom layer on :8787 that existed on one machine, README said Ollama on
     :11434), and both log/span paths. A stranger following the README got a
     proxy pointed at a port nothing was listening on.
     """

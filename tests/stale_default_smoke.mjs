@@ -1,5 +1,5 @@
-// P44 release (2026-10-04): A3 stale recall is ON by default -- it passed its bar on the variant bench
-// (temp\bench1003\cg: S1/S2/S3 12/12 current, 0 stale, early 3/3; pins-only R1/R2 9-12/12 with 3 stale).
+// 0.1.0-alpha.9 (2026-10-04): stale recall is ON by default -- it passed its bar on the variant benchmark
+// (S1/S2/S3 12/12 current, 0 stale, early 3/3; pins-only R1/R2 9-12/12 with 3 stale).
 // Written red first against 0.1.0-alpha.8's `staleRecall: false`.
 import fs from "node:fs";
 import path from "node:path";

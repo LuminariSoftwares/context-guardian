@@ -1,4 +1,4 @@
-// cg_postcheck.js -- context-guardian postcheck (TJ plan P44 A4, C-Recall stage b).
+// cg_postcheck.js -- context-guardian postcheck (C-Recall stage b: steer a final answer that states a stale pinned value).
 //
 // Pure module: finds statements in the model's final answer that state a STALE value
 // for a subject the user has pinned, and renders a one-shot steering correction.

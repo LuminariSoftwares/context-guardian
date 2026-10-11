@@ -1,4 +1,4 @@
-// P44 A4 seam (2026-10-03, written before the engine.js splice -- red first): with postAnswerCheck on, a final answer that
+// C-Recall stage (b) seam (2026-10-03, written before the engine.js splice -- red first): with postAnswerCheck on, a final answer that
 // states an OLD value for a pinned subject is steered exactly once per turn; current answers and the default (off) are silent.
 // usage: node tests/autorecall_steer_smoke.mjs   (exit 0 iff "0 failed")
 import { mkdtempSync, rmSync } from 'node:fs'

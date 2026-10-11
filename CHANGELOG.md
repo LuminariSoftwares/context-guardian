@@ -399,7 +399,7 @@ neither.
   8192) compacted on *every request, forever*. A reserve that does not fit is
   now clamped to half the window and logged once.
 - **Machine-specific absolute paths shipped as defaults.** `SPAN_DIR` and
-  `LOG_PATH` defaulted to `F:\AI\LuminariStudio\...`. On Linux and macOS that
+  `LOG_PATH` defaulted to a Windows absolute path such as `C:\\example\\logs\\guardian_spans`. On Linux and macOS that
   is not an absolute path at all — it is a single filename containing
   backslashes, so the archive was silently created in the working directory
   under a name nobody would look for. Both now default inside the repo.

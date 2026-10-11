@@ -104,10 +104,10 @@ export const DEFAULTS = Object.freeze({
   chainMaxTokens: 0,
   chainMaxCheckpoints: 4,
   anchorCheck: 'repair',
-  // C-Recall stage (a): ON by default since 0.1.0-alpha.9 -- the P44 variant bench cleared its bar (S1/S2/S3
+  // C-Recall stage (a): ON by default since 0.1.0-alpha.9 -- the variant benchmark cleared its bar (S1/S2/S3
   // 12/12 current, 0 stale, early 3/3). `staleRecall: false` or GUARDIAN_STALE_RECALL=0 turns it off.
   staleRecall: true,
-  // C-Recall stage (b): off until the variant bench shows it does not regress (P44 A4).
+  // C-Recall stage (b): off until the variant benchmark shows it does not regress.
   postAnswerCheck: false,
 })
 
@@ -179,7 +179,7 @@ export function resolveEngineOptions(config = {}, env = process.env) {
     // One recall may never take more than a quarter of the window it lands in.
     // One recall may never take more than a quarter of the window it lands in. When the user pinned the window,
     // cap here; otherwise the quarter cap is applied per session at use (doRecall) against the model's real window --
-    // capping by the default numCtx would pin every big-model user at 8192 (O5 2026-09-25).
+    // capping by the default numCtx would pin every big-model user at 8192 (2026-09-25).
     maxRecallTokens: numCtxExplicit
       ? Math.min(Math.floor(num('GUARDIAN_MAX_RECALL_TOKENS', 'maxRecallTokens', 100, 1_000_000)), Math.floor(numCtx / 4))
       : Math.floor(num('GUARDIAN_MAX_RECALL_TOKENS', 'maxRecallTokens', 100, 1_000_000)),
@@ -741,7 +741,7 @@ export function apply(ctx, config) {
   }
 
   /**
-   * C-Handoff (P44 A2, 2026-10-03): after a compaction, write handoff_<session>.json/.md and handoff_latest.json
+   * C-Handoff (2026-10-03): after a compaction, write handoff_<session>.json/.md and handoff_latest.json
    * beside memory.json, so another session -- or Claude through escalate_to_claude -- can pick the work up from
    * the goal and pins alone. GUARDIAN_HANDOFF=0 (or config handoff: false) turns it off. Never throws.
    */
@@ -1074,7 +1074,7 @@ export function apply(ctx, config) {
     if (status === 'idle') recallCount.delete(agent)
   })
 
-  // ── C-Recall stage (b) (P44 A4, 2026-10-03): a final answer that states an OLD value for a pinned subject is
+  // ── C-Recall stage (b) (2026-10-03): a final answer that states an OLD value for a pinned subject is
   // steered ONCE per turn with the current pinned value. Pins come from the whole session log (live and compacted),
   // so an update still in the window counts. Opt-in (postAnswerCheck / GUARDIAN_POST_ANSWER_CHECK=1); never throws.
   if (options.postAnswerCheck) {
@@ -1102,7 +1102,7 @@ export function apply(ctx, config) {
     })
   }
 
-  // ── C-Recall stage (a) (P44 A3, 2026-10-03): a name in the newest user message that only compacted
+  // ── C-Recall stage (a) (2026-10-03): a name in the newest user message that only compacted
   // turns still hold is shown again as ONE extra message. Opt-in (staleRecall / GUARDIAN_STALE_RECALL=1);
   // any error leaves the step exactly as it was.
   if (options.staleRecall) {

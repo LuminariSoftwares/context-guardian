@@ -1,5 +1,5 @@
-// tests/anchors_engine_smoke.mjs -- contract probe for the engine.js anchor check (P36 C2b).
-// Written by the overseer FROM THE CONTRACT before the wiring existed. Fake cordis ctx +
+// tests/anchors_engine_smoke.mjs -- contract probe for the engine.js anchor check.
+// Written FROM THE CONTRACT before the wiring existed. Fake cordis ctx +
 // fake compaction service, as in engine_smoke.mjs. No network.
 // Prints `anchors_engine_smoke: N checks, N passed, M failed`.
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'

@@ -1,5 +1,5 @@
-// tests/anchors_smoke.mjs -- contract probe for cg_anchors.js (P36 C2a).
-// Written by the overseer FROM THE CONTRACT before the module existed. No framework,
+// tests/anchors_smoke.mjs -- contract probe for cg_anchors.js.
+// Written FROM THE CONTRACT before the module existed. No framework,
 // no network, no filesystem. Prints `anchors_smoke: N checks, N passed, M failed`.
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -35,12 +35,12 @@ check('extracts_each_anchor_kind', () => {
   const text = [
     'We set `MAX_RETRIES` to 5.',
     'Docs at https://example.org/guide/start.html, see there.',
-    'Edited F:\\AI\\proj\\worker.py and src/app/main.ts today.',
+    'Edited C:\\path\\to\\proj\\worker.py and src/app/main.ts today.',
     'Also touched config.yml.',
     'Then call build_index(root) again.',
   ].join('\n')
   const got = mod.extractAnchors(text)
-  const want = ['MAX_RETRIES', 'https://example.org/guide/start.html', 'F:\\AI\\proj\\worker.py', 'src/app/main.ts', 'config.yml', 'build_index']
+  const want = ['MAX_RETRIES', 'https://example.org/guide/start.html', 'C:\\path\\to\\proj\\worker.py', 'src/app/main.ts', 'config.yml', 'build_index']
   return want.every(w => got.includes(w))
 })
 

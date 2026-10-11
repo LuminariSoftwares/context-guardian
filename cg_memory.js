@@ -365,7 +365,7 @@ export function renderMemory(memory, opts = {}) {
     if (session !== null && SESSION_SCOPED.has(it.cat) && it.session !== session && it.session !== '') continue
     items.push(it)
   }
-  // C-Pin provenance (P44 A1, 2026-10-03): a pinned value that a LATER pin changed never renders again,
+  // C-Pin provenance (2026-10-03): a pinned value that a LATER pin changed never renders again,
   // and a pin whose every keyed fact changed is retired. memory.json keeps them all (audit).
   const provenance = applyProvenance(items.filter((it) => it.cat === 'pins'))
   for (let i = items.length - 1, k = provenance.length - 1; i >= 0; i--) {

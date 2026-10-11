@@ -1,5 +1,5 @@
-// @studio: QA | Overseer probe for cg_postcheck.js (P44 A4 C-Recall stage b), written from the contract before dispatch 2026-10-03
-// @job: none -- overseer-written contract probe. Usage: node postcheck_smoke.mjs <dir>  (dir holds cg_postcheck.js + cg_provenance.js)
+// Contract probe for cg_postcheck.js (C-Recall stage b), written from the contract before the module, 2026-10-03.
+// Usage: node postcheck_smoke.mjs <dir>  (dir holds cg_postcheck.js + cg_provenance.js)
 import { spawnSync } from 'node:child_process'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'

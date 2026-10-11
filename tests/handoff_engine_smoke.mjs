@@ -1,4 +1,4 @@
-// P44 A2 seam: the engine writes the hand-off files at compaction/end (C-Handoff), 2026-10-03.
+// C-Handoff seam: the engine writes the hand-off files at compaction/end (C-Handoff), 2026-10-03.
 // usage: node tests/handoff_engine_smoke.mjs   (exit 0 iff "0 failed")
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'

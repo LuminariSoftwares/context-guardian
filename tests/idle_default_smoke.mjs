@@ -1,7 +1,7 @@
-// The idle trigger is OFF by default on EVERY install path (P36 / P44 A0, 2026-10-03).
+// The idle trigger is OFF by default on EVERY install path (2026-10-03).
 // engine.js and docs/dsh-integration.md said off since 0.1.0-alpha.8, but the npm entry (index.js schema) and the
 // bundle patch (cordis.patch.yml) still shipped 0.45 -- so a public install compacted on idle and the append-only
-// chain never ran (temp\p36default\REPORT.md run 1: 17 idle compactions, 0 chain events).
+// chain never ran (measured run: 17 idle compactions, 0 chain events).
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
