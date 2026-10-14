@@ -38,8 +38,9 @@ def load(monkeypatch, tmp_path, **env):
 def wire(g, show=None):
     """Point the proxy at a stub. Records every request the stub receives.
 
-    Chat calls without `stream` are the summariser and get SUMMARY back; every
-    other chat call gets a two-frame SSE stream. `show` answers /api/show.
+    The summariser's call (its prompt carries BEGIN_TRANSCRIPT) gets SUMMARY
+    back; every other chat call gets a two-frame SSE stream. `show` answers
+    /api/show.
     """
     seen = {"chat": [], "show": []}
 
@@ -50,8 +51,7 @@ def wire(g, show=None):
                 return httpx.Response(404, json={"error": "not found"})
             return show(request)
         body = request.content
-        payload = json.loads(body) if body else {}
-        if payload.get("stream") is False:
+        if b"BEGIN_TRANSCRIPT" in body:
             return httpx.Response(200, json={"choices": [{"message": {
                 "role": "assistant", "content": SUMMARY}, "finish_reason": "stop"}]})
         seen["chat"].append(body)

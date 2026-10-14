@@ -293,7 +293,8 @@ cp .env.example .env
 |---|---|---|
 | `GUARDIAN_PORT` | `8786` | Port Guardian itself listens on |
 | `GUARDIAN_UPSTREAM_URL` | `http://localhost:11434/v1` | The OpenAI-compatible backend Guardian forwards to |
-| `GUARDIAN_NUM_CTX` | `32768` | Your model's real context window, in tokens — keep this in sync with your actual backend/model config |
+| `GUARDIAN_NUM_CTX` | `32768` | Your model's real context window, in tokens — keep this in sync with your actual backend/model config. On Ollama the proxy can read it per model instead: see `GUARDIAN_OLLAMA_CONTEXT` |
+| `GUARDIAN_OLLAMA_CONTEXT` | `auto` | When the upstream is Ollama (`auto`: the upstream URL is on port 11434; `1` always, `0` never), ask `/api/show` once per model and budget against the `num_ctx` it reports. A model that reports only its trained `context_length` can lower `GUARDIAN_NUM_CTX` but never raise it, since Ollama may run it at less. Any error falls back to `GUARDIAN_NUM_CTX` for that model for the rest of the run |
 | `GUARDIAN_COMPACT_THRESHOLD` | `0.85` | Fraction of `GUARDIAN_NUM_CTX` at which compaction triggers |
 | `GUARDIAN_KEEP_RECENT_MESSAGES` | unset | Unset (the default): keep the newest messages that fit in `GUARDIAN_KEEP_RECENT_FRACTION` of the usable window (`GUARDIAN_NUM_CTX` − `GUARDIAN_RESERVE_OUTPUT`), never fewer than 4 — a 40 KB tool result counts as what it is, not as one message. Set a number to keep exactly that many messages instead (the old fixed-count behaviour; `0` keeps none) |
 | `GUARDIAN_KEEP_RECENT_FRACTION` | `0.20` | Share of the usable window kept verbatim when `GUARDIAN_KEEP_RECENT_MESSAGES` is unset |
@@ -372,7 +373,7 @@ Standard library only; it never changes a file.
 
 ## Running multiple models with different context windows
 
-Guardian's `GUARDIAN_NUM_CTX` is fixed for the lifetime of one running instance. If you switch between models with meaningfully different context windows, either:
+On Ollama, Guardian asks `/api/show` for each model's `num_ctx` (see `GUARDIAN_OLLAMA_CONTEXT`), so a model whose Modelfile sets `num_ctx` is budgeted against its own window. Otherwise `GUARDIAN_NUM_CTX` is fixed for the lifetime of one running instance. If you switch between models with meaningfully different context windows, either:
 
 - run a second Guardian instance on a different `GUARDIAN_PORT` with its own `GUARDIAN_NUM_CTX`, or
 - keep one instance and accept that its threshold is tuned to whichever model has the smaller/more-constrained window (safer than the alternative, since it just means Guardian compacts a bit earlier than strictly necessary for the larger-window model).

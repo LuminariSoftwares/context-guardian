@@ -79,6 +79,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, Request
@@ -153,6 +154,16 @@ CHARS_PER_TOKEN_ESTIMATE = float(os.environ.get("GUARDIAN_CHARS_PER_TOKEN", "3.5
 # request and the model IS charged for it. Set GUARDIAN_COUNT_TOOLS=0 to get
 # the old messages-only behaviour back if this ever needs bisecting.
 COUNT_TOOLS = os.environ.get("GUARDIAN_COUNT_TOOLS", "1") not in ("0", "false", "False")
+
+# OLLAMA_CONTEXT: when the upstream is Ollama, ask /api/show once per model for
+# the window it really runs at, instead of trusting GUARDIAN_NUM_CTX to have
+# been kept in step by hand. "auto" (default) means "the upstream is on
+# Ollama's port 11434"; "1" always asks, "0" never does. Any error falls back
+# to GUARDIAN_NUM_CTX for that model.
+OLLAMA_CONTEXT = os.environ.get("GUARDIAN_OLLAMA_CONTEXT", "auto").strip().lower()
+OLLAMA_DEFAULT_PORT = 11434
+# /api/show answers from disk in milliseconds; this only bounds a hung server.
+OLLAMA_SHOW_TIMEOUT_SECONDS = 5.0
 
 # DRY_RUN: compute every compaction (summary included) and log it as a
 # `dry_run` event, but forward the client's request byte-for-byte. For watching
@@ -352,6 +363,10 @@ _state = {
     # the tokens they would have removed.
     "dry_runs": 0,
     "dry_run_tokens_saved_total": 0,
+    # The window and input budget the latest request was measured against.
+    # Differs from num_ctx when Ollama's /api/show reported the model's own.
+    "last_num_ctx": NUM_CTX,
+    "last_input_budget": 0,
 }
 
 # When this process started, for the health view's uptime line.
@@ -603,6 +618,75 @@ async def _lifespan(_app: FastAPI):
 app = FastAPI(title="Context Guardian", lifespan=_lifespan)
 
 
+# model name -> window /api/show reported, or None when asking failed. Filled
+# once per model and kept for the life of the process.
+_ollama_windows: Dict[str, Optional[int]] = {}
+
+
+def upstream_is_ollama() -> bool:
+    if OLLAMA_CONTEXT in ("0", "false", "no", "off"):
+        return False
+    if OLLAMA_CONTEXT in ("1", "true", "yes", "on"):
+        return True
+    try:
+        return urlparse(UPSTREAM_URL).port == OLLAMA_DEFAULT_PORT
+    except ValueError:
+        return False
+
+
+def window_from_show(data: Any) -> Optional[int]:
+    """The context window out of an /api/show response, or None. May raise on
+    junk; the caller treats any exception as "unknown".
+
+    `num_ctx` in the model's parameters is the window Ollama will actually run
+    the model at, so it wins. `<arch>.context_length` is only the model's
+    TRAINED maximum: Ollama may run it at far less, and believing the bigger
+    number would make this proxy compact late -- the overflow it exists to
+    stop. So context_length can only LOWER the configured window, never raise it.
+    """
+    params = data.get("parameters")
+    if isinstance(params, str):
+        for line in params.splitlines():
+            fields = line.split()
+            if len(fields) == 2 and fields[0] == "num_ctx":
+                n = int(fields[1])
+                if n > 0:
+                    return n
+    info = data.get("model_info")
+    if isinstance(info, dict):
+        for key, value in info.items():
+            if (key.endswith(".context_length") and isinstance(value, int)
+                    and not isinstance(value, bool) and value > 0):
+                return min(value, NUM_CTX)
+    return None
+
+
+async def context_window(client: httpx.AsyncClient, model: str) -> int:
+    """The window to budget this model against. GUARDIAN_NUM_CTX unless the
+    upstream is Ollama and /api/show says otherwise. Never raises."""
+    if not model or not upstream_is_ollama():
+        return NUM_CTX
+    if model not in _ollama_windows:
+        found = None
+        root = UPSTREAM_URL.rstrip("/")
+        if root.endswith("/v1"):
+            root = root[:-3]
+        try:
+            resp = await client.post(f"{root}/api/show", json={"model": model},
+                                     timeout=OLLAMA_SHOW_TIMEOUT_SECONDS)
+            resp.raise_for_status()
+            found = window_from_show(resp.json())
+            log.info("Ollama reports a %s-token window for %s%s.",
+                     found if found else "unstated", model,
+                     "" if found else "; using GUARDIAN_NUM_CTX=%d" % NUM_CTX)
+        except Exception as exc:                           # noqa: BLE001
+            log.warning("Ollama /api/show for %s failed (%s: %s); using "
+                        "GUARDIAN_NUM_CTX=%d for this model.", model,
+                        type(exc).__name__, exc, NUM_CTX)
+        _ollama_windows[model] = found
+    return _ollama_windows[model] or NUM_CTX
+
+
 def estimate_tool_tokens(payload: Dict[str, Any]) -> int:
     """What the `tools` array costs.
 
@@ -818,7 +902,8 @@ def keep_recent_count(non_system: List[Dict[str, Any]], num_ctx: int = None,
     return min(len(non_system), max(n, KEEP_RECENT_MIN_MESSAGES))
 
 
-def partition_messages(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+def partition_messages(messages: List[Dict[str, Any]],
+                       num_ctx: int = None) -> Dict[str, Any]:
     """Split a conversation into what is kept, retired, and summarised.
 
     Pure -- no HTTP, no clock, no globals beyond config. Split out of
@@ -839,7 +924,7 @@ def partition_messages(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     kept_summaries = prior[len(prior) - keep_n:] if keep_n else []
     retired_summaries = prior[:len(prior) - len(kept_summaries)]
 
-    keep = keep_recent_count(non_system)
+    keep = keep_recent_count(non_system, num_ctx=num_ctx)
     cut = len(non_system) - keep if keep else len(non_system)
     cut = max(0, min(cut, len(non_system)))
     cut = _safe_cut(non_system, cut)
@@ -1278,7 +1363,10 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
     # Compact against the budget the INPUT is actually allowed to occupy, which
     # is the window minus the space the model needs to think and answer. Take
     # whichever limit is stricter so lowering COMPACT_THRESHOLD still works.
-    threshold_tokens = effective_threshold()
+    num_ctx = await context_window(client, calib_model)
+    threshold_tokens = effective_threshold(num_ctx=num_ctx)
+    _state["last_num_ctx"] = num_ctx
+    _state["last_input_budget"] = threshold_tokens
 
     # Tool definitions are a FLOOR, not a thing compaction can reduce -- this
     # proxy can only summarise messages. Say so out loud the first time a
@@ -1286,18 +1374,18 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
     # is looking at the real cause instead of blaming the summariser.
     if tool_tokens and tool_tokens != _state.get("logged_tool_tokens"):
         _state["logged_tool_tokens"] = tool_tokens
-        share = tool_tokens / NUM_CTX if NUM_CTX else 0
+        share = tool_tokens / num_ctx if num_ctx else 0
         log.info("Tool definitions in this request: ~%d tokens (%.1f%% of %d). "
                  "Compaction CANNOT reduce this -- only loading fewer MCP "
-                 "servers can.", tool_tokens, share * 100, NUM_CTX)
+                 "servers can.", tool_tokens, share * 100, num_ctx)
         log_event({"event": "tool_budget", "tool_tokens": tool_tokens,
-                   "num_ctx": NUM_CTX, "share_of_ctx": round(share, 3),
+                   "num_ctx": num_ctx, "share_of_ctx": round(share, 3),
                    "note": "fixed floor; not reducible by compaction"})
-        usable = NUM_CTX - RESERVE_OUTPUT - tool_tokens
+        usable = num_ctx - RESERVE_OUTPUT - tool_tokens
         log.info("Budget for conversation after tools and reserved output: "
                  "~%d tokens (window %d - reserve %d - tools %d).",
-                 usable, NUM_CTX, RESERVE_OUTPUT, tool_tokens)
-        log_event({"event": "budget", "num_ctx": NUM_CTX,
+                 usable, num_ctx, RESERVE_OUTPUT, tool_tokens)
+        log_event({"event": "budget", "num_ctx": num_ctx,
                    "reserve_output": RESERVE_OUTPUT, "tool_tokens": tool_tokens,
                    "usable_for_messages": usable})
         if usable < 4000:
@@ -1306,21 +1394,21 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
                         "model to skip MCP tools and fall back to built-ins. "
                         "Load fewer MCP servers -- compaction cannot help here.",
                         usable, tool_tokens, RESERVE_OUTPUT)
-        if tool_tokens >= NUM_CTX:
+        if tool_tokens >= num_ctx:
             log.warning("TOOL DEFINITIONS ALONE (%d) EXCEED THE WHOLE CONTEXT "
                         "WINDOW (%d). Nothing this proxy does can fix that. "
                         "Launch with --strict-mcp-config and a smaller server "
-                        "set.", tool_tokens, NUM_CTX)
+                        "set.", tool_tokens, num_ctx)
 
     if estimated < threshold_tokens or len(messages) <= KEEP_RECENT_MESSAGES + 1:
         return payload
 
     log.info(
         "Estimated %d tokens >= threshold %d (%.0f%% of %d) -- compacting.",
-        estimated, threshold_tokens, COMPACT_THRESHOLD * 100, NUM_CTX,
+        estimated, threshold_tokens, COMPACT_THRESHOLD * 100, num_ctx,
     )
 
-    part = partition_messages(messages)
+    part = partition_messages(messages, num_ctx=num_ctx)
     system_msgs = part["real_system"] + part["kept_summaries"]
     to_summarize = part["to_summarize"]
     to_keep = part["to_keep"]
@@ -1354,7 +1442,7 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
             "happening.",
             "None" if summary is None
             else "%d usable chars" % len(summary.strip()),
-            MIN_SUMMARY_CHARS, len(to_summarize), estimated, NUM_CTX,
+            MIN_SUMMARY_CHARS, len(to_summarize), estimated, num_ctx,
             _state["summaries_rejected_empty"])
         log_event({"event": "compaction_refused",
                    "reason": "empty_or_short_summary",
@@ -1362,7 +1450,7 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
                    "min_summary_chars": MIN_SUMMARY_CHARS,
                    "messages_not_evicted": len(to_summarize),
                    "estimated_tokens": estimated,
-                   "num_ctx": NUM_CTX})
+                   "num_ctx": num_ctx})
         return payload
 
     if DRY_RUN:
@@ -1423,7 +1511,7 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
         # the moment the operator most wants to know the proxy acted and that it
         # did not silently drop anything -- span_written says the evicted text is
         # on disk, tokens_saved says how much room it bought.
-        pct = (100.0 * tokens_after / NUM_CTX) if NUM_CTX else 0.0
+        pct = (100.0 * tokens_after / num_ctx) if num_ctx else 0.0
         span_note = (f"archived -> {span_path}" if span_path
                      else "NOT archived (span write skipped)")
         cost_line = ""
@@ -1441,7 +1529,7 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
             "  +-----------------------------------------------------------",
             _state["compactions_performed"], len(messages), len(new_messages),
             estimated, tokens_after, tokens_saved, tool_tokens,
-            tokens_after, NUM_CTX, pct, span_note, cost_line,
+            tokens_after, num_ctx, pct, span_note, cost_line,
         )
     else:
         log.info(
@@ -1590,6 +1678,8 @@ async def stats():
         "update_available": _update_notice is not None,
         "verbose": VERBOSE,
         "dry_run": DRY_RUN,
+        "ollama_context_enabled": upstream_is_ollama(),
+        "ollama_context": {m: n for m, n in _ollama_windows.items() if n},
         "uptime_seconds": round(time.time() - STARTED_AT, 1),
         "cost_per_1m_input_usd": COST_PER_1M_INPUT_USD,
         "cost_saved_usd": cost_saved_usd(),
@@ -1814,7 +1904,7 @@ async function tick(){
   $("status").className="pill ok";$("status").textContent="live";
   $("ver").textContent="v"+(s.version||"?");
   $("upstream").textContent="-> "+(s.upstream||"");
-  budget=e.effective_input_budget||s.effective_input_budget||s.num_ctx||1;
+  budget=s.last_input_budget||e.effective_input_budget||s.effective_input_budget||s.num_ctx||1;
 
   const used=s.last_known_total_tokens||0, up=pct(used), rejected=s.summaries_rejected_empty||0;
   $("cards").innerHTML=[
