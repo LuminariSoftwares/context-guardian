@@ -379,6 +379,20 @@ On Ollama, Guardian asks `/api/show` for each model's `num_ctx` (see `GUARDIAN_O
 - run a second Guardian instance on a different `GUARDIAN_PORT` with its own `GUARDIAN_NUM_CTX`, or
 - keep one instance and accept that its threshold is tuned to whichever model has the smaller/more-constrained window (safer than the alternative, since it just means Guardian compacts a bit earlier than strictly necessary for the larger-window model).
 
+## Benchmark
+
+`scripts/bench_proxy.py` drives a scripted agent conversation (user turns, tool calls with large results, assistant replies; the client resends its whole history every turn) through the real proxy app against an in-process stub upstream, and prints one line. Same `--turns` and `--seed` give the same token figures; latency depends on the machine. Nothing touches the network or the repository.
+
+```bash
+python scripts/bench_proxy.py --turns 40 --seed 1
+```
+
+Measured against a stub upstream (not a real model; the stub summarises instantly, so `added_ms` is the proxy's own overhead, not summarisation time), 2026-10-14, Python 3.11, Linux container:
+
+```
+turns=40 tokens_before=1130722 tokens_after=160310 compactions=27 p50_added_ms=5.07 p95_added_ms=7.20
+```
+
 ## Development / running tests
 
 ```bash
