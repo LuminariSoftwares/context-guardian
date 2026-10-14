@@ -71,6 +71,7 @@ by `context-guardian-configure`); see the README for the full list.
 """
 
 import collections
+import contextlib
 import json
 import logging
 import os
@@ -311,7 +312,6 @@ LOG_PATH = Path(os.environ.get(
 logging.basicConfig(level=logging.INFO, format="[ContextGuardian] %(message)s")
 log = logging.getLogger("context_guardian")
 
-app = FastAPI(title="Context Guardian")
 
 # Running estimate of tokens "in flight" for the current conversation.
 # This is intentionally process-local and best-effort -- it resets if the
@@ -563,8 +563,14 @@ def calibration_enabled() -> bool:
         "0", "false", "no")
 
 
-@app.on_event("startup")
-async def _startup() -> None:
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Build the shared upstream client at startup and close it at shutdown.
+
+    A lifespan, not the on_event decorator: FastAPI deprecated it, and every
+    import of this module emitted two DeprecationWarnings that buried any real
+    warning in the test summary.
+    """
     global _http_client
     # httpx's bare default (5s connect/read/write/pool) is sized for
     # ordinary REST APIs, not local LLM inference -- a "thinking" model can
@@ -577,12 +583,14 @@ async def _startup() -> None:
         timeout=httpx.Timeout(UPSTREAM_TIMEOUT_SECONDS,
                               connect=UPSTREAM_CONNECT_TIMEOUT_SECONDS)
     )
+    try:
+        yield
+    finally:
+        if _http_client is not None:
+            await _http_client.aclose()
 
 
-@app.on_event("shutdown")
-async def _shutdown() -> None:
-    if _http_client is not None:
-        await _http_client.aclose()
+app = FastAPI(title="Context Guardian", lifespan=_lifespan)
 
 
 def estimate_tool_tokens(payload: Dict[str, Any]) -> int:
@@ -1870,7 +1878,7 @@ async def proxy(path: str, request: Request):
         # request path -- stripped, the next line raises AttributeError on
         # None; unstripped it was a bare 500. Either way the client sees an
         # unreadable error for a startup problem.
-        log.error("HTTP client is not initialised -- the startup event did "
+        log.error("HTTP client is not initialised -- the lifespan did "
                   "not run. Is the app being served by something that skips "
                   "lifespan events?")
         return JSONResponse(
