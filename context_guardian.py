@@ -154,6 +154,12 @@ CHARS_PER_TOKEN_ESTIMATE = float(os.environ.get("GUARDIAN_CHARS_PER_TOKEN", "3.5
 # the old messages-only behaviour back if this ever needs bisecting.
 COUNT_TOOLS = os.environ.get("GUARDIAN_COUNT_TOOLS", "1") not in ("0", "false", "False")
 
+# DRY_RUN: compute every compaction (summary included) and log it as a
+# `dry_run` event, but forward the client's request byte-for-byte. For watching
+# what the proxy WOULD do to a live session before letting it do it. No span is
+# written, since nothing is evicted.
+DRY_RUN = os.environ.get("GUARDIAN_DRY_RUN", "0").strip().lower() in ("1", "true", "yes")
+
 # --- 0.5.0 additions ---------------------------------------------------------
 # VERBOSE: print a visible multi-line banner on every compaction instead of the
 # single terse INFO line. Default ON -- a compaction silently reshaping your
@@ -342,6 +348,10 @@ _state = {
     # comment above `last_known_total_tokens` is now only half true, so the raw
     # figure is kept beside it rather than overwriting the only one on display.
     "last_raw_estimate": 0,
+    # GUARDIAN_DRY_RUN: compactions computed and logged but NOT applied, and
+    # the tokens they would have removed.
+    "dry_runs": 0,
+    "dry_run_tokens_saved_total": 0,
 }
 
 # When this process started, for the health view's uptime line.
@@ -1174,6 +1184,76 @@ async def summarize_older_messages(
         return None
 
 
+def _summary_message(to_summarize: List[Dict[str, Any]], summary: str,
+                     pointer: str) -> Dict[str, Any]:
+    return {
+        "role": "system",
+        "content": (
+            "[Context Guardian auto-compaction — earlier conversation "
+            f"({len(to_summarize)} messages) condensed to stay within the "
+            "context window:]\n\n" + summary + pointer
+        ),
+    }
+
+
+def _compaction_event(name: str, index: int, messages: List[Dict[str, Any]],
+                      new_messages: List[Dict[str, Any]],
+                      to_keep: List[Dict[str, Any]], estimated: int,
+                      message_tokens: int, tool_tokens: int,
+                      span_path: Optional[str], summary: str) -> Dict[str, Any]:
+    """The log record of one compaction. A dry run writes the same record
+    under its own event name, so the two can be compared field for field."""
+    # Compute the "after" figures once and reuse -- estimate_tokens walks every
+    # message, so calling it three times on the request path was pure waste.
+    msgs_after_tokens = estimate_tokens(new_messages)
+    tokens_after = msgs_after_tokens + tool_tokens
+    return {
+        "event": name,
+        # RUN_ID scopes an event to this process, so /guardian/events (and the
+        # dashboard's compaction monitor) can show only the current session's
+        # compactions rather than everything ever logged to this file.
+        "run_id": RUN_ID,
+        "compaction_index": index,
+        "messages_before": len(messages),
+        "messages_after": len(new_messages),
+        # Recent messages forwarded verbatim (what keep-recent actually kept).
+        "kept_messages": len(to_keep),
+        "estimated_tokens_before": estimated,
+        "estimated_tokens_after": tokens_after,
+        "message_tokens_before": message_tokens,
+        "message_tokens_after": msgs_after_tokens,
+        "tool_tokens": tool_tokens,
+        # Tokens this compaction removed from the outgoing request. Clamp at 0:
+        # a summary is normally far smaller than what it replaced, but a
+        # pathological tiny eviction should never subtract from the running
+        # savings total.
+        "tokens_saved": max(0, estimated - tokens_after),
+        "span_file": span_path,
+        "span_written": span_path is not None,
+        "summary_preview": summary[:500],
+    }
+
+
+def _log_dry_run(messages, system_msgs, to_summarize, to_keep, summary,
+                 estimated, message_tokens, tool_tokens) -> None:
+    """Record what this compaction WOULD have done. Never raises: the caller
+    forwards the original request whatever happens here."""
+    try:
+        new_messages = system_msgs + [_summary_message(to_summarize, summary, "")] + to_keep
+        event = _compaction_event("dry_run", _state["dry_runs"] + 1, messages,
+                                  new_messages, to_keep, estimated,
+                                  message_tokens, tool_tokens, None, summary)
+        _state["dry_runs"] += 1
+        _state["dry_run_tokens_saved_total"] += event["tokens_saved"]
+        log_event(event)
+        log.info("DRY RUN #%d: would compact %d -> %d messages, ~%d -> ~%d "
+                 "tokens (saving ~%d). Forwarding the original unchanged.",
+                 _state["dry_runs"], len(messages), len(new_messages), estimated,
+                 event["estimated_tokens_after"], event["tokens_saved"])
+    except Exception as exc:                               # noqa: BLE001
+        log.warning("dry run bookkeeping failed, request unaffected: %s", exc)
+
+
 async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> Dict[str, Any]:
     """Returns a (possibly rewritten) payload. Never returns something with
     LESS information than the original unless the summarization call
@@ -1285,6 +1365,11 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
                    "num_ctx": NUM_CTX})
         return payload
 
+    if DRY_RUN:
+        _log_dry_run(messages, system_msgs, to_summarize, to_keep, summary,
+                     estimated, message_tokens, tool_tokens)
+        return payload
+
     # Evict to disk BEFORE the messages are replaced. If this ran after, a crash
     # between the two would lose the span with nothing to show it existed.
     span_path = write_span(to_summarize, summary, _state["compactions_performed"] + 1)
@@ -1320,51 +1405,18 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
                    f"(from a source checkout: `python {RECALL_SCRIPT} "
                    f"\"<term>\" --run {RUN_ID}`).]")
 
-    summary_message = {
-        "role": "system",
-        "content": (
-            "[Context Guardian auto-compaction — earlier conversation "
-            f"({len(to_summarize)} messages) condensed to stay within the "
-            "context window:]\n\n" + summary + pointer
-        ),
-    }
-
-    new_messages = system_msgs + [summary_message] + to_keep
+    new_messages = system_msgs + [_summary_message(to_summarize, summary, pointer)] + to_keep
     new_payload = dict(payload)
     new_payload["messages"] = new_messages
 
-    # Compute the "after" figures once and reuse -- estimate_tokens walks every
-    # message, so calling it three times on the request path was pure waste.
-    msgs_after_tokens = estimate_tokens(new_messages)
-    tokens_after = msgs_after_tokens + tool_tokens
-    # Tokens this compaction removed from the outgoing request. Clamp at 0: a
-    # summary is normally far smaller than what it replaced, but a pathological
-    # tiny eviction should never subtract from the running savings total.
-    tokens_saved = max(0, estimated - tokens_after)
-
     _state["compactions_performed"] += 1
+    event = _compaction_event("compaction", _state["compactions_performed"],
+                              messages, new_messages, to_keep, estimated,
+                              message_tokens, tool_tokens, span_path, summary)
+    tokens_after = event["estimated_tokens_after"]
+    tokens_saved = event["tokens_saved"]
     _state["tokens_saved_total"] += tokens_saved
-    log_event({
-        "event": "compaction",
-        # RUN_ID scopes an event to this process, so /guardian/events (and the
-        # dashboard's compaction monitor) can show only the current session's
-        # compactions rather than everything ever logged to this file.
-        "run_id": RUN_ID,
-        "compaction_index": _state["compactions_performed"],
-        "messages_before": len(messages),
-        "messages_after": len(new_messages),
-        # Recent messages forwarded verbatim (what keep-recent actually kept).
-        "kept_messages": len(to_keep),
-        "estimated_tokens_before": estimated,
-        "estimated_tokens_after": tokens_after,
-        "message_tokens_before": message_tokens,
-        "message_tokens_after": msgs_after_tokens,
-        "tool_tokens": tool_tokens,
-        "tokens_saved": tokens_saved,
-        "span_file": span_path,
-        "span_written": span_path is not None,
-        "summary_preview": summary[:500],
-    })
+    log_event(event)
 
     if VERBOSE:
         # A visible banner, not a line that scrolls past in a busy log. This is
@@ -1537,6 +1589,7 @@ async def stats():
         "latest_version": (_update_notice or {}).get("latest"),
         "update_available": _update_notice is not None,
         "verbose": VERBOSE,
+        "dry_run": DRY_RUN,
         "uptime_seconds": round(time.time() - STARTED_AT, 1),
         "cost_per_1m_input_usd": COST_PER_1M_INPUT_USD,
         "cost_saved_usd": cost_saved_usd(),
@@ -1773,7 +1826,9 @@ async function tick(){
     card("Tool definitions",fmt(s.last_tool_tokens||0),"fixed floor - compaction can't touch it"),
     card("Rejected summaries",fmt(rejected),rejected?"empty/degenerate - investigate":"none - healthy"),
     card("Uptime",human(s.uptime_seconds),`run ${s.run_id||""}`),
-    estimateCard(s)
+    estimateCard(s),
+    ...(s.dry_run||s.dry_runs?[card("Dry runs",fmt(s.dry_runs),
+      `would have saved ${fmt(s.dry_run_tokens_saved_total)} tokens &middot; requests forwarded unchanged`)]:[])
   ].join("");
   if(rejected){$("cards").children[4].querySelector(".big").style.color="#f85149";}
 
@@ -1863,6 +1918,14 @@ async def _tapped_stream(chunks, upstream_resp: httpx.Response,
             log.debug("usage calibration tap failed, response unaffected: %s", exc)
 
 
+async def rewrite_chat_payload(client: httpx.AsyncClient,
+                               payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Everything the proxy may change in a chat/completions body. Returns the
+    SAME object when nothing changed, so the caller can forward the original
+    bytes."""
+    return await maybe_compact(client, payload)
+
+
 @app.api_route("/v1/{path:path}", methods=["GET", "POST"])
 async def proxy(path: str, request: Request):
     """Generic passthrough for everything except chat/completions, which
@@ -1905,8 +1968,20 @@ async def proxy(path: str, request: Request):
         # an object is not something this proxy understands; pass it through
         # untouched and let the backend rule on it.
         if isinstance(payload, dict):
-            payload = await maybe_compact(client, payload)
-            body_bytes = json.dumps(payload).encode("utf-8")
+            # FAIL-OPEN for the whole rewrite step. Whatever raises in here --
+            # a bug in compaction, a dry run, an injected field -- costs the
+            # rewrite, never the request: it goes upstream as the client sent it.
+            try:
+                rewritten = await rewrite_chat_payload(client, payload)
+            except Exception as exc:                       # noqa: BLE001
+                log.error("Rewriting the request failed (%s: %s). Forwarding "
+                          "it unchanged.", type(exc).__name__, exc)
+                rewritten = payload
+            # Unchanged means the client's own bytes, not a re-serialisation:
+            # key order, spacing and number formatting all survive.
+            if rewritten is not payload:
+                body_bytes = json.dumps(rewritten).encode("utf-8")
+            payload = rewritten
             # Grabbed HERE, immediately after the estimate was recorded and
             # before anything else can touch _state. Only chat/completions
             # gets a usage block back; every other route keeps the raw stream
