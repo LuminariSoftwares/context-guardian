@@ -1307,6 +1307,39 @@ async def summarize_older_messages(
         return None
 
 
+def _span_pointer(to_summarize: List[Dict[str, Any]], span_path: Optional[str]) -> str:
+    # Name the span file IN the summary the model receives. This is the whole
+    # difference between an archive and a recovery path: Guardian is a proxy and
+    # cannot hand the model a tool, but every agentic client it fronts already
+    # has file access. Telling it WHERE the detail went costs ~25 tokens and
+    # turns "that context is gone" into "that context is one Read away".
+    #
+    # The pointer is only added when the span actually wrote. Pointing at a file
+    # that does not exist would be worse than saying nothing -- it would send
+    # the model looking, and teach it the pointer cannot be trusted.
+    if not span_path:
+        return ""
+    # Tell it the SIZE, and tell it to search rather than read whole.
+    # A span is by definition bigger than the window had room for -- an
+    # unqualified "read that file" invites the model to reload the exact
+    # payload compaction just evicted, blowing the window on the recovery.
+    # The size figure is what lets it decide; the search hint is what keeps
+    # it cheap.
+    span_tokens = estimate_tokens(to_summarize)
+    n_spans = _state["compactions_performed"] + 1
+    # Name the DIRECTORY, not just this file. Older summaries are retired
+    # from the window now, so their individual pointers go with them -- one
+    # pointer at the whole archive is what keeps the earlier spans findable.
+    return (f"\n\n[Full text of those {len(to_summarize)} messages "
+            f"(~{span_tokens} tokens) saved at {span_path}. "
+            f"{n_spans} span(s) so far this session, all under "
+            f"{SPAN_DIR / RUN_ID}. They are LARGER than the room that "
+            f"was freed -- do not read them whole. Search instead: "
+            f"`context-guardian-recall \"<term>\" --run {RUN_ID}` "
+            f"(from a source checkout: `python {RECALL_SCRIPT} "
+            f"\"<term>\" --run {RUN_ID}`).]")
+
+
 def _summary_message(to_summarize: List[Dict[str, Any]], summary: str,
                      pointer: str) -> Dict[str, Any]:
     return {
@@ -1506,36 +1539,7 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
     # between the two would lose the span with nothing to show it existed.
     span_path = write_span(to_summarize, summary, _state["compactions_performed"] + 1)
 
-    # Name the span file IN the summary the model receives. This is the whole
-    # difference between an archive and a recovery path: Guardian is a proxy and
-    # cannot hand the model a tool, but every agentic client it fronts already
-    # has file access. Telling it WHERE the detail went costs ~25 tokens and
-    # turns "that context is gone" into "that context is one Read away".
-    #
-    # The pointer is only added when the span actually wrote. Pointing at a file
-    # that does not exist would be worse than saying nothing -- it would send
-    # the model looking, and teach it the pointer cannot be trusted.
-    pointer = ""
-    if span_path:
-        # Tell it the SIZE, and tell it to search rather than read whole.
-        # A span is by definition bigger than the window had room for -- an
-        # unqualified "read that file" invites the model to reload the exact
-        # payload compaction just evicted, blowing the window on the recovery.
-        # The size figure is what lets it decide; the search hint is what keeps
-        # it cheap.
-        span_tokens = estimate_tokens(to_summarize)
-        n_spans = _state["compactions_performed"] + 1
-        # Name the DIRECTORY, not just this file. Older summaries are retired
-        # from the window now, so their individual pointers go with them -- one
-        # pointer at the whole archive is what keeps the earlier spans findable.
-        pointer = (f"\n\n[Full text of those {len(to_summarize)} messages "
-                   f"(~{span_tokens} tokens) saved at {span_path}. "
-                   f"{n_spans} span(s) so far this session, all under "
-                   f"{SPAN_DIR / RUN_ID}. They are LARGER than the room that "
-                   f"was freed -- do not read them whole. Search instead: "
-                   f"`context-guardian-recall \"<term>\" --run {RUN_ID}` "
-                   f"(from a source checkout: `python {RECALL_SCRIPT} "
-                   f"\"<term>\" --run {RUN_ID}`).]")
+    pointer = _span_pointer(to_summarize, span_path)
 
     new_messages = system_msgs + [_summary_message(to_summarize, summary, pointer)] + to_keep
     new_payload = dict(payload)
@@ -2073,6 +2077,149 @@ def with_stream_options(payload: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+# --- Anthropic Messages API (/v1/messages) ---------------------------------
+# Same compaction, different shape: the system prompt is a top-level `system`
+# (a string or a list of text blocks), and a tool round-trip is an assistant
+# `tool_use` block answered by a USER message carrying a `tool_result` block.
+# The summary is appended to `system`, since messages have no system role.
+
+# Headers the summary call carries over from the client's request, so a
+# backend that wants a key or an API version gets the client's own.
+ANTHROPIC_FORWARD_HEADERS = ("x-api-key", "authorization", "anthropic-version",
+                             "anthropic-beta")
+ANTHROPIC_SUMMARY_MAX_TOKENS = 2048
+
+
+def _anthropic_text(content: Any) -> str:
+    """A message's content as text for the summariser (and for estimates of a
+    system prompt). Tool calls are named with truncated input, like
+    render_for_summary does for the OpenAI shape."""
+    if isinstance(content, str):
+        return content
+    parts = []
+    for block in content if isinstance(content, list) else []:
+        if not isinstance(block, dict):
+            parts.append(str(block))
+        elif block.get("type") == "text":
+            parts.append(str(block.get("text", "")))
+        elif block.get("type") == "tool_use":
+            parts.append("called tool %s(%s)" % (
+                block.get("name") or "unknown",
+                _json_dump(block.get("input"))[:TOOL_ARG_CHARS_IN_SUMMARY]))
+        elif block.get("type") == "tool_result":
+            parts.append("tool result: " + _anthropic_text(block.get("content")))
+        else:
+            parts.append("[%s omitted]" % (block.get("type") or "attachment"))
+    return " ".join(p for p in parts if p)
+
+
+def _starts_a_turn(m: Any) -> bool:
+    """A kept window must open on a user message that answers no tool call:
+    a leading tool_result whose tool_use was evicted is a 400 from Anthropic."""
+    if not isinstance(m, dict) or m.get("role") != "user":
+        return False
+    content = m.get("content")
+    return not (isinstance(content, list) and any(
+        isinstance(b, dict) and b.get("type") == "tool_result" for b in content))
+
+
+async def _summarize_anthropic(client: httpx.AsyncClient, model: str,
+                               older: List[Dict[str, Any]],
+                               headers: Dict[str, str]) -> Optional[str]:
+    """The same fenced condense prompt, sent to the upstream's /messages.
+    None on any failure; the caller fails open."""
+    transcript = "\n\n".join("[%s]: %s" % (m.get("role", "unknown"),
+                                            _anthropic_text(m.get("content")))
+                              for m in older)
+    if len(transcript.strip()) < MIN_TRANSCRIPT_CHARS:
+        return None
+    try:
+        resp = await client.post(
+            f"{UPSTREAM_URL}/messages", timeout=UPSTREAM_TIMEOUT_SECONDS,
+            headers={k: v for k, v in headers.items()
+                     if k.lower() in ANTHROPIC_FORWARD_HEADERS},
+            json={"model": model, "max_tokens": ANTHROPIC_SUMMARY_MAX_TOKENS,
+                  "messages": [{"role": "user", "content":
+                                CONDENSE_PROMPT + transcript + FENCE_SUFFIX}]})
+        resp.raise_for_status()
+        text = _anthropic_text([b for b in resp.json().get("content") or []
+                                if isinstance(b, dict) and b.get("type") == "text"])
+        return text if text.strip() else None
+    except Exception as exc:                               # noqa: BLE001
+        log.error("Anthropic summarisation call failed, failing OPEN: %s", exc)
+        return None
+
+
+async def maybe_compact_anthropic(client: httpx.AsyncClient, payload: Dict[str, Any],
+                                  headers: Dict[str, str]) -> Dict[str, Any]:
+    """maybe_compact for /v1/messages. Returns the SAME object when nothing is
+    compacted, so the caller forwards the client's own bytes."""
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
+        return payload
+    _state["requests_seen"] += 1
+    system = payload.get("system")
+    system_tokens = int(len(_anthropic_text(system)) / CHARS_PER_TOKEN_ESTIMATE)
+    message_tokens = estimate_tokens(messages) + system_tokens
+    tool_tokens = estimate_tool_tokens(payload)
+    estimated = message_tokens + tool_tokens
+    model = str(payload.get("model") or "")
+    num_ctx = await context_window(client, model)
+    threshold_tokens = effective_threshold(num_ctx=num_ctx)
+    _state["last_known_total_tokens"] = estimated
+    _state["last_num_ctx"] = num_ctx
+    _state["last_input_budget"] = threshold_tokens
+    if estimated < threshold_tokens:
+        return payload
+
+    cut = len(messages) - keep_recent_count(messages, num_ctx=num_ctx)
+    while cut > 0 and not _starts_a_turn(messages[cut]):
+        cut -= 1
+    if cut <= 0:
+        return payload
+    to_summarize, to_keep = messages[:cut], messages[cut:]
+    log.info("Anthropic request ~%d tokens >= threshold %d -- compacting %d "
+             "message(s).", estimated, threshold_tokens, len(to_summarize))
+
+    summary = await _summarize_anthropic(client, model, to_summarize, headers)
+    if summary is None or len(summary.strip()) < MIN_SUMMARY_CHARS:
+        _state["summaries_rejected_empty"] += 1
+        log_event({"event": "compaction_refused", "reason": "empty_or_short_summary",
+                   "route": "messages", "messages_not_evicted": len(to_summarize),
+                   "estimated_tokens": estimated, "num_ctx": num_ctx})
+        return payload
+
+    # Estimates count the summary as a message so the event matches the
+    # chat/completions one field for field.
+    system_msgs = [{"role": "system", "content": _anthropic_text(system)}] if system else []
+    if DRY_RUN:
+        _log_dry_run(messages, system_msgs, to_summarize, to_keep, summary,
+                     estimated, message_tokens, tool_tokens)
+        return payload
+
+    span_path = write_span(to_summarize, summary, _state["compactions_performed"] + 1)
+    note = _summary_message(to_summarize, summary,
+                            _span_pointer(to_summarize, span_path))["content"]
+    out = dict(payload)
+    if isinstance(system, list):
+        out["system"] = system + [{"type": "text", "text": note}]
+    else:
+        out["system"] = (system + "\n\n" + note) if isinstance(system, str) and system else note
+    out["messages"] = to_keep
+
+    _state["compactions_performed"] += 1
+    event = _compaction_event("compaction", _state["compactions_performed"], messages,
+                              system_msgs + [{"role": "system", "content": note}] + to_keep,
+                              to_keep, estimated, message_tokens, tool_tokens,
+                              span_path, summary)
+    event["route"] = "messages"
+    _state["tokens_saved_total"] += event["tokens_saved"]
+    log_event(event)
+    log.info("Compacted Anthropic request %d -> %d messages, ~%d -> ~%d tokens.",
+             len(messages), len(to_keep), estimated, event["estimated_tokens_after"])
+    return out
+
+
 @app.api_route("/v1/{path:path}", methods=["GET", "POST"])
 async def proxy(path: str, request: Request):
     """Generic passthrough for everything except chat/completions, which
@@ -2139,6 +2286,20 @@ async def proxy(path: str, request: Request):
                 # estimate would make the backend's figure look far too small.
                 calib_estimate = (estimate_tokens(payload.get("messages") or [])
                                   + estimate_tool_tokens(payload))
+
+    elif path == "messages" and request.method == "POST" and body_bytes:
+        # Anthropic Messages API: same fail-open contract. The response is
+        # never touched (no calibration tap), so with no compaction the
+        # stream is byte-identical both ways.
+        try:
+            payload = json.loads(body_bytes)
+            if isinstance(payload, dict):
+                rewritten = await maybe_compact_anthropic(client, payload, headers)
+                if rewritten is not payload:
+                    body_bytes = json.dumps(rewritten).encode("utf-8")
+        except Exception as exc:                           # noqa: BLE001
+            log.error("Rewriting the /v1/messages request failed (%s: %s). "
+                      "Forwarding it unchanged.", type(exc).__name__, exc)
 
     upstream_url = f"{UPSTREAM_URL}/{path}"
 

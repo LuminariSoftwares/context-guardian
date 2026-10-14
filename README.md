@@ -63,7 +63,7 @@ The proxy compacts OpenAI-style `POST /v1/chat/completions` requests. Every clie
 
 | client | where | what to set |
 |---|---|---|
-| **Claude Code** | environment | Claude Code speaks the Anthropic Messages API (`/v1/messages`), which the proxy passes through **without compacting**. For compaction, use an OpenAI-compatible build such as OpenClaude: `CLAUDE_CODE_USE_OPENAI=1 OPENAI_BASE_URL=http://localhost:8786/v1 OPENAI_API_KEY=local OPENAI_MODEL=<model>` |
+| **Claude Code** | environment | Claude Code speaks the Anthropic Messages API (`/v1/messages`). The proxy compacts it too when `GUARDIAN_UPSTREAM_URL` serves that API (the summary call goes to the same upstream's `/messages` with your key and goes into `system`): `ANTHROPIC_BASE_URL=http://localhost:8786`. Or use an OpenAI-compatible build such as OpenClaude: `CLAUDE_CODE_USE_OPENAI=1 OPENAI_BASE_URL=http://localhost:8786/v1 OPENAI_API_KEY=local OPENAI_MODEL=<model>` |
 | **Cline** | Settings → API Provider: **OpenAI Compatible** | Base URL `http://localhost:8786/v1` · API Key any non-empty text · Model ID `<model>` |
 | **Continue** | `~/.continue/config.yaml` | under `models:` add `- {name: Context Guardian, provider: openai, model: <model>, apiBase: "http://localhost:8786/v1", apiKey: local}` |
 | **OpenCode** | `opencode.json` | `"provider": {"guardian": {"npm": "@ai-sdk/openai-compatible", "name": "Context Guardian", "options": {"baseURL": "http://localhost:8786/v1"}, "models": {"<model>": {}}}}` |

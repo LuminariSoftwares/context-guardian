@@ -20,6 +20,10 @@
   what lies between.
 - **`GUARDIAN_INJECT_STREAM_OPTIONS=1`** (off by default): streaming chat requests without `stream_options` get
   `{"include_usage": true}`, so the calibrator learns from streaming clients.
+- **Anthropic `/v1/messages` is compacted** like chat/completions: the summary is appended to `system`, the kept
+  window always opens on a user turn (never an orphaned `tool_result`), and the summary call goes to the upstream's
+  `/messages` with the client's key and API-version headers. Fail-open: a failed summary or any exception forwards
+  the client's bytes; with no compaction the request and the streamed response are byte-identical.
 - **`scripts/bench_proxy.py --turns N --seed S`**: a re-runnable benchmark through the real proxy app against a stub
   upstream; README has a Benchmark section with one measured line.
 
