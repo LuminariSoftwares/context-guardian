@@ -902,6 +902,43 @@ def keep_recent_count(non_system: List[Dict[str, Any]], num_ctx: int = None,
     return min(len(non_system), max(n, KEEP_RECENT_MIN_MESSAGES))
 
 
+def _split_system(messages: List[Dict[str, Any]]):
+    """(real system prompts, kept Guardian summaries, retired ones, the rest)."""
+    system_all = [m for m in messages if m.get("role") == "system"]
+    non_system = [m for m in messages if m.get("role") != "system"]
+
+    real_system = [m for m in system_all if not is_guardian_summary(m)]
+    prior = [m for m in system_all if is_guardian_summary(m)]
+
+    keep_n = max(0, KEEP_SUMMARIES)
+    kept_summaries = prior[len(prior) - keep_n:] if keep_n else []
+    retired_summaries = prior[:len(prior) - len(kept_summaries)]
+    return real_system, kept_summaries, retired_summaries, non_system
+
+
+def partition_short(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """The split for a conversation too short for keep-recent to leave anything
+    to summarise (KEEP_RECENT_MESSAGES + 1 messages or fewer). Pure.
+
+    Keeps the first user message (the task) and everything from the last user
+    message on (the live turn) verbatim, and summarises what lies between --
+    typically one huge assistant reply or tool result. Nothing between them
+    means nothing to summarise, and the caller fails open.
+    """
+    real_system, kept_summaries, retired_summaries, non_system = _split_system(messages)
+    users = [i for i, m in enumerate(non_system) if m.get("role") == "user"]
+    middle: List[Dict[str, Any]] = []
+    to_keep = non_system
+    if len(users) >= 2 and users[-1] - users[0] > 1:
+        first, last = users[0], users[-1]
+        middle = non_system[first + 1:last]
+        to_keep = non_system[:first + 1] + non_system[last:]
+    return {"real_system": real_system, "kept_summaries": kept_summaries,
+            "retired_summaries": retired_summaries if middle else [],
+            "to_summarize": retired_summaries + middle if middle else [],
+            "to_keep": to_keep}
+
+
 def partition_messages(messages: List[Dict[str, Any]],
                        num_ctx: int = None) -> Dict[str, Any]:
     """Split a conversation into what is kept, retired, and summarised.
@@ -914,15 +951,7 @@ def partition_messages(messages: List[Dict[str, Any]],
     Returns keys: real_system, kept_summaries, retired_summaries,
     to_summarize, to_keep.
     """
-    system_all = [m for m in messages if m.get("role") == "system"]
-    non_system = [m for m in messages if m.get("role") != "system"]
-
-    real_system = [m for m in system_all if not is_guardian_summary(m)]
-    prior = [m for m in system_all if is_guardian_summary(m)]
-
-    keep_n = max(0, KEEP_SUMMARIES)
-    kept_summaries = prior[len(prior) - keep_n:] if keep_n else []
-    retired_summaries = prior[:len(prior) - len(kept_summaries)]
+    real_system, kept_summaries, retired_summaries, non_system = _split_system(messages)
 
     keep = keep_recent_count(non_system, num_ctx=num_ctx)
     cut = len(non_system) - keep if keep else len(non_system)
@@ -1400,7 +1429,7 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
                         "Launch with --strict-mcp-config and a smaller server "
                         "set.", tool_tokens, num_ctx)
 
-    if estimated < threshold_tokens or len(messages) <= KEEP_RECENT_MESSAGES + 1:
+    if estimated < threshold_tokens:
         return payload
 
     log.info(
@@ -1408,7 +1437,13 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
         estimated, threshold_tokens, COMPACT_THRESHOLD * 100, num_ctx,
     )
 
-    part = partition_messages(messages, num_ctx=num_ctx)
+    # A conversation this short leaves keep-recent nothing to summarise. It
+    # used to be skipped outright, so three messages with one huge reply in the
+    # middle went upstream over the window every time.
+    if len(messages) <= KEEP_RECENT_MESSAGES + 1:
+        part = partition_short(messages)
+    else:
+        part = partition_messages(messages, num_ctx=num_ctx)
     system_msgs = part["real_system"] + part["kept_summaries"]
     to_summarize = part["to_summarize"]
     to_keep = part["to_keep"]
