@@ -318,6 +318,7 @@ cp .env.example .env
 | `GUARDIAN_VERSION_CHECK` | `1` | On startup, ask PyPI once (2s timeout, cached 24h, fully fail-open) whether a newer `context-guardian` exists and print one line if so. Set `0` to disable — airgapped/privacy setups never touch the network |
 | `GUARDIAN_VERSION_CACHE` | `<repo>/logs/.version_check_cache.json` | Where the update check caches PyPI's answer so frequent restarts don't re-hit the network (24h TTL) |
 | `GUARDIAN_DRY_RUN` | `0` | `1`: compute every compaction (the summariser is still called) and log it as a `dry_run` event with the same fields as a real one, but forward the client's request byte-for-byte. Counted on the health dashboard. For watching what the proxy would do before letting it |
+| `GUARDIAN_INJECT_STREAM_OPTIONS` | `0` | `1`: add `stream_options: {"include_usage": true}` to streaming chat requests that do not already carry `stream_options`, so the usage frame reaches the calibrator. Off by default because the client then receives one extra final frame with empty `choices`, which some clients do not expect |
 
 **A note on timeouts:** local "thinking"/reasoning models can go silent for a long time before their first output token. If you see `500` errors appear only on real (non-trivial) requests after a long pause, raise `GUARDIAN_UPSTREAM_TIMEOUT` before assuming something is broken — the default 5-second timeout most HTTP clients ship with is sized for ordinary REST APIs, not local LLM inference, which is exactly the bug this project's own commit history caught during development.
 

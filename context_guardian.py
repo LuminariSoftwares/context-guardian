@@ -171,6 +171,15 @@ OLLAMA_SHOW_TIMEOUT_SECONDS = 5.0
 # written, since nothing is evicted.
 DRY_RUN = os.environ.get("GUARDIAN_DRY_RUN", "0").strip().lower() in ("1", "true", "yes")
 
+# INJECT_STREAM_OPTIONS: a streamed OpenAI-style reply carries no usage block
+# unless the request asked for one, so the calibrator never learns from a
+# streaming client. When on, a streaming chat request without stream_options
+# gets {"include_usage": true}. OFF by default: the client then receives one
+# extra final frame (empty choices + usage) it did not ask for, and a client
+# that indexes choices[0] on every frame breaks on it.
+INJECT_STREAM_OPTIONS = os.environ.get(
+    "GUARDIAN_INJECT_STREAM_OPTIONS", "0").strip().lower() in ("1", "true", "yes")
+
 # --- 0.5.0 additions ---------------------------------------------------------
 # VERBOSE: print a visible multi-line banner on every compaction instead of the
 # single terse INFO line. Default ON -- a compaction silently reshaping your
@@ -1713,6 +1722,7 @@ async def stats():
         "update_available": _update_notice is not None,
         "verbose": VERBOSE,
         "dry_run": DRY_RUN,
+        "inject_stream_options": INJECT_STREAM_OPTIONS,
         "ollama_context_enabled": upstream_is_ollama(),
         "ollama_context": {m: n for m, n in _ollama_windows.items() if n},
         "uptime_seconds": round(time.time() - STARTED_AT, 1),
@@ -2048,7 +2058,19 @@ async def rewrite_chat_payload(client: httpx.AsyncClient,
     """Everything the proxy may change in a chat/completions body. Returns the
     SAME object when nothing changed, so the caller can forward the original
     bytes."""
-    return await maybe_compact(client, payload)
+    return with_stream_options(await maybe_compact(client, payload))
+
+
+def with_stream_options(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """GUARDIAN_INJECT_STREAM_OPTIONS: ask for the usage frame on a streaming
+    request, never over the client's own stream_options. Same object back
+    when nothing is added."""
+    if (not INJECT_STREAM_OPTIONS or payload.get("stream") is not True
+            or "stream_options" in payload):
+        return payload
+    out = dict(payload)
+    out["stream_options"] = {"include_usage": True}
+    return out
 
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST"])
