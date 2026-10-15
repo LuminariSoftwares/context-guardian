@@ -51,9 +51,14 @@ TOOLS = [
     {
         "name": "guardian_status",
         "title": "Proxy status",
-        "description": ("Context Guardian's live status from the running proxy: "
-                        "window and budget, compactions, tokens saved, rejected "
-                        "summaries, calibration. Reads GUARDIAN_HOST:GUARDIAN_PORT."),
+        "description": ("Context Guardian's live status from the running proxy, as "
+                        "JSON: window and budget, compactions, tokens saved, rejected "
+                        "summaries, calibration. Read-only: one local HTTP request to "
+                        "GUARDIAN_HOST:GUARDIAN_PORT (default 127.0.0.1:8786), no "
+                        "credentials. Returns an error saying how to start the proxy "
+                        "when it is not running. Call it to see whether compaction is "
+                        "working; use search_spans or read_span for the archived "
+                        "conversation text instead."),
         "inputSchema": {"type": "object", "properties": {}},
         "annotations": _annotations("Proxy status", open_world=True),
     },
@@ -61,23 +66,40 @@ TOOLS = [
         "name": "search_spans",
         "title": "Search archived spans",
         "description": ("Case-insensitive search of the conversation text "
-                        "compaction archived. One line per hit: span file, "
-                        "message index and role, snippet."),
+                        "compaction archived, for details that no longer fit in the "
+                        "window. Read-only, local files only. Returns one line per hit: "
+                        "span file, message index and role, snippet (at most 50 hits). "
+                        "Use read_span to open a whole span from a hit; use "
+                        "guardian_status for proxy counters, not conversation text."),
         "inputSchema": {"type": "object", "properties": {
-            "term": {"type": "string", "description": "text to find"},
-            "run": {"type": "string", "description": "only this proxy run id"},
-            "max": {"type": "integer", "minimum": 1, "maximum": MAX_SEARCH_HITS},
+            "term": {"type": "string", "description": (
+                "Text to find, matched case-insensitively as plain text (not a "
+                "regex), e.g. \"migration plan\". Must not be empty.")},
+            "run": {"type": "string", "description": (
+                "Only search this proxy run id, e.g. \"20261015-120000\" (the "
+                "folder name in the span archive). Omit to search every run.")},
+            "max": {"type": "integer", "minimum": 1, "maximum": MAX_SEARCH_HITS, "description": (
+                "Maximum number of hits to return, from 1 to %d, e.g. 10. "
+                "Defaults to %d." % (MAX_SEARCH_HITS, MAX_SEARCH_HITS))},
         }, "required": ["term"]},
         "annotations": _annotations("Search archived spans", open_world=False),
     },
     {
         "name": "read_span",
         "title": "Read one archived span",
-        "description": ("The summary and original messages of one span, by run "
-                        "id and index (as search_spans prints them). Long "
-                        "spans are cut at %d characters." % READ_SPAN_MAX_CHARS),
+        "description": ("Read one archived span: the summary compaction wrote and "
+                        "the original messages it replaced. Read-only, local files "
+                        "only. Returns text, cut at %d characters for long spans, or "
+                        "an error when no such span exists. Use it after search_spans "
+                        "gives you the run id and index; use search_spans to find "
+                        "text, not this." % READ_SPAN_MAX_CHARS),
         "inputSchema": {"type": "object", "properties": {
-            "run": {"type": "string"}, "index": {"type": "integer", "minimum": 1},
+            "run": {"type": "string", "description": (
+                "Run id, e.g. \"20261015-120000\": the folder name that "
+                "search_spans prints before the slash in each hit.")},
+            "index": {"type": "integer", "minimum": 1, "description": (
+                "Span number within the run, counting from 1, e.g. 3: the "
+                "file number search_spans prints (0003.json is 3).")},
         }, "required": ["run", "index"]},
         "annotations": _annotations("Read one archived span", open_world=False),
     },

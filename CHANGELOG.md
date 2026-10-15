@@ -13,7 +13,7 @@
   a socket.
 - **MCP Registry markers:** `"mcpName": "io.github.luminarisoftwares/context-guardian"` in `package.json` and a
   `mcp-name:` line in the README PyPI publishes, so the next release can be listed in the official MCP Registry.
-  No `server.json` yet.
+  `server.json` in the repository root describes the package for the Registry.
 - **Lifespan, not `on_event`.** The proxy's upstream client is built and closed in a FastAPI lifespan. The deprecated
   `on_event` hooks produced 351 of the test suite's 352 warnings; that count is now 0.
 - **`GUARDIAN_DRY_RUN=1`**: every compaction is computed (the summariser is still called) and logged as a `dry_run`
