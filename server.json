@@ -1,0 +1,19 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.luminarisoftwares/context-guardian",
+  "title": "Context Guardian",
+  "description": "Compacting proxy for OpenAI-compatible backends, with MCP tools to search the archived history.",
+  "repository": {"url": "https://github.com/LuminariSoftwares/context-guardian", "source": "github"},
+  "version": "0.10.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "context-guardian",
+      "version": "0.10.0",
+      "runtimeHint": "uvx",
+      "transport": {"type": "stdio"},
+      "packageArguments": [{"type": "positional", "value": "mcp"}]
+    }
+  ]
+}

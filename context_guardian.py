@@ -75,6 +75,7 @@ import contextlib
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -90,7 +91,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 # PyPI, importlib.metadata reports the same string off the wheel; this constant
 # is the fallback for a bare `python context_guardian.py` run out of a checkout,
 # where no distribution metadata exists. Keep it in lockstep with pyproject.toml.
-__version__ = "0.9.0"  # keep equal to pyproject.toml version
+__version__ = "0.10.0"  # keep equal to pyproject.toml version
 from starlette.background import BackgroundTask
 
 # Load .env BEFORE any config is read.
@@ -2357,6 +2358,9 @@ def keep_recent_label() -> str:
 
 def main():
     """Console entry point (`context-guardian`) and `python context_guardian.py`."""
+    if sys.argv[1:2] == ["mcp"]:  # `context-guardian mcp` = context-guardian-mcp (the MCP Registry runs `uvx context-guardian mcp`)
+        import cg_mcp
+        sys.exit(cg_mcp.main())
     import uvicorn
     log.info(
         "Starting Context Guardian v%s on port %d, forwarding to %s "
