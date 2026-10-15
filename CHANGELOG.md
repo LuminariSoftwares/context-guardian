@@ -2,6 +2,8 @@
 
 ## dsh-context-guardian 0.1.0-alpha.11 / PyPI context-guardian 0.10.0 (2026-10-14)
 
+- MCP Registry name uses the GitHub owner's case: `io.github.LuminariSoftwares/...` (the registry rejects the lower-case form).
+
 - **`context-guardian mcp`** starts the MCP server (same as `context-guardian-mcp`), so `uvx context-guardian mcp` works; `server.json` for the official MCP Registry.
 
 - **MCP server: `context-guardian-mcp`** (new console script, `cg_mcp.py`, stdlib only). A stdio MCP server with
