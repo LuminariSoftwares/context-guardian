@@ -28,7 +28,7 @@ from typing import Any, Dict, Optional
 import cg_recall_cli
 
 SERVER_NAME = "context-guardian"
-SERVER_VERSION = "0.9.0"  # keep equal to pyproject.toml version
+SERVER_VERSION = "0.10.0"  # keep equal to pyproject.toml version
 # Newest first. The client's version is echoed when supported, else ours.
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 STATUS_TIMEOUT_SECONDS = 3.0

@@ -27,3 +27,7 @@ _archive/
 
 # library: no lockfile
 pnpm-lock.yaml
+
+# mcp-publisher binary (MCP Registry publish)
+_tools/
+mcp-publisher.tar.gz
