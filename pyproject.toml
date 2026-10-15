@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61", "wheel"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,13 +8,13 @@ version = "0.10.0"
 description = "A tiny proxy in front of any OpenAI-compatible LLM backend that compacts conversation history before the context window fills, so local-model coding CLIs don't hard-die from overflow."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "LuminariSoftwares" }]
 keywords = ["ollama", "local-llm", "llm", "openai-api", "proxy", "context-window", "context-management", "litellm", "mcp", "coding-assistant"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
