@@ -391,13 +391,32 @@ On Ollama, Guardian asks `/api/show` for each model's `num_ctx` (see `GUARDIAN_O
 | `search_spans` | Find text in the spans compaction archived (same search as `context-guardian-recall`) |
 | `read_span` | One archived span by run id and index: its summary and original messages, cut at 20,000 characters |
 
+Run it without installing anything first, using [uv](https://docs.astral.sh/uv/):
+
+```
+uvx context-guardian mcp
+```
+
 Claude Desktop (`claude_desktop_config.json`) or any client that takes the same shape:
 
 ```json
-{ "mcpServers": { "context-guardian": { "command": "context-guardian-mcp" } } }
+{
+  "mcpServers": {
+    "context-guardian": {
+      "command": "uvx",
+      "args": ["context-guardian", "mcp"]
+    }
+  }
+}
 ```
 
-Claude Code: `claude mcp add context-guardian -- context-guardian-mcp`
+If you installed the package with pip, `{ "command": "context-guardian-mcp" }` does the same.
+
+Claude Code: `claude mcp add context-guardian -- uvx context-guardian mcp`
+
+Arguments: `search_spans` takes `term` (required), `run` and `max`; `read_span` takes `run` and `index` (both required); `guardian_status` takes none. `guardian_status` needs the proxy running (`context-guardian`); the other two read the span archive on disk.
+
+A [`server.json`](server.json) in the repository root describes the package (PyPI `context-guardian`, launched as `uvx context-guardian mcp`) for the official MCP Registry; the `mcp-name:` line at the top of this README is its ownership marker.
 
 ## Benchmark
 
