@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **MCP server: `context-guardian-mcp`** (new console script, `cg_mcp.py`, stdlib only). A stdio MCP server with
+  three read-only tools: `guardian_status` (the proxy's `/guardian/stats` over loopback), `search_spans` and
+  `read_span` (the span archive). Every tool declares a `title` and the MCP tool annotations `readOnlyHint`,
+  `destructiveHint`, `idempotentHint` and `openWorldHint`; only `guardian_status` is open-world, since only it opens
+  a socket.
+- **MCP Registry markers:** `"mcpName": "io.github.luminarisoftwares/context-guardian"` in `package.json` and a
+  `mcp-name:` line in the README PyPI publishes, so the next release can be listed in the official MCP Registry.
+  No `server.json` yet.
 - **Lifespan, not `on_event`.** The proxy's upstream client is built and closed in a FastAPI lifespan. The deprecated
   `on_event` hooks produced 351 of the test suite's 352 warnings; that count is now 0.
 - **`GUARDIAN_DRY_RUN=1`**: every compaction is computed (the summariser is still called) and logged as a `dry_run`

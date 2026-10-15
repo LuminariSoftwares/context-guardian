@@ -15,6 +15,8 @@
   <img alt="Fails open" src="https://img.shields.io/badge/fails-open-6f42c1.svg">
 </p>
 
+mcp-name: io.github.luminarisoftwares/context-guardian
+
 <p align="center">
   <a href="#quick-start">Quick start</a> &middot;
   <a href="#works-with">Works with</a> &middot;
@@ -378,6 +380,24 @@ On Ollama, Guardian asks `/api/show` for each model's `num_ctx` (see `GUARDIAN_O
 
 - run a second Guardian instance on a different `GUARDIAN_PORT` with its own `GUARDIAN_NUM_CTX`, or
 - keep one instance and accept that its threshold is tuned to whichever model has the smaller/more-constrained window (safer than the alternative, since it just means Guardian compacts a bit earlier than strictly necessary for the larger-window model).
+
+## MCP server
+
+`context-guardian-mcp` (installed with the PyPI package) is a stdio MCP server, so an MCP client can see what the proxy is doing without a terminal. It has three tools, and all three only read:
+
+| Tool | What it does |
+|---|---|
+| `guardian_status` | The running proxy's `/guardian/stats` over loopback (`GUARDIAN_HOST`:`GUARDIAN_PORT`) |
+| `search_spans` | Find text in the spans compaction archived (same search as `context-guardian-recall`) |
+| `read_span` | One archived span by run id and index: its summary and original messages, cut at 20,000 characters |
+
+Claude Desktop (`claude_desktop_config.json`) or any client that takes the same shape:
+
+```json
+{ "mcpServers": { "context-guardian": { "command": "context-guardian-mcp" } } }
+```
+
+Claude Code: `claude mcp add context-guardian -- context-guardian-mcp`
 
 ## Benchmark
 
