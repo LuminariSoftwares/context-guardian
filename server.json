@@ -1,6 +1,6 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.luminarisoftwares/context-guardian",
+  "name": "io.github.LuminariSoftwares/context-guardian",
   "title": "Context Guardian",
   "description": "Compacting proxy for OpenAI-compatible backends, with MCP tools to search the archived history.",
   "repository": {"url": "https://github.com/LuminariSoftwares/context-guardian", "source": "github"},

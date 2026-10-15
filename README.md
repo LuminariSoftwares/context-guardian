@@ -15,7 +15,7 @@
   <img alt="Fails open" src="https://img.shields.io/badge/fails-open-6f42c1.svg">
 </p>
 
-mcp-name: io.github.luminarisoftwares/context-guardian
+mcp-name: io.github.LuminariSoftwares/context-guardian
 
 <p align="center">
   <a href="#quick-start">Quick start</a> &middot;

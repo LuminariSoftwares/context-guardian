@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-NAME = "io.github.luminarisoftwares/context-guardian"
+NAME = "io.github.LuminariSoftwares/context-guardian"
 
 
 def test_both_markers_exist_and_agree():
