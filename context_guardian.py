@@ -71,6 +71,7 @@ by `context-guardian-configure`); see the README for the full list.
 """
 
 import collections
+import contextlib
 import json
 import logging
 import os
@@ -78,6 +79,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, Request
@@ -152,6 +154,31 @@ CHARS_PER_TOKEN_ESTIMATE = float(os.environ.get("GUARDIAN_CHARS_PER_TOKEN", "3.5
 # request and the model IS charged for it. Set GUARDIAN_COUNT_TOOLS=0 to get
 # the old messages-only behaviour back if this ever needs bisecting.
 COUNT_TOOLS = os.environ.get("GUARDIAN_COUNT_TOOLS", "1") not in ("0", "false", "False")
+
+# OLLAMA_CONTEXT: when the upstream is Ollama, ask /api/show once per model for
+# the window it really runs at, instead of trusting GUARDIAN_NUM_CTX to have
+# been kept in step by hand. "auto" (default) means "the upstream is on
+# Ollama's port 11434"; "1" always asks, "0" never does. Any error falls back
+# to GUARDIAN_NUM_CTX for that model.
+OLLAMA_CONTEXT = os.environ.get("GUARDIAN_OLLAMA_CONTEXT", "auto").strip().lower()
+OLLAMA_DEFAULT_PORT = 11434
+# /api/show answers from disk in milliseconds; this only bounds a hung server.
+OLLAMA_SHOW_TIMEOUT_SECONDS = 5.0
+
+# DRY_RUN: compute every compaction (summary included) and log it as a
+# `dry_run` event, but forward the client's request byte-for-byte. For watching
+# what the proxy WOULD do to a live session before letting it do it. No span is
+# written, since nothing is evicted.
+DRY_RUN = os.environ.get("GUARDIAN_DRY_RUN", "0").strip().lower() in ("1", "true", "yes")
+
+# INJECT_STREAM_OPTIONS: a streamed OpenAI-style reply carries no usage block
+# unless the request asked for one, so the calibrator never learns from a
+# streaming client. When on, a streaming chat request without stream_options
+# gets {"include_usage": true}. OFF by default: the client then receives one
+# extra final frame (empty choices + usage) it did not ask for, and a client
+# that indexes choices[0] on every frame breaks on it.
+INJECT_STREAM_OPTIONS = os.environ.get(
+    "GUARDIAN_INJECT_STREAM_OPTIONS", "0").strip().lower() in ("1", "true", "yes")
 
 # --- 0.5.0 additions ---------------------------------------------------------
 # VERBOSE: print a visible multi-line banner on every compaction instead of the
@@ -311,7 +338,6 @@ LOG_PATH = Path(os.environ.get(
 logging.basicConfig(level=logging.INFO, format="[ContextGuardian] %(message)s")
 log = logging.getLogger("context_guardian")
 
-app = FastAPI(title="Context Guardian")
 
 # Running estimate of tokens "in flight" for the current conversation.
 # This is intentionally process-local and best-effort -- it resets if the
@@ -342,6 +368,14 @@ _state = {
     # comment above `last_known_total_tokens` is now only half true, so the raw
     # figure is kept beside it rather than overwriting the only one on display.
     "last_raw_estimate": 0,
+    # GUARDIAN_DRY_RUN: compactions computed and logged but NOT applied, and
+    # the tokens they would have removed.
+    "dry_runs": 0,
+    "dry_run_tokens_saved_total": 0,
+    # The window and input budget the latest request was measured against.
+    # Differs from num_ctx when Ollama's /api/show reported the model's own.
+    "last_num_ctx": NUM_CTX,
+    "last_input_budget": 0,
 }
 
 # When this process started, for the health view's uptime line.
@@ -563,8 +597,14 @@ def calibration_enabled() -> bool:
         "0", "false", "no")
 
 
-@app.on_event("startup")
-async def _startup() -> None:
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Build the shared upstream client at startup and close it at shutdown.
+
+    A lifespan, not the on_event decorator: FastAPI deprecated it, and every
+    import of this module emitted two DeprecationWarnings that buried any real
+    warning in the test summary.
+    """
     global _http_client
     # httpx's bare default (5s connect/read/write/pool) is sized for
     # ordinary REST APIs, not local LLM inference -- a "thinking" model can
@@ -577,12 +617,83 @@ async def _startup() -> None:
         timeout=httpx.Timeout(UPSTREAM_TIMEOUT_SECONDS,
                               connect=UPSTREAM_CONNECT_TIMEOUT_SECONDS)
     )
+    try:
+        yield
+    finally:
+        if _http_client is not None:
+            await _http_client.aclose()
 
 
-@app.on_event("shutdown")
-async def _shutdown() -> None:
-    if _http_client is not None:
-        await _http_client.aclose()
+app = FastAPI(title="Context Guardian", lifespan=_lifespan)
+
+
+# model name -> window /api/show reported, or None when asking failed. Filled
+# once per model and kept for the life of the process.
+_ollama_windows: Dict[str, Optional[int]] = {}
+
+
+def upstream_is_ollama() -> bool:
+    if OLLAMA_CONTEXT in ("0", "false", "no", "off"):
+        return False
+    if OLLAMA_CONTEXT in ("1", "true", "yes", "on"):
+        return True
+    try:
+        return urlparse(UPSTREAM_URL).port == OLLAMA_DEFAULT_PORT
+    except ValueError:
+        return False
+
+
+def window_from_show(data: Any) -> Optional[int]:
+    """The context window out of an /api/show response, or None. May raise on
+    junk; the caller treats any exception as "unknown".
+
+    `num_ctx` in the model's parameters is the window Ollama will actually run
+    the model at, so it wins. `<arch>.context_length` is only the model's
+    TRAINED maximum: Ollama may run it at far less, and believing the bigger
+    number would make this proxy compact late -- the overflow it exists to
+    stop. So context_length can only LOWER the configured window, never raise it.
+    """
+    params = data.get("parameters")
+    if isinstance(params, str):
+        for line in params.splitlines():
+            fields = line.split()
+            if len(fields) == 2 and fields[0] == "num_ctx":
+                n = int(fields[1])
+                if n > 0:
+                    return n
+    info = data.get("model_info")
+    if isinstance(info, dict):
+        for key, value in info.items():
+            if (key.endswith(".context_length") and isinstance(value, int)
+                    and not isinstance(value, bool) and value > 0):
+                return min(value, NUM_CTX)
+    return None
+
+
+async def context_window(client: httpx.AsyncClient, model: str) -> int:
+    """The window to budget this model against. GUARDIAN_NUM_CTX unless the
+    upstream is Ollama and /api/show says otherwise. Never raises."""
+    if not model or not upstream_is_ollama():
+        return NUM_CTX
+    if model not in _ollama_windows:
+        found = None
+        root = UPSTREAM_URL.rstrip("/")
+        if root.endswith("/v1"):
+            root = root[:-3]
+        try:
+            resp = await client.post(f"{root}/api/show", json={"model": model},
+                                     timeout=OLLAMA_SHOW_TIMEOUT_SECONDS)
+            resp.raise_for_status()
+            found = window_from_show(resp.json())
+            log.info("Ollama reports a %s-token window for %s%s.",
+                     found if found else "unstated", model,
+                     "" if found else "; using GUARDIAN_NUM_CTX=%d" % NUM_CTX)
+        except Exception as exc:                           # noqa: BLE001
+            log.warning("Ollama /api/show for %s failed (%s: %s); using "
+                        "GUARDIAN_NUM_CTX=%d for this model.", model,
+                        type(exc).__name__, exc, NUM_CTX)
+        _ollama_windows[model] = found
+    return _ollama_windows[model] or NUM_CTX
 
 
 def estimate_tool_tokens(payload: Dict[str, Any]) -> int:
@@ -800,7 +911,45 @@ def keep_recent_count(non_system: List[Dict[str, Any]], num_ctx: int = None,
     return min(len(non_system), max(n, KEEP_RECENT_MIN_MESSAGES))
 
 
-def partition_messages(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _split_system(messages: List[Dict[str, Any]]):
+    """(real system prompts, kept Guardian summaries, retired ones, the rest)."""
+    system_all = [m for m in messages if m.get("role") == "system"]
+    non_system = [m for m in messages if m.get("role") != "system"]
+
+    real_system = [m for m in system_all if not is_guardian_summary(m)]
+    prior = [m for m in system_all if is_guardian_summary(m)]
+
+    keep_n = max(0, KEEP_SUMMARIES)
+    kept_summaries = prior[len(prior) - keep_n:] if keep_n else []
+    retired_summaries = prior[:len(prior) - len(kept_summaries)]
+    return real_system, kept_summaries, retired_summaries, non_system
+
+
+def partition_short(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """The split for a conversation too short for keep-recent to leave anything
+    to summarise (KEEP_RECENT_MESSAGES + 1 messages or fewer). Pure.
+
+    Keeps the first user message (the task) and everything from the last user
+    message on (the live turn) verbatim, and summarises what lies between --
+    typically one huge assistant reply or tool result. Nothing between them
+    means nothing to summarise, and the caller fails open.
+    """
+    real_system, kept_summaries, retired_summaries, non_system = _split_system(messages)
+    users = [i for i, m in enumerate(non_system) if m.get("role") == "user"]
+    middle: List[Dict[str, Any]] = []
+    to_keep = non_system
+    if len(users) >= 2 and users[-1] - users[0] > 1:
+        first, last = users[0], users[-1]
+        middle = non_system[first + 1:last]
+        to_keep = non_system[:first + 1] + non_system[last:]
+    return {"real_system": real_system, "kept_summaries": kept_summaries,
+            "retired_summaries": retired_summaries if middle else [],
+            "to_summarize": retired_summaries + middle if middle else [],
+            "to_keep": to_keep}
+
+
+def partition_messages(messages: List[Dict[str, Any]],
+                       num_ctx: int = None) -> Dict[str, Any]:
     """Split a conversation into what is kept, retired, and summarised.
 
     Pure -- no HTTP, no clock, no globals beyond config. Split out of
@@ -811,17 +960,9 @@ def partition_messages(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     Returns keys: real_system, kept_summaries, retired_summaries,
     to_summarize, to_keep.
     """
-    system_all = [m for m in messages if m.get("role") == "system"]
-    non_system = [m for m in messages if m.get("role") != "system"]
+    real_system, kept_summaries, retired_summaries, non_system = _split_system(messages)
 
-    real_system = [m for m in system_all if not is_guardian_summary(m)]
-    prior = [m for m in system_all if is_guardian_summary(m)]
-
-    keep_n = max(0, KEEP_SUMMARIES)
-    kept_summaries = prior[len(prior) - keep_n:] if keep_n else []
-    retired_summaries = prior[:len(prior) - len(kept_summaries)]
-
-    keep = keep_recent_count(non_system)
+    keep = keep_recent_count(non_system, num_ctx=num_ctx)
     cut = len(non_system) - keep if keep else len(non_system)
     cut = max(0, min(cut, len(non_system)))
     cut = _safe_cut(non_system, cut)
@@ -1166,6 +1307,76 @@ async def summarize_older_messages(
         return None
 
 
+def _summary_message(to_summarize: List[Dict[str, Any]], summary: str,
+                     pointer: str) -> Dict[str, Any]:
+    return {
+        "role": "system",
+        "content": (
+            "[Context Guardian auto-compaction — earlier conversation "
+            f"({len(to_summarize)} messages) condensed to stay within the "
+            "context window:]\n\n" + summary + pointer
+        ),
+    }
+
+
+def _compaction_event(name: str, index: int, messages: List[Dict[str, Any]],
+                      new_messages: List[Dict[str, Any]],
+                      to_keep: List[Dict[str, Any]], estimated: int,
+                      message_tokens: int, tool_tokens: int,
+                      span_path: Optional[str], summary: str) -> Dict[str, Any]:
+    """The log record of one compaction. A dry run writes the same record
+    under its own event name, so the two can be compared field for field."""
+    # Compute the "after" figures once and reuse -- estimate_tokens walks every
+    # message, so calling it three times on the request path was pure waste.
+    msgs_after_tokens = estimate_tokens(new_messages)
+    tokens_after = msgs_after_tokens + tool_tokens
+    return {
+        "event": name,
+        # RUN_ID scopes an event to this process, so /guardian/events (and the
+        # dashboard's compaction monitor) can show only the current session's
+        # compactions rather than everything ever logged to this file.
+        "run_id": RUN_ID,
+        "compaction_index": index,
+        "messages_before": len(messages),
+        "messages_after": len(new_messages),
+        # Recent messages forwarded verbatim (what keep-recent actually kept).
+        "kept_messages": len(to_keep),
+        "estimated_tokens_before": estimated,
+        "estimated_tokens_after": tokens_after,
+        "message_tokens_before": message_tokens,
+        "message_tokens_after": msgs_after_tokens,
+        "tool_tokens": tool_tokens,
+        # Tokens this compaction removed from the outgoing request. Clamp at 0:
+        # a summary is normally far smaller than what it replaced, but a
+        # pathological tiny eviction should never subtract from the running
+        # savings total.
+        "tokens_saved": max(0, estimated - tokens_after),
+        "span_file": span_path,
+        "span_written": span_path is not None,
+        "summary_preview": summary[:500],
+    }
+
+
+def _log_dry_run(messages, system_msgs, to_summarize, to_keep, summary,
+                 estimated, message_tokens, tool_tokens) -> None:
+    """Record what this compaction WOULD have done. Never raises: the caller
+    forwards the original request whatever happens here."""
+    try:
+        new_messages = system_msgs + [_summary_message(to_summarize, summary, "")] + to_keep
+        event = _compaction_event("dry_run", _state["dry_runs"] + 1, messages,
+                                  new_messages, to_keep, estimated,
+                                  message_tokens, tool_tokens, None, summary)
+        _state["dry_runs"] += 1
+        _state["dry_run_tokens_saved_total"] += event["tokens_saved"]
+        log_event(event)
+        log.info("DRY RUN #%d: would compact %d -> %d messages, ~%d -> ~%d "
+                 "tokens (saving ~%d). Forwarding the original unchanged.",
+                 _state["dry_runs"], len(messages), len(new_messages), estimated,
+                 event["estimated_tokens_after"], event["tokens_saved"])
+    except Exception as exc:                               # noqa: BLE001
+        log.warning("dry run bookkeeping failed, request unaffected: %s", exc)
+
+
 async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> Dict[str, Any]:
     """Returns a (possibly rewritten) payload. Never returns something with
     LESS information than the original unless the summarization call
@@ -1190,7 +1401,10 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
     # Compact against the budget the INPUT is actually allowed to occupy, which
     # is the window minus the space the model needs to think and answer. Take
     # whichever limit is stricter so lowering COMPACT_THRESHOLD still works.
-    threshold_tokens = effective_threshold()
+    num_ctx = await context_window(client, calib_model)
+    threshold_tokens = effective_threshold(num_ctx=num_ctx)
+    _state["last_num_ctx"] = num_ctx
+    _state["last_input_budget"] = threshold_tokens
 
     # Tool definitions are a FLOOR, not a thing compaction can reduce -- this
     # proxy can only summarise messages. Say so out loud the first time a
@@ -1198,18 +1412,18 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
     # is looking at the real cause instead of blaming the summariser.
     if tool_tokens and tool_tokens != _state.get("logged_tool_tokens"):
         _state["logged_tool_tokens"] = tool_tokens
-        share = tool_tokens / NUM_CTX if NUM_CTX else 0
+        share = tool_tokens / num_ctx if num_ctx else 0
         log.info("Tool definitions in this request: ~%d tokens (%.1f%% of %d). "
                  "Compaction CANNOT reduce this -- only loading fewer MCP "
-                 "servers can.", tool_tokens, share * 100, NUM_CTX)
+                 "servers can.", tool_tokens, share * 100, num_ctx)
         log_event({"event": "tool_budget", "tool_tokens": tool_tokens,
-                   "num_ctx": NUM_CTX, "share_of_ctx": round(share, 3),
+                   "num_ctx": num_ctx, "share_of_ctx": round(share, 3),
                    "note": "fixed floor; not reducible by compaction"})
-        usable = NUM_CTX - RESERVE_OUTPUT - tool_tokens
+        usable = num_ctx - RESERVE_OUTPUT - tool_tokens
         log.info("Budget for conversation after tools and reserved output: "
                  "~%d tokens (window %d - reserve %d - tools %d).",
-                 usable, NUM_CTX, RESERVE_OUTPUT, tool_tokens)
-        log_event({"event": "budget", "num_ctx": NUM_CTX,
+                 usable, num_ctx, RESERVE_OUTPUT, tool_tokens)
+        log_event({"event": "budget", "num_ctx": num_ctx,
                    "reserve_output": RESERVE_OUTPUT, "tool_tokens": tool_tokens,
                    "usable_for_messages": usable})
         if usable < 4000:
@@ -1218,21 +1432,27 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
                         "model to skip MCP tools and fall back to built-ins. "
                         "Load fewer MCP servers -- compaction cannot help here.",
                         usable, tool_tokens, RESERVE_OUTPUT)
-        if tool_tokens >= NUM_CTX:
+        if tool_tokens >= num_ctx:
             log.warning("TOOL DEFINITIONS ALONE (%d) EXCEED THE WHOLE CONTEXT "
                         "WINDOW (%d). Nothing this proxy does can fix that. "
                         "Launch with --strict-mcp-config and a smaller server "
-                        "set.", tool_tokens, NUM_CTX)
+                        "set.", tool_tokens, num_ctx)
 
-    if estimated < threshold_tokens or len(messages) <= KEEP_RECENT_MESSAGES + 1:
+    if estimated < threshold_tokens:
         return payload
 
     log.info(
         "Estimated %d tokens >= threshold %d (%.0f%% of %d) -- compacting.",
-        estimated, threshold_tokens, COMPACT_THRESHOLD * 100, NUM_CTX,
+        estimated, threshold_tokens, COMPACT_THRESHOLD * 100, num_ctx,
     )
 
-    part = partition_messages(messages)
+    # A conversation this short leaves keep-recent nothing to summarise. It
+    # used to be skipped outright, so three messages with one huge reply in the
+    # middle went upstream over the window every time.
+    if len(messages) <= KEEP_RECENT_MESSAGES + 1:
+        part = partition_short(messages)
+    else:
+        part = partition_messages(messages, num_ctx=num_ctx)
     system_msgs = part["real_system"] + part["kept_summaries"]
     to_summarize = part["to_summarize"]
     to_keep = part["to_keep"]
@@ -1266,7 +1486,7 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
             "happening.",
             "None" if summary is None
             else "%d usable chars" % len(summary.strip()),
-            MIN_SUMMARY_CHARS, len(to_summarize), estimated, NUM_CTX,
+            MIN_SUMMARY_CHARS, len(to_summarize), estimated, num_ctx,
             _state["summaries_rejected_empty"])
         log_event({"event": "compaction_refused",
                    "reason": "empty_or_short_summary",
@@ -1274,7 +1494,12 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
                    "min_summary_chars": MIN_SUMMARY_CHARS,
                    "messages_not_evicted": len(to_summarize),
                    "estimated_tokens": estimated,
-                   "num_ctx": NUM_CTX})
+                   "num_ctx": num_ctx})
+        return payload
+
+    if DRY_RUN:
+        _log_dry_run(messages, system_msgs, to_summarize, to_keep, summary,
+                     estimated, message_tokens, tool_tokens)
         return payload
 
     # Evict to disk BEFORE the messages are replaced. If this ran after, a crash
@@ -1312,58 +1537,25 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
                    f"(from a source checkout: `python {RECALL_SCRIPT} "
                    f"\"<term>\" --run {RUN_ID}`).]")
 
-    summary_message = {
-        "role": "system",
-        "content": (
-            "[Context Guardian auto-compaction — earlier conversation "
-            f"({len(to_summarize)} messages) condensed to stay within the "
-            "context window:]\n\n" + summary + pointer
-        ),
-    }
-
-    new_messages = system_msgs + [summary_message] + to_keep
+    new_messages = system_msgs + [_summary_message(to_summarize, summary, pointer)] + to_keep
     new_payload = dict(payload)
     new_payload["messages"] = new_messages
 
-    # Compute the "after" figures once and reuse -- estimate_tokens walks every
-    # message, so calling it three times on the request path was pure waste.
-    msgs_after_tokens = estimate_tokens(new_messages)
-    tokens_after = msgs_after_tokens + tool_tokens
-    # Tokens this compaction removed from the outgoing request. Clamp at 0: a
-    # summary is normally far smaller than what it replaced, but a pathological
-    # tiny eviction should never subtract from the running savings total.
-    tokens_saved = max(0, estimated - tokens_after)
-
     _state["compactions_performed"] += 1
+    event = _compaction_event("compaction", _state["compactions_performed"],
+                              messages, new_messages, to_keep, estimated,
+                              message_tokens, tool_tokens, span_path, summary)
+    tokens_after = event["estimated_tokens_after"]
+    tokens_saved = event["tokens_saved"]
     _state["tokens_saved_total"] += tokens_saved
-    log_event({
-        "event": "compaction",
-        # RUN_ID scopes an event to this process, so /guardian/events (and the
-        # dashboard's compaction monitor) can show only the current session's
-        # compactions rather than everything ever logged to this file.
-        "run_id": RUN_ID,
-        "compaction_index": _state["compactions_performed"],
-        "messages_before": len(messages),
-        "messages_after": len(new_messages),
-        # Recent messages forwarded verbatim (what keep-recent actually kept).
-        "kept_messages": len(to_keep),
-        "estimated_tokens_before": estimated,
-        "estimated_tokens_after": tokens_after,
-        "message_tokens_before": message_tokens,
-        "message_tokens_after": msgs_after_tokens,
-        "tool_tokens": tool_tokens,
-        "tokens_saved": tokens_saved,
-        "span_file": span_path,
-        "span_written": span_path is not None,
-        "summary_preview": summary[:500],
-    })
+    log_event(event)
 
     if VERBOSE:
         # A visible banner, not a line that scrolls past in a busy log. This is
         # the moment the operator most wants to know the proxy acted and that it
         # did not silently drop anything -- span_written says the evicted text is
         # on disk, tokens_saved says how much room it bought.
-        pct = (100.0 * tokens_after / NUM_CTX) if NUM_CTX else 0.0
+        pct = (100.0 * tokens_after / num_ctx) if num_ctx else 0.0
         span_note = (f"archived -> {span_path}" if span_path
                      else "NOT archived (span write skipped)")
         cost_line = ""
@@ -1381,7 +1573,7 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
             "  +-----------------------------------------------------------",
             _state["compactions_performed"], len(messages), len(new_messages),
             estimated, tokens_after, tokens_saved, tool_tokens,
-            tokens_after, NUM_CTX, pct, span_note, cost_line,
+            tokens_after, num_ctx, pct, span_note, cost_line,
         )
     else:
         log.info(
@@ -1529,6 +1721,10 @@ async def stats():
         "latest_version": (_update_notice or {}).get("latest"),
         "update_available": _update_notice is not None,
         "verbose": VERBOSE,
+        "dry_run": DRY_RUN,
+        "inject_stream_options": INJECT_STREAM_OPTIONS,
+        "ollama_context_enabled": upstream_is_ollama(),
+        "ollama_context": {m: n for m, n in _ollama_windows.items() if n},
         "uptime_seconds": round(time.time() - STARTED_AT, 1),
         "cost_per_1m_input_usd": COST_PER_1M_INPUT_USD,
         "cost_saved_usd": cost_saved_usd(),
@@ -1753,7 +1949,7 @@ async function tick(){
   $("status").className="pill ok";$("status").textContent="live";
   $("ver").textContent="v"+(s.version||"?");
   $("upstream").textContent="-> "+(s.upstream||"");
-  budget=e.effective_input_budget||s.effective_input_budget||s.num_ctx||1;
+  budget=s.last_input_budget||e.effective_input_budget||s.effective_input_budget||s.num_ctx||1;
 
   const used=s.last_known_total_tokens||0, up=pct(used), rejected=s.summaries_rejected_empty||0;
   $("cards").innerHTML=[
@@ -1765,7 +1961,9 @@ async function tick(){
     card("Tool definitions",fmt(s.last_tool_tokens||0),"fixed floor - compaction can't touch it"),
     card("Rejected summaries",fmt(rejected),rejected?"empty/degenerate - investigate":"none - healthy"),
     card("Uptime",human(s.uptime_seconds),`run ${s.run_id||""}`),
-    estimateCard(s)
+    estimateCard(s),
+    ...(s.dry_run||s.dry_runs?[card("Dry runs",fmt(s.dry_runs),
+      `would have saved ${fmt(s.dry_run_tokens_saved_total)} tokens &middot; requests forwarded unchanged`)]:[])
   ].join("");
   if(rejected){$("cards").children[4].querySelector(".big").style.color="#f85149";}
 
@@ -1855,6 +2053,26 @@ async def _tapped_stream(chunks, upstream_resp: httpx.Response,
             log.debug("usage calibration tap failed, response unaffected: %s", exc)
 
 
+async def rewrite_chat_payload(client: httpx.AsyncClient,
+                               payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Everything the proxy may change in a chat/completions body. Returns the
+    SAME object when nothing changed, so the caller can forward the original
+    bytes."""
+    return with_stream_options(await maybe_compact(client, payload))
+
+
+def with_stream_options(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """GUARDIAN_INJECT_STREAM_OPTIONS: ask for the usage frame on a streaming
+    request, never over the client's own stream_options. Same object back
+    when nothing is added."""
+    if (not INJECT_STREAM_OPTIONS or payload.get("stream") is not True
+            or "stream_options" in payload):
+        return payload
+    out = dict(payload)
+    out["stream_options"] = {"include_usage": True}
+    return out
+
+
 @app.api_route("/v1/{path:path}", methods=["GET", "POST"])
 async def proxy(path: str, request: Request):
     """Generic passthrough for everything except chat/completions, which
@@ -1870,7 +2088,7 @@ async def proxy(path: str, request: Request):
         # request path -- stripped, the next line raises AttributeError on
         # None; unstripped it was a bare 500. Either way the client sees an
         # unreadable error for a startup problem.
-        log.error("HTTP client is not initialised -- the startup event did "
+        log.error("HTTP client is not initialised -- the lifespan did "
                   "not run. Is the app being served by something that skips "
                   "lifespan events?")
         return JSONResponse(
@@ -1897,8 +2115,20 @@ async def proxy(path: str, request: Request):
         # an object is not something this proxy understands; pass it through
         # untouched and let the backend rule on it.
         if isinstance(payload, dict):
-            payload = await maybe_compact(client, payload)
-            body_bytes = json.dumps(payload).encode("utf-8")
+            # FAIL-OPEN for the whole rewrite step. Whatever raises in here --
+            # a bug in compaction, a dry run, an injected field -- costs the
+            # rewrite, never the request: it goes upstream as the client sent it.
+            try:
+                rewritten = await rewrite_chat_payload(client, payload)
+            except Exception as exc:                       # noqa: BLE001
+                log.error("Rewriting the request failed (%s: %s). Forwarding "
+                          "it unchanged.", type(exc).__name__, exc)
+                rewritten = payload
+            # Unchanged means the client's own bytes, not a re-serialisation:
+            # key order, spacing and number formatting all survive.
+            if rewritten is not payload:
+                body_bytes = json.dumps(rewritten).encode("utf-8")
+            payload = rewritten
             # Grabbed HERE, immediately after the estimate was recorded and
             # before anything else can touch _state. Only chat/completions
             # gets a usage block back; every other route keeps the raw stream

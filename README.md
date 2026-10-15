@@ -293,7 +293,8 @@ cp .env.example .env
 |---|---|---|
 | `GUARDIAN_PORT` | `8786` | Port Guardian itself listens on |
 | `GUARDIAN_UPSTREAM_URL` | `http://localhost:11434/v1` | The OpenAI-compatible backend Guardian forwards to |
-| `GUARDIAN_NUM_CTX` | `32768` | Your model's real context window, in tokens — keep this in sync with your actual backend/model config |
+| `GUARDIAN_NUM_CTX` | `32768` | Your model's real context window, in tokens — keep this in sync with your actual backend/model config. On Ollama the proxy can read it per model instead: see `GUARDIAN_OLLAMA_CONTEXT` |
+| `GUARDIAN_OLLAMA_CONTEXT` | `auto` | When the upstream is Ollama (`auto`: the upstream URL is on port 11434; `1` always, `0` never), ask `/api/show` once per model and budget against the `num_ctx` it reports. A model that reports only its trained `context_length` can lower `GUARDIAN_NUM_CTX` but never raise it, since Ollama may run it at less. Any error falls back to `GUARDIAN_NUM_CTX` for that model for the rest of the run |
 | `GUARDIAN_COMPACT_THRESHOLD` | `0.85` | Fraction of `GUARDIAN_NUM_CTX` at which compaction triggers |
 | `GUARDIAN_KEEP_RECENT_MESSAGES` | unset | Unset (the default): keep the newest messages that fit in `GUARDIAN_KEEP_RECENT_FRACTION` of the usable window (`GUARDIAN_NUM_CTX` − `GUARDIAN_RESERVE_OUTPUT`), never fewer than 4 — a 40 KB tool result counts as what it is, not as one message. Set a number to keep exactly that many messages instead (the old fixed-count behaviour; `0` keeps none) |
 | `GUARDIAN_KEEP_RECENT_FRACTION` | `0.20` | Share of the usable window kept verbatim when `GUARDIAN_KEEP_RECENT_MESSAGES` is unset |
@@ -316,6 +317,8 @@ cp .env.example .env
 | `GUARDIAN_COST_PER_1M_INPUT_USD` | `0` | Price of 1M input tokens on the hosted API you're *avoiding* by running locally. When set, Guardian reports the running dollar value of the tokens compaction has kept you from re-sending. `0` (default) omits the cost line — you're on a local model, there's no real bill |
 | `GUARDIAN_VERSION_CHECK` | `1` | On startup, ask PyPI once (2s timeout, cached 24h, fully fail-open) whether a newer `context-guardian` exists and print one line if so. Set `0` to disable — airgapped/privacy setups never touch the network |
 | `GUARDIAN_VERSION_CACHE` | `<repo>/logs/.version_check_cache.json` | Where the update check caches PyPI's answer so frequent restarts don't re-hit the network (24h TTL) |
+| `GUARDIAN_DRY_RUN` | `0` | `1`: compute every compaction (the summariser is still called) and log it as a `dry_run` event with the same fields as a real one, but forward the client's request byte-for-byte. Counted on the health dashboard. For watching what the proxy would do before letting it |
+| `GUARDIAN_INJECT_STREAM_OPTIONS` | `0` | `1`: add `stream_options: {"include_usage": true}` to streaming chat requests that do not already carry `stream_options`, so the usage frame reaches the calibrator. Off by default because the client then receives one extra final frame with empty `choices`, which some clients do not expect |
 
 **A note on timeouts:** local "thinking"/reasoning models can go silent for a long time before their first output token. If you see `500` errors appear only on real (non-trivial) requests after a long pause, raise `GUARDIAN_UPSTREAM_TIMEOUT` before assuming something is broken — the default 5-second timeout most HTTP clients ship with is sized for ordinary REST APIs, not local LLM inference, which is exactly the bug this project's own commit history caught during development.
 
@@ -371,10 +374,24 @@ Standard library only; it never changes a file.
 
 ## Running multiple models with different context windows
 
-Guardian's `GUARDIAN_NUM_CTX` is fixed for the lifetime of one running instance. If you switch between models with meaningfully different context windows, either:
+On Ollama, Guardian asks `/api/show` for each model's `num_ctx` (see `GUARDIAN_OLLAMA_CONTEXT`), so a model whose Modelfile sets `num_ctx` is budgeted against its own window. Otherwise `GUARDIAN_NUM_CTX` is fixed for the lifetime of one running instance. If you switch between models with meaningfully different context windows, either:
 
 - run a second Guardian instance on a different `GUARDIAN_PORT` with its own `GUARDIAN_NUM_CTX`, or
 - keep one instance and accept that its threshold is tuned to whichever model has the smaller/more-constrained window (safer than the alternative, since it just means Guardian compacts a bit earlier than strictly necessary for the larger-window model).
+
+## Benchmark
+
+`scripts/bench_proxy.py` drives a scripted agent conversation (user turns, tool calls with large results, assistant replies; the client resends its whole history every turn) through the real proxy app against an in-process stub upstream, and prints one line. Same `--turns` and `--seed` give the same token figures; latency depends on the machine. Nothing touches the network or the repository.
+
+```bash
+python scripts/bench_proxy.py --turns 40 --seed 1
+```
+
+Measured against a stub upstream (not a real model; the stub summarises instantly, so `added_ms` is the proxy's own overhead, not summarisation time), 2026-10-14, Python 3.11, Linux container:
+
+```
+turns=40 tokens_before=1130722 tokens_after=160310 compactions=27 p50_added_ms=5.07 p95_added_ms=7.20
+```
 
 ## Development / running tests
 

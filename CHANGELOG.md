@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+- **Lifespan, not `on_event`.** The proxy's upstream client is built and closed in a FastAPI lifespan. The deprecated
+  `on_event` hooks produced 351 of the test suite's 352 warnings; that count is now 0.
+- **`GUARDIAN_DRY_RUN=1`**: every compaction is computed (the summariser is still called) and logged as a `dry_run`
+  event with the same fields as a `compaction` event, while the client's request goes upstream byte-for-byte and no
+  span is written. `/guardian/stats` adds `dry_run`, `dry_runs` and `dry_run_tokens_saved_total`; the health
+  dashboard shows a Dry runs card.
+- **Fail-open rewrite step.** An exception anywhere in compaction or the request rewrite now forwards the request as
+  the client sent it, instead of a 500. A request the proxy did not change is forwarded as the client's own bytes
+  rather than a re-serialisation.
+- **Ollama window from `/api/show`** (`GUARDIAN_OLLAMA_CONTEXT`, default `auto` = upstream on port 11434): asked once
+  per model and cached for the process. A `num_ctx` in the model's parameters becomes the budget base; a trained
+  `context_length` can only lower `GUARDIAN_NUM_CTX`. Any error falls back to `GUARDIAN_NUM_CTX`. `/guardian/stats`
+  adds `ollama_context`, `last_num_ctx` and `last_input_budget`.
+- **Short conversations compact.** A conversation of `KEEP_RECENT_MESSAGES + 1` messages or fewer (5 by default) that
+  is over budget was skipped; it now keeps the first user message and the last user turn verbatim and summarises
+  what lies between.
+- **`GUARDIAN_INJECT_STREAM_OPTIONS=1`** (off by default): streaming chat requests without `stream_options` get
+  `{"include_usage": true}`, so the calibrator learns from streaming clients.
+- **`scripts/bench_proxy.py --turns N --seed S`**: a re-runnable benchmark through the real proxy app against a stub
+  upstream; README has a Benchmark section with one measured line.
+
 ## dsh-context-guardian 0.1.0-alpha.10 / PyPI context-guardian 0.9.0 (2026-10-10)
 
 - **`context-guardian-recall <term> [--run RUN_ID]`** (new console script, `cg_recall_cli.py`): searches the span
