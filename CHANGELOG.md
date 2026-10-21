@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+- **MCP: `guardian_status` is now `get_proxy_status`**, so every tool name is `verb_noun` (Glama's coherence review
+  marked the noun-phrase name down). `guardian_status` still answers `tools/call` as a deprecated alias; it is no
+  longer listed, because two names for one tool is the ambiguity a client's model should not have to resolve. A
+  client allow-list that names `guardian_status` needs the new name.
+- **MCP: new `list_spans` tool.** Lists the runs in the span archive (newest first, with span counts) or, given
+  `run`, the spans in that run with message counts and the start of each summary, so a run id or span number can be
+  found without a search term. Read-only, local files only; `max` caps the list (default 20, up to 100).
+- **MCP: `get_proxy_status` declares an `outputSchema`** and returns the stats as `structuredContent` beside the same
+  JSON text as before. A port that answers with JSON that is not an object is now an error result instead of being
+  passed through as stats.
+- **MCP tool definitions say when to use each tool, what it touches and what comes back.** Every description names
+  the siblings to use instead, what the tool reads (local span files, or one loopback GET) and its output shape.
+  Every parameter carries a type, constraints (`minLength`, `pattern`, `minimum`/`maximum`), a default where it has
+  one, and `examples`; every input schema sets `additionalProperties: false`. The advertised `run` pattern is the one
+  the server already enforced (`^[A-Za-z0-9_-]+$`). Arguments and text results of the existing tools are unchanged.
+- `read_span` treats a span whose `messages` is not a list as having no messages, instead of iterating whatever is
+  there.
+- **README tool reference generated from the schemas**: `python tools/gen_mcp_reference.py --write` renders it from
+  `cg_mcp.TOOLS`, and the suite fails when the two differ. The README also gains an Architecture section
+  (request-path diagram, file map, design decisions with trade-offs), MCP client configs for Claude Desktop, Claude
+  Code and generic stdio clients, a How it's tested section, and more honest limits.
+- **`docs/adr/`**: six decision records for choices already in the code (fail open, character estimate with
+  calibration, JSON span archive, two front doors, keep-recent budget, stdlib read-only MCP server).
+- **`Dockerfile`** for hosts that build MCP servers in a container (Glama's build check):
+  `docker build -t context-guardian-mcp . && docker run -i --rm context-guardian-mcp`.
+- **Tests:** every tool and parameter must be fully documented; `tools/list` over stdio must equal `cg_mcp.TOOLS`;
+  `search_spans` and `list_spans` honour `max`; the deprecated name still answers and is not listed; `glama.json`, `server.json` and the `Dockerfile` must agree with `pyproject.toml`.
+
 ## dsh-context-guardian 0.1.0-alpha.11 / PyPI context-guardian 0.10.0 (2026-10-14)
 
 - MCP Registry name uses the GitHub owner's case: `io.github.LuminariSoftwares/...` (the registry rejects the lower-case form).

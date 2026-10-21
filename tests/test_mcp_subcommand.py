@@ -17,4 +17,4 @@ def test_context_guardian_mcp_subcommand_speaks_mcp(tmp_path):
     lines = [json.loads(x) for x in r.stdout.splitlines() if x.strip()]
     assert lines[0]["result"]["serverInfo"]["name"] == "context-guardian"
     names = sorted(t["name"] for t in lines[1]["result"]["tools"])
-    assert names == ["guardian_status", "read_span", "search_spans"]
+    assert names == ["get_proxy_status", "list_spans", "read_span", "search_spans"]

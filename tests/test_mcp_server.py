@@ -102,9 +102,9 @@ def test_the_hints_match_what_each_tool_does(client):
         assert tool["annotations"]["readOnlyHint"] is True, name
         assert tool["annotations"]["destructiveHint"] is False, name
     # Only the status tool opens a socket (to the proxy on loopback).
-    assert tools["guardian_status"]["annotations"]["openWorldHint"] is True
-    assert tools["search_spans"]["annotations"]["openWorldHint"] is False
-    assert tools["read_span"]["annotations"]["openWorldHint"] is False
+    assert tools["get_proxy_status"]["annotations"]["openWorldHint"] is True
+    for name in ("list_spans", "search_spans", "read_span"):
+        assert tools[name]["annotations"]["openWorldHint"] is False, name
 
 
 def test_search_spans_finds_an_archived_message(client):
@@ -132,7 +132,7 @@ def test_read_span_refuses_bad_or_missing_spans(client, args):
 
 
 def test_status_with_no_proxy_is_a_tool_error_not_a_crash(client):
-    res = client.call("tools/call", {"name": "guardian_status", "arguments": {}})["result"]
+    res = client.call("tools/call", {"name": "get_proxy_status", "arguments": {}})["result"]
     assert res["isError"] is True
     assert "not reachable" in res["content"][0]["text"]
     # the server is still alive afterwards
@@ -158,3 +158,78 @@ def test_server_version_matches_the_package():
     version = re.search(r'^version = "([^"]+)"', (ROOT / "pyproject.toml").read_text(
         encoding="utf-8"), re.M).group(1)
     assert cg_mcp.SERVER_VERSION == version
+
+
+def test_tools_list_over_stdio_is_exactly_the_documented_definitions(client):
+    # The README reference and the quality tests read cg_mcp.TOOLS; this proves that is what a client receives.
+    sys.path.insert(0, str(ROOT))
+    import cg_mcp
+    listed = client.call("tools/list")["result"]["tools"]
+    assert json.loads(json.dumps(cg_mcp.TOOLS)) == listed
+
+
+def test_search_spans_max_limits_the_hits(client):
+    res = client.call("tools/call", {"name": "search_spans",
+                                     "arguments": {"term": "e", "max": 1}})["result"]
+    lines = res["content"][0]["text"].splitlines()
+    assert len(lines) == 2 and lines[1].startswith("(stopped at 1 hits")
+
+
+def test_the_0_10_name_guardian_status_still_answers(client):
+    res = client.call("tools/call", {"name": "guardian_status", "arguments": {}})["result"]
+    assert res["isError"] is True and "not reachable" in res["content"][0]["text"]
+    assert "guardian_status" not in _tools(client)
+
+
+def test_list_spans_lists_runs_then_spans(client, spans):
+    (spans / "20261016-090000").mkdir()
+    res = client.call("tools/call", {"name": "list_spans", "arguments": {}})["result"]
+    assert res.get("isError") is not True
+    assert res["content"][0]["text"].splitlines() == ["20261016-090000: 0 spans",
+                                                     "20261015-120000: 1 spans"]
+    res = client.call("tools/call", {"name": "list_spans", "arguments": {
+        "run": "20261015-120000"}})["result"]
+    assert res["content"][0]["text"] == "20261015-120000/0001.json, 2 messages: parser fix agreed"
+    capped = client.call("tools/call", {"name": "list_spans", "arguments": {"max": 1}})["result"]
+    assert capped["content"][0]["text"].splitlines()[-1] == "(showing 1 of 2 runs; raise max to see more)"
+
+
+@pytest.mark.parametrize("args", [{"run": "../.."}, {"run": "20990101-000000"}])
+def test_list_spans_refuses_bad_or_missing_runs(client, args):
+    res = client.call("tools/call", {"name": "list_spans", "arguments": args})["result"]
+    assert res["isError"] is True
+
+
+@pytest.mark.parametrize("body,is_error", [(b'{"version": "0.10.0", "num_ctx": 32768}', False),
+                                           (b'[1, 2]', True)])
+def test_get_proxy_status_returns_structured_stats_or_refuses_non_objects(monkeypatch, body, is_error):
+    import http.server
+    import threading
+    sys.path.insert(0, str(ROOT))
+    import cg_mcp
+
+    class Stats(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Stats)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setenv("GUARDIAN_HOST", "127.0.0.1")
+    monkeypatch.setenv("GUARDIAN_PORT", str(server.server_port))
+    try:
+        res = cg_mcp.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                             "params": {"name": "get_proxy_status", "arguments": {}}})["result"]
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert res["isError"] is is_error
+    if not is_error:
+        assert res["structuredContent"] == json.loads(body)
+        assert json.loads(res["content"][0]["text"]) == res["structuredContent"]
+    else:
+        assert "structuredContent" not in res
