@@ -47,60 +47,110 @@ def _annotations(title: str, *, open_world: bool) -> Dict[str, Any]:
             "idempotentHint": True, "openWorldHint": open_world}
 
 
+RUN_ID_EXAMPLE = "20261015-120000"
+# Shared wording: a run id is what the proxy names each run's span folder.
+RUN_ID_DOC = ("Proxy run id: the folder name under the span archive, which is also the text "
+              "before the slash in each search_spans hit. Letters, digits, '_' and '-' only.")
+
 TOOLS = [
     {
         "name": "guardian_status",
         "title": "Proxy status",
-        "description": ("Context Guardian's live status from the running proxy, as "
-                        "JSON: window and budget, compactions, tokens saved, rejected "
-                        "summaries, calibration. Read-only: one local HTTP request to "
-                        "GUARDIAN_HOST:GUARDIAN_PORT (default 127.0.0.1:8786), no "
-                        "credentials. Returns an error saying how to start the proxy "
-                        "when it is not running. Call it to see whether compaction is "
-                        "working; use search_spans or read_span for the archived "
-                        "conversation text instead."),
-        "inputSchema": {"type": "object", "properties": {}},
+        "description": (
+            "Live settings and counters of the running Context Guardian proxy. Use it to "
+            "check that the proxy is up and compaction is working: context window and input "
+            "budget, compactions so far, tokens saved, rejected summaries, per-model "
+            "calibration. Use search_spans or read_span instead when you need archived "
+            "conversation text; this tool never returns message text. "
+            "Behaviour: read-only; one HTTP GET to "
+            "http://GUARDIAN_HOST:GUARDIAN_PORT/guardian/stats (default 127.0.0.1:8786; a "
+            "wildcard bind address is read as loopback), %g-second timeout, no credentials "
+            "sent, nothing written. Takes no arguments. "
+            "Returns the stats object as JSON text (indented, keys sorted), or an error "
+            "result naming the URL it tried and how to start the proxy." % STATUS_TIMEOUT_SECONDS),
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         "annotations": _annotations("Proxy status", open_world=True),
     },
     {
         "name": "search_spans",
         "title": "Search archived spans",
-        "description": ("Case-insensitive search of the conversation text "
-                        "compaction archived, for details that no longer fit in the "
-                        "window. Read-only, local files only. Returns one line per hit: "
-                        "span file, message index and role, snippet (at most 50 hits). "
-                        "Use read_span to open a whole span from a hit; use "
-                        "guardian_status for proxy counters, not conversation text."),
-        "inputSchema": {"type": "object", "properties": {
-            "term": {"type": "string", "description": (
-                "Text to find, matched case-insensitively as plain text (not a "
-                "regex), e.g. \"migration plan\". Must not be empty.")},
-            "run": {"type": "string", "description": (
-                "Only search this proxy run id, e.g. \"20261015-120000\" (the "
-                "folder name in the span archive). Omit to search every run.")},
-            "max": {"type": "integer", "minimum": 1, "maximum": MAX_SEARCH_HITS, "description": (
-                "Maximum number of hits to return, from 1 to %d, e.g. 10. "
-                "Defaults to %d." % (MAX_SEARCH_HITS, MAX_SEARCH_HITS))},
-        }, "required": ["term"]},
+        "description": (
+            "Find text in the conversation history that compaction archived, for a detail "
+            "that no longer fits in the context window (a file name, a decision, an error "
+            "message). Use it first when you know what to look for; then use read_span to "
+            "open one span from a hit. Use guardian_status for proxy counters, not this. "
+            "Behaviour: read-only, local files only (GUARDIAN_SPAN_DIR, the directory the "
+            "proxy archives to), no network. Plain-text, "
+            "case-insensitive match over every archived message and each span's summary; "
+            "oldest span first, at most one hit per message. "
+            "Returns one line per hit, `<run>/<NNNN>.json msg <i> [<role>]: <snippet>` or "
+            "`<run>/<NNNN>.json summary: <snippet>`, then a note if it stopped at `max`; "
+            "`No match for '<term>'.` when nothing matches; an error result when the archive "
+            "does not exist yet or `run` is malformed."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "term": {
+                    "type": "string", "minLength": 1,
+                    "description": ("Text to find, matched case-insensitively as a plain "
+                                    "substring (not a regex), e.g. \"migration plan\". "
+                                    "Required; must contain a non-space character."),
+                    "examples": ["migration plan", "parse.py"],
+                },
+                "run": {
+                    "type": "string", "pattern": RUN_ID_RE.pattern,
+                    "description": (RUN_ID_DOC + " Only that run is searched, e.g. \"%s\". "
+                                    "Omit to search every run." % RUN_ID_EXAMPLE),
+                    "examples": [RUN_ID_EXAMPLE],
+                },
+                "max": {
+                    "type": "integer", "minimum": 1, "maximum": MAX_SEARCH_HITS,
+                    "default": MAX_SEARCH_HITS,
+                    "description": ("Maximum number of hits to return, from 1 to %d, e.g. 10. "
+                                    "Defaults to %d; values outside the range are clamped."
+                                    % (MAX_SEARCH_HITS, MAX_SEARCH_HITS)),
+                    "examples": [10],
+                },
+            },
+            "required": ["term"],
+            "additionalProperties": False,
+        },
         "annotations": _annotations("Search archived spans", open_world=False),
     },
     {
         "name": "read_span",
         "title": "Read one archived span",
-        "description": ("Read one archived span: the summary compaction wrote and "
-                        "the original messages it replaced. Read-only, local files "
-                        "only. Returns text, cut at %d characters for long spans, or "
-                        "an error when no such span exists. Use it after search_spans "
-                        "gives you the run id and index; use search_spans to find "
-                        "text, not this." % READ_SPAN_MAX_CHARS),
-        "inputSchema": {"type": "object", "properties": {
-            "run": {"type": "string", "description": (
-                "Run id, e.g. \"20261015-120000\": the folder name that "
-                "search_spans prints before the slash in each hit.")},
-            "index": {"type": "integer", "minimum": 1, "description": (
-                "Span number within the run, counting from 1, e.g. 3: the "
-                "file number search_spans prints (0003.json is 3).")},
-        }, "required": ["run", "index"]},
+        "description": (
+            "Open one archived span: the summary compaction wrote and the original messages "
+            "it replaced, in order. Use it after search_spans has given you a run id and span "
+            "number; use search_spans to find text, since a span is larger than the window "
+            "had room for. "
+            "Behaviour: read-only, reads one local file "
+            "(GUARDIAN_SPAN_DIR/<run>/<NNNN>.json), no network; `run` is validated before "
+            "it touches a path. "
+            "Returns text: a header line `span <run>/<NNNN>.json, <n> messages`, a "
+            "`summary:` line, then `[<i>] <role>: <text>` per message, cut at %d "
+            "characters with a note when longer; an error result when the span does not "
+            "exist or is not a span." % READ_SPAN_MAX_CHARS),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run": {
+                    "type": "string", "pattern": RUN_ID_RE.pattern,
+                    "description": RUN_ID_DOC + " Required, e.g. \"%s\"." % RUN_ID_EXAMPLE,
+                    "examples": [RUN_ID_EXAMPLE],
+                },
+                "index": {
+                    "type": "integer", "minimum": 1,
+                    "description": ("Span number within the run, counting from 1: the file "
+                                    "number search_spans prints, e.g. 3 for 0003.json. "
+                                    "Required."),
+                    "examples": [3],
+                },
+            },
+            "required": ["run", "index"],
+            "additionalProperties": False,
+        },
         "annotations": _annotations("Read one archived span", open_world=False),
     },
 ]

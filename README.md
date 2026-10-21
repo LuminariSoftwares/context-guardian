@@ -28,7 +28,10 @@ mcp-name: io.github.LuminariSoftwares/context-guardian
   <a href="#install">Install the proxy</a> &middot;
   <a href="docs/dsh-integration.md">Install in DSH</a> &middot;
   <a href="#see-it-work">See it work</a> &middot;
+  <a href="#architecture">Architecture</a> &middot;
   <a href="#compatibility">Compatibility</a> &middot;
+  <a href="#mcp-server">MCP server</a> &middot;
+  <a href="#how-its-tested">How it's tested</a> &middot;
   <a href="CHANGELOG.md">Changelog</a>
 </p>
 
@@ -142,6 +145,55 @@ flowchart LR
 
 The rest of this page is the **proxy**. The DSH engine has its own five-minute guide: **[docs/dsh-integration.md](docs/dsh-integration.md)**.
 
+## Architecture
+
+One request through the proxy (`context_guardian.py`). The DSH engine (`engine.js`) makes the same decision inside DSH; see the diagram in [Two ways to run it](#two-ways-to-run-it).
+
+```mermaid
+sequenceDiagram
+    participant C as CLI / agent
+    participant G as Context Guardian proxy
+    participant A as span archive (disk)
+    participant B as backend (/v1)
+    C->>G: POST /v1/chat/completions (whole history)
+    G->>G: estimate tokens: chars / 3.5 x per-model factor
+    alt under budget
+        G->>B: client's bytes, unchanged
+    else over budget
+        G->>B: summarise older messages (fenced as data)
+        alt usable summary
+            G->>A: write originals + summary as NNNN.json
+            G->>B: system + summary + archive pointer + recent messages
+        else empty, failed or any exception
+            G->>B: client's bytes, unchanged (fail open)
+        end
+    end
+    B-->>G: response (streamed or not)
+    G-->>C: response, byte for byte
+    G->>G: learn reported/estimated ratio from usage
+```
+
+| part | file | role |
+|---|---|---|
+| proxy | `context_guardian.py` | FastAPI app: estimate, compact, archive, forward; `/guardian/stats`, `/guardian/health`, `/guardian/events` |
+| DSH engine | `engine.js`, `cg_recall.js`, `cg_memory.js`, `vendor/compiler.js` | compaction row inside DeepSeek Harness, with model-facing `recall` / `search` and pinned facts |
+| recall CLI | `cg_recall_cli.py` | `context-guardian-recall`: search the span archive |
+| MCP server | `cg_mcp.py` | `context-guardian-mcp`: three read-only tools over the proxy's stats and the archive |
+| setup tools | `cg_configure.py`, `cg_doctor.py`, `setup.mjs` | write a `.env`, check an install, add the DSH preset row |
+
+### Design decisions
+
+Each has a short record in [docs/adr/](docs/adr/) with the alternatives that were turned down.
+
+| decision | trade-off accepted |
+|---|---|
+| [Fail open](docs/adr/0001-fail-open.md): any compaction failure forwards the client's request unchanged | the proxy sometimes does nothing, and the backend may then reject an over-long request, rather than ever dropping history on a guess |
+| [Characters / 3.5, calibrated per model](docs/adr/0002-estimate-tokens-from-characters-with-calibration.md) from reported usage | not tokenizer-accurate (errs high, compacts a little early), in exchange for no tokenizer dependency and no per-request cost |
+| [Plain JSON spans on disk](docs/adr/0003-archive-originals-as-plain-json-spans.md) for everything compaction removes | linear-scan search and clear-text conversations on disk, in exchange for files a person can open, grep and delete |
+| [Two front doors, one archive](docs/adr/0004-two-front-doors-one-archive.md): HTTP proxy and native DSH engine | two languages and two suites to keep equivalent by hand |
+| [Keep recent by token budget](docs/adr/0005-keep-recent-by-token-budget.md), never splitting a tool call from its result | the number of kept messages varies; the startup line says which mode is active |
+| [Stdlib, read-only MCP server](docs/adr/0006-stdlib-read-only-mcp-server.md) | new MCP protocol features are added by hand, in exchange for no SDK dependency tree and no way for a model to change its own guard |
+
 ## Compatibility
 
 | | tested on | expected to work | notes |
@@ -254,6 +306,10 @@ this full and you could not see it.
 - **It doesn't replace or duplicate compression your backend already does** (e.g. Headroom, prompt caching). It forwards to your backend as-is once it's decided whether to compact first — the two are complementary, not competing.
 - **It doesn't fix your CLI's own context-usage display.** Your CLI doesn't know this proxy exists, so its own token counter will drift from reality after a compaction happens. What matters is that the session keeps working instead of hard-stopping — a slightly-wrong displayed number afterward is an accepted tradeoff of doing this invisibly at the proxy layer, since the CLI itself usually isn't something you can modify.
 - **It is not a tokenizer-accurate counter.** Token count is estimated from character length (~3.5 chars/token by default), not a real tokenizer, so it triggers a little early rather than late. Treat it as a safety-margin trigger, not a precise measurement.
+- **It does not protect a single message that is bigger than the window.** Compaction summarises older messages; the newest user turn and the kept recent messages are sent verbatim, so one huge paste can still overflow.
+- **The span archive is clear text on disk.** Everything compaction removes is written under `GUARDIAN_SPAN_DIR` (default `logs/guardian_spans`, newest 500 files kept). Treat that directory like your shell history.
+- **The MCP server only reads.** It cannot trigger a compaction or change a setting, and it has no tool to list runs: you find a run id through `search_spans`. `guardian_status` reaches only a proxy on the address in `GUARDIAN_HOST` / `GUARDIAN_PORT`.
+- **Client compatibility is uneven.** Ollama (daily use) and DeepSeek Harness 0.1.2-alpha.2 are tested; the other backends and clients listed above are configured from their documentation and marked untested.
 
 ## Install
 
@@ -383,13 +439,17 @@ On Ollama, Guardian asks `/api/show` for each model's `num_ctx` (see `GUARDIAN_O
 
 ## MCP server
 
-`context-guardian-mcp` (installed with the PyPI package) is a stdio MCP server, so an MCP client can see what the proxy is doing without a terminal. It has three tools, and all three only read:
+`context-guardian-mcp` (installed with the PyPI package; `context-guardian mcp` is the same thing) is a stdio MCP server, so an MCP client can see what the proxy is doing without a terminal. It has three tools, and all three only read: nothing they do changes the proxy, its settings or the archive.
 
-| Tool | What it does |
-|---|---|
-| `guardian_status` | The running proxy's `/guardian/stats` over loopback (`GUARDIAN_HOST`:`GUARDIAN_PORT`) |
-| `search_spans` | Find text in the spans compaction archived (same search as `context-guardian-recall`) |
-| `read_span` | One archived span by run id and index: its summary and original messages, cut at 20,000 characters |
+| Tool | Use it to | Reads |
+|---|---|---|
+| `guardian_status` | check the proxy is up and compaction is working (counters, budget, calibration) | the running proxy's `/guardian/stats`, one loopback HTTP GET |
+| `search_spans` | find a detail compaction archived, when you know what to look for | the span archive on disk (same search as `context-guardian-recall`) |
+| `read_span` | open one archived span from a `search_spans` hit | one span file on disk, cut at 20,000 characters |
+
+`guardian_status` needs the proxy running (`context-guardian`); the other two need only the span archive (`GUARDIAN_SPAN_DIR`, the same variable the proxy reads).
+
+### Client configuration
 
 Run it without installing anything first, using [uv](https://docs.astral.sh/uv/):
 
@@ -397,7 +457,7 @@ Run it without installing anything first, using [uv](https://docs.astral.sh/uv/)
 uvx context-guardian mcp
 ```
 
-Claude Desktop (`claude_desktop_config.json`) or any client that takes the same shape:
+**Claude Desktop** (`claude_desktop_config.json`), Cursor, Windsurf, or any client that takes the `mcpServers` shape:
 
 ```json
 {
@@ -410,13 +470,62 @@ Claude Desktop (`claude_desktop_config.json`) or any client that takes the same 
 }
 ```
 
-If you installed the package with pip, `{ "command": "context-guardian-mcp" }` does the same.
+**Claude Code:** `claude mcp add context-guardian -- uvx context-guardian mcp`
 
-Claude Code: `claude mcp add context-guardian -- uvx context-guardian mcp`
+**Installed with pip, or a non-default proxy address or archive:**
 
-Arguments: `search_spans` takes `term` (required), `run` and `max`; `read_span` takes `run` and `index` (both required); `guardian_status` takes none. `guardian_status` needs the proxy running (`context-guardian`); the other two read the span archive on disk.
+```json
+{
+  "mcpServers": {
+    "context-guardian": {
+      "command": "context-guardian-mcp",
+      "env": {"GUARDIAN_PORT": "8786", "GUARDIAN_SPAN_DIR": "/home/user/project/logs/guardian_spans"}
+    }
+  }
+}
+```
 
-A [`server.json`](server.json) in the repository root describes the package (PyPI `context-guardian`, launched as `uvx context-guardian mcp`) for the official MCP Registry; the `mcp-name:` line at the top of this README is its ownership marker.
+**Any other client:** launch `context-guardian-mcp` as a stdio server. It speaks newline-delimited JSON-RPC 2.0 on stdin/stdout, MCP protocol versions 2025-06-18, 2025-03-26 and 2024-11-05, and logs to stderr only.
+
+A [`server.json`](server.json) in the repository root describes the package (PyPI `context-guardian`, launched as `uvx context-guardian mcp`) for the official MCP Registry; the `mcp-name:` line at the top of this README is its ownership marker. [`glama.json`](glama.json) names the maintainer for Glama.
+
+### Tool reference
+
+Generated from `cg_mcp.TOOLS` by `python tools/gen_mcp_reference.py --write`; the test suite fails if this block and the schemas the server advertises differ.
+
+<!-- mcp-tools:start (generated by tools/gen_mcp_reference.py) -->
+#### `guardian_status` (Proxy status)
+
+Live settings and counters of the running Context Guardian proxy. Use it to check that the proxy is up and compaction is working: context window and input budget, compactions so far, tokens saved, rejected summaries, per-model calibration. Use search_spans or read_span instead when you need archived conversation text; this tool never returns message text. Behaviour: read-only; one HTTP GET to http://GUARDIAN_HOST:GUARDIAN_PORT/guardian/stats (default 127.0.0.1:8786; a wildcard bind address is read as loopback), 3-second timeout, no credentials sent, nothing written. Takes no arguments. Returns the stats object as JSON text (indented, keys sorted), or an error result naming the URL it tried and how to start the proxy.
+
+Annotations: `readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true`, `openWorldHint: true`.
+
+Parameters: none.
+
+#### `search_spans` (Search archived spans)
+
+Find text in the conversation history that compaction archived, for a detail that no longer fits in the context window (a file name, a decision, an error message). Use it first when you know what to look for; then use read_span to open one span from a hit. Use guardian_status for proxy counters, not this. Behaviour: read-only, local files only (GUARDIAN_SPAN_DIR, the directory the proxy archives to), no network. Plain-text, case-insensitive match over every archived message and each span's summary; oldest span first, at most one hit per message. Returns one line per hit, `<run>/<NNNN>.json msg <i> [<role>]: <snippet>` or `<run>/<NNNN>.json summary: <snippet>`, then a note if it stopped at `max`; `No match for '<term>'.` when nothing matches; an error result when the archive does not exist yet or `run` is malformed.
+
+Annotations: `readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true`, `openWorldHint: false`.
+
+| parameter | type | required | default | constraints | example | description |
+|---|---|---|---|---|---|---|
+| `term` | string | yes | — | min length 1 | `"migration plan"` | Text to find, matched case-insensitively as a plain substring (not a regex), e.g. "migration plan". Required; must contain a non-space character. |
+| `run` | string | no | — | pattern `^[A-Za-z0-9_-]+$` | `"20261015-120000"` | Proxy run id: the folder name under the span archive, which is also the text before the slash in each search_spans hit. Letters, digits, '_' and '-' only. Only that run is searched, e.g. "20261015-120000". Omit to search every run. |
+| `max` | integer | no | 50 | min 1, max 50 | `10` | Maximum number of hits to return, from 1 to 50, e.g. 10. Defaults to 50; values outside the range are clamped. |
+
+#### `read_span` (Read one archived span)
+
+Open one archived span: the summary compaction wrote and the original messages it replaced, in order. Use it after search_spans has given you a run id and span number; use search_spans to find text, since a span is larger than the window had room for. Behaviour: read-only, reads one local file (GUARDIAN_SPAN_DIR/&lt;run>/&lt;NNNN>.json), no network; `run` is validated before it touches a path. Returns text: a header line `span <run>/<NNNN>.json, <n> messages`, a `summary:` line, then `[<i>] <role>: <text>` per message, cut at 20000 characters with a note when longer; an error result when the span does not exist or is not a span.
+
+Annotations: `readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true`, `openWorldHint: false`.
+
+| parameter | type | required | default | constraints | example | description |
+|---|---|---|---|---|---|---|
+| `run` | string | yes | — | pattern `^[A-Za-z0-9_-]+$` | `"20261015-120000"` | Proxy run id: the folder name under the span archive, which is also the text before the slash in each search_spans hit. Letters, digits, '_' and '-' only. Required, e.g. "20261015-120000". |
+| `index` | integer | yes | — | min 1 | `3` | Span number within the run, counting from 1: the file number search_spans prints, e.g. 3 for 0003.json. Required. |
+
+<!-- mcp-tools:end -->
 
 ## Benchmark
 
@@ -432,16 +541,26 @@ Measured against a stub upstream (not a real model; the stub summarises instantl
 turns=40 tokens_before=1130722 tokens_after=160310 compactions=27 p50_added_ms=5.07 p95_added_ms=7.20
 ```
 
-## Development / running tests
+## How it's tested
 
 ```bash
 pip install -r requirements-dev.txt
-pytest
+pytest                                                    # proxy, recall CLI, MCP server, docs and packaging checks
 npm install --no-package-lock --legacy-peer-deps
-npm run check && npm run test:node
+npm run check && npm run test:node                        # DSH engine, recall, memory, setup: Node smoke suites
+node examples/dsh-preset/smoke.mjs && npm run selftest    # the documented preset row; the Python bridge's selftest
 ```
 
-CI runs both suites on Ubuntu, Windows and macOS ([tests](.github/workflows/test.yml), [node](.github/workflows/node.yml)).
+CI runs both suites on Ubuntu, Windows and macOS on every push and pull request ([tests](.github/workflows/test.yml), [node](.github/workflows/node.yml)), plus a [privacy scan](.github/workflows/privacy.yml) of every tracked file.
+
+What the tests stand on:
+
+- **The proxy is driven through its real FastAPI app** against a stub upstream (`tests/_proxy_stub.py`): streaming and non-streaming, OpenAI and Anthropic routes, and the fail-open paths with the values that actually occur (an empty summary, not only `None`).
+- **The MCP server is driven over its real transport**: a subprocess speaking JSON-RPC on stdio, as a client launches it (`tests/test_mcp_server.py`). `tests/test_glama_quality.py` fails if a tool or parameter is missing its description, type, example, default or constraints, or if the [tool reference](#tool-reference) above no longer matches the schemas.
+- **Docs are tested where they make a promise**: every `GUARDIAN_*` variable the code reads is documented (`tests/test_env_docs.py`), the README's client table and MCP section are complete, and `server.json`, `glama.json` and the `Dockerfile` match `pyproject.toml` (`tests/test_packaging_files.py`).
+- **The measured numbers are labelled with how they were measured**: the [Measured](#measured-does-it-keep-what-matters-2026-10-01) section is a real DSH session on a real model (n stated); the [Benchmark](#benchmark) is against a stub and says so.
+
+What is not covered automatically: a real model's summary quality, and the untested backends and clients in [Works with](#works-with).
 
 ## See it work
 

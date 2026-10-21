@@ -158,3 +158,18 @@ def test_server_version_matches_the_package():
     version = re.search(r'^version = "([^"]+)"', (ROOT / "pyproject.toml").read_text(
         encoding="utf-8"), re.M).group(1)
     assert cg_mcp.SERVER_VERSION == version
+
+
+def test_tools_list_over_stdio_is_exactly_the_documented_definitions(client):
+    # The README reference and the quality tests read cg_mcp.TOOLS; this proves that is what a client receives.
+    sys.path.insert(0, str(ROOT))
+    import cg_mcp
+    listed = client.call("tools/list")["result"]["tools"]
+    assert json.loads(json.dumps(cg_mcp.TOOLS)) == listed
+
+
+def test_search_spans_max_limits_the_hits(client):
+    res = client.call("tools/call", {"name": "search_spans",
+                                     "arguments": {"term": "e", "max": 1}})["result"]
+    lines = res["content"][0]["text"].splitlines()
+    assert len(lines) == 2 and lines[1].startswith("(stopped at 1 hits")

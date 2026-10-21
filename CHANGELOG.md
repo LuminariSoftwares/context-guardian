@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+- **MCP tool definitions say when to use each tool, what it touches and what comes back.** Every description now
+  names the sibling to use instead, its behaviour (read-only, local files or one loopback GET, no writes) and the
+  exact output shape. Every parameter carries a type, constraints (`minLength`, `pattern`, `minimum`/`maximum`), a
+  default where it has one, and `examples`; every input schema sets `additionalProperties: false`. The advertised
+  `run` pattern is the one the server already enforced (`^[A-Za-z0-9_-]+$`). Tool names, arguments and results are
+  unchanged.
+- **README tool reference generated from the schemas**: `python tools/gen_mcp_reference.py --write` renders it from
+  `cg_mcp.TOOLS`, and the suite fails when the two differ. The README also gains an Architecture section
+  (request-path diagram, file map, design decisions with trade-offs), MCP client configs for Claude Desktop, Claude
+  Code and generic stdio clients, a How it's tested section, and more honest limits.
+- **`docs/adr/`**: six decision records for choices already in the code (fail open, character estimate with
+  calibration, JSON span archive, two front doors, keep-recent budget, stdlib read-only MCP server).
+- **`Dockerfile`** for hosts that build MCP servers in a container (Glama's build check):
+  `docker build -t context-guardian-mcp . && docker run -i --rm context-guardian-mcp`.
+- **Tests:** every tool and parameter must be fully documented; `tools/list` over stdio must equal `cg_mcp.TOOLS`;
+  `search_spans` honours `max`; `glama.json`, `server.json` and the `Dockerfile` must agree with `pyproject.toml`.
+
 ## dsh-context-guardian 0.1.0-alpha.11 / PyPI context-guardian 0.10.0 (2026-10-14)
 
 - MCP Registry name uses the GitHub owner's case: `io.github.LuminariSoftwares/...` (the registry rejects the lower-case form).
