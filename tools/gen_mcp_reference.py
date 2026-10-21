@@ -68,6 +68,15 @@ def render() -> str:
                            f"{_cell(default)} | {_cell(_constraints(spec))} | `{_cell(example)}` | "
                            f"{_cell(spec['description'])} |")
         out.append("")
+        output = tool.get("outputSchema")
+        if output:
+            out.append("Structured output (`structuredContent`, also sent as JSON text); other fields may appear:")
+            out.append("")
+            out.append("| field | type | description |")
+            out.append("|---|---|---|")
+            for name, spec in output["properties"].items():
+                out.append(f"| `{name}` | {spec['type']} | {_cell(spec['description'])} |")
+            out.append("")
     return "\n".join(out).rstrip() + "\n"
 
 

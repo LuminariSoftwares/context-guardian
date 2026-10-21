@@ -11,9 +11,10 @@ worse.
 ## Decision
 
 `cg_mcp.py` implements the MCP stdio transport directly: newline-delimited JSON-RPC 2.0, `initialize`, `ping`,
-`tools/list`, `tools/call`, protocol versions 2025-06-18 / 2025-03-26 / 2024-11-05. Standard library only. Three
+`tools/list`, `tools/call`, protocol versions 2025-06-18 / 2025-03-26 / 2024-11-05. Standard library only. Four
 tools, all read-only and annotated so (`readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true`;
-`openWorldHint` true only for `guardian_status`, the one tool that opens a socket, to loopback). Inputs that become
+`openWorldHint` true only for `get_proxy_status`, the one tool that opens a socket, to loopback). Tool names are
+`verb_noun`; a renamed tool keeps its old name as an unlisted alias (`guardian_status`, the 0.10.0 name). Inputs that become
 paths are validated against `^[A-Za-z0-9_-]+$` before they touch the filesystem, and `read_span` output is capped at
 20,000 characters. Tool failures are tool results with `isError: true`, not protocol errors, so the client's model
 can read them.
