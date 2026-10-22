@@ -16,6 +16,8 @@ _to_delete*/
 
 # python build artifacts
 dist/
+# dist_release/ is where release prep builds the artifacts to check
+dist_release/
 build/
 *.egg-info/
 
