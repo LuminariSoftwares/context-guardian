@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## dsh-context-guardian 0.1.0-beta.1 / PyPI context-guardian 0.11.0 (2026-10-22)
+
+- **The npm package leaves alpha: `dsh-context-guardian` is `0.1.0-beta.1`.** The compaction logic was never the
+  reason for the alpha label -- the DeepSeek Harness plugin API was, and it has held steady across this engine's
+  last several releases. Nothing about the installed files or the preset row changes; `npm i dsh-context-guardian`
+  on a profile pinned to `0.1.0-alpha.x` still needs `@latest` or an explicit version, as any pin does. The PyPI
+  package stays beta, where it has been since 0.4.0.
 
 ### Review fixes (2026-10-22)
 
