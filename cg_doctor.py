@@ -226,6 +226,9 @@ def doctor(root: Path = PACKAGE_ROOT, env: dict | None = None, preset: Path | No
         out.append(_f("warn", f"window: pinned to {w['value']} by numCtx in {preset}",
                       "delete the numCtx line so the engine uses the window DSH reports for your model; "
                       f"keep it only if {w['value']} really is your model's window"))
+    elif not bundle:
+        out.append(_f("ok", f"window: no GUARDIAN_NUM_CTX, so the proxy uses its default "
+                            f"{PROXY_DEFAULT_NUM_CTX}"))
     else:
         out.append(_f("ok", "window: the engine uses the window DSH reports for the session; "
                             f"the proxy uses its default {PROXY_DEFAULT_NUM_CTX}"))
@@ -242,7 +245,10 @@ def doctor(root: Path = PACKAGE_ROOT, env: dict | None = None, preset: Path | No
     except Exception:  # noqa: BLE001 -- any transport or parse failure means "not reachable"
         stats = None
     if stats is None:
-        out.append(_f("warn", f"proxy not reachable at {url}", "optional: the DSH bundle works without it. To run it: python context_guardian.py"))
+        start = "python context_guardian.py" if bundle else "context-guardian"
+        why = ("optional: the DSH bundle works without it. " if bundle
+               else "the span tools work without it. ")
+        out.append(_f("warn", f"proxy not reachable at {url}", f"{why}To run it: {start}"))
     else:
         running = stats.get("num_ctx")
         whole = isinstance(running, int) and not isinstance(running, bool)

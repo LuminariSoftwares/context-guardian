@@ -72,6 +72,22 @@ def test_a_pip_layout_still_checks_the_env_and_the_proxy(tmp_path):
     assert any("proxy not reachable" in w for w in warns), warns
 
 
+def test_a_pip_layout_is_told_to_run_the_console_script(tmp_path):
+    """`python context_guardian.py` is not a command a pip user has."""
+    def down(url, timeout):
+        raise OSError("refused")
+
+    fixes = [f["fix"] for f in _findings(_pip_layout(tmp_path), http_get=down)
+             if "not reachable" in f["what"]]
+    assert fixes and "To run it: context-guardian" in fixes[0], fixes
+    assert "python context_guardian.py" not in fixes[0]
+    # Apart from the one line that says the bundle checks were skipped, a pip
+    # user is not told about DeepSeek Harness at all.
+    rest = [f["what"] for f in _findings(_pip_layout(tmp_path))
+            if "bundle checks skipped" not in f["what"]]
+    assert not any("DSH" in w for w in rest), rest
+
+
 def test_a_broken_npm_layout_is_still_an_error(tmp_path):
     """The bridge is there, so this IS an npm install -- and its package.json
     is missing, which is a real fault."""
