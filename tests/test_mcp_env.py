@@ -18,6 +18,8 @@ sys.path.insert(0, str(ROOT))
 import cg_mcp  # noqa: E402
 import cg_paths  # noqa: E402
 
+from _child_env import child_env  # noqa: E402
+
 
 def test_startup_loads_the_env_file(monkeypatch, tmp_path):
     monkeypatch.delenv("GUARDIAN_PORT", raising=False)
@@ -74,8 +76,7 @@ def test_the_server_process_loads_it_before_the_first_tool_call(tmp_path):
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
          "params": {"name": "get_proxy_status", "arguments": {}}},
     ]
-    env = {"PATH": "/usr/bin:/bin", "GUARDIAN_DATA_DIR": str(tmp_path),
-           "PYTHONPATH": str(ROOT)}
+    env = child_env(pythonpath=ROOT, GUARDIAN_DATA_DIR=tmp_path)
     r = subprocess.run([sys.executable, str(ROOT / "cg_mcp.py")],
                        input="\n".join(json.dumps(m) for m in msgs) + "\n",
                        capture_output=True, text=True, timeout=60, cwd=tmp_path, env=env)

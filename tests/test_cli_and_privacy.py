@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pytest
 
+from _child_env import child_env
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -30,9 +32,9 @@ POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
 
 
 def _cli(*args, timeout=30, env=None):
-    full = {"PATH": "/usr/bin:/bin", "PYTHONPATH": str(ROOT),
-            "GUARDIAN_VERSION_CHECK": "0"}
-    full.update(env or {})
+    # child_env, not a hand-built dict: this child imports fastapi, so without
+    # SYSTEMROOT it dies in Winsock before main() runs. See tests/_child_env.py.
+    full = child_env(pythonpath=ROOT, GUARDIAN_VERSION_CHECK="0", **(env or {}))
     return subprocess.run([sys.executable, str(ROOT / "context_guardian.py"), *args],
                           capture_output=True, text=True, timeout=timeout, env=full)
 

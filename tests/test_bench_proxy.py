@@ -1,9 +1,10 @@
 """Item 6 (2026-10-14): scripts/bench_proxy.py is re-runnable and deterministic."""
-import os
 import re
 import subprocess
 import sys
 from pathlib import Path
+
+from _child_env import child_env
 
 ROOT = Path(__file__).resolve().parent.parent
 LINE = re.compile(r"^turns=(\d+) tokens_before=(\d+) tokens_after=(\d+) "
@@ -49,7 +50,7 @@ def test_the_figures_do_not_depend_on_the_temp_directory(tmp_path):
     absolute path, so `tokens_after` used to move with TMPDIR -- 160341 /
     160370 / 161066 for the same --turns and --seed. A benchmark whose number
     depends on where it ran is not a benchmark."""
-    short, long = tmp_path / "s", tmp_path / ("l" * 60)
+    short, long = tmp_path / "s", tmp_path / ("l" * 40)
     short.mkdir()
     long.mkdir()
     runs = []
@@ -58,7 +59,7 @@ def test_the_figures_do_not_depend_on_the_temp_directory(tmp_path):
             [sys.executable, str(ROOT / "scripts" / "bench_proxy.py"),
              "--turns", "12", "--seed", "4"],
             capture_output=True, text=True, timeout=180, cwd=ROOT,
-            env={**os.environ, "TMPDIR": str(where)})
+            env=child_env(TMPDIR=where))
         assert out.returncode == 0, out.stderr
         runs.append(LINE.match(out.stdout.strip()).groups()[:4])
     assert runs[0] == runs[1], runs

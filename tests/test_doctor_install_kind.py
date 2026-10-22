@@ -21,6 +21,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import cg_doctor  # noqa: E402
 
+from _child_env import child_env  # noqa: E402
+
 
 def _pip_layout(root: Path) -> Path:
     """What `pip install context-guardian` leaves: the wheel's modules and
@@ -117,7 +119,7 @@ def test_the_cli_exits_zero_on_a_pip_layout(tmp_path):
         (ROOT / "cg_doctor.py").read_text(encoding="utf-8"), encoding="utf-8")
     r = subprocess.run([sys.executable, str(root / "cg_doctor.py")],
                        capture_output=True, text=True, timeout=120,
-                       env={"PATH": "/usr/bin:/bin", "GUARDIAN_NUM_CTX": "32768"})
+                       env=child_env(GUARDIAN_NUM_CTX="32768"))
     assert "FAIL" not in r.stdout, r.stdout
     assert "pip install" in r.stdout
     assert r.returncode == 0, r.stdout + r.stderr
