@@ -364,6 +364,7 @@ cp .env.example .env
 | `GUARDIAN_SUMMARY_TIMEOUT` | `GUARDIAN_UPSTREAM_TIMEOUT` | Seconds to wait for the summarisation call specifically. It sends the largest prompt Guardian ever builds, so it inherits the long upstream read timeout; set this to give it a different ceiling. The connection itself always uses `GUARDIAN_UPSTREAM_CONNECT_TIMEOUT` |
 | `GUARDIAN_LOG_PATH` | `<repo>/logs/context_guardian_log.json` | Where compaction events are logged (JSON lines) |
 | `GUARDIAN_HOST` | `127.0.0.1` | Interface Guardian binds. **Leave this alone unless you know what you are doing** — Guardian fronts your backend with no authentication |
+| `GUARDIAN_ALLOWED_ORIGINS` | unset | Extra browser origins allowed to call Guardian while it is bound to a loopback address, comma-separated and matched exactly (e.g. `http://localhost:3000,https://ui.example`). Loopback origins are always allowed and a request with no `Origin` header — every CLI — is unaffected. Only consulted on a loopback bind |
 | `GUARDIAN_RESERVE_OUTPUT` | `8192` | Tokens held back for the model's *output*. The window has to hold the reply and (for reasoning models) the thinking too, so compaction triggers against what is LEFT. If this is ever ≥ `GUARDIAN_NUM_CTX` it is clamped to half the window and logged — fix the config |
 | `GUARDIAN_SPAN_DIR` | `<repo>/logs/guardian_spans` | Where evicted messages are archived before folding. This is what makes compaction lossless on disk |
 | `GUARDIAN_KEEP_SPANS` | `500` | How many span files to keep. `0` keeps none |

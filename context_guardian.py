@@ -659,6 +659,101 @@ async def _lifespan(_app: FastAPI):
 app = FastAPI(title="Context Guardian", lifespan=_lifespan)
 
 
+# --- The loopback guard ----------------------------------------------------
+# Bound to 127.0.0.1 this proxy has no authentication, and that is only safe
+# while "arrives on loopback" and "comes from this machine" mean the same
+# thing. Two ways they came apart, both reachable from a web page:
+#
+#   DNS rebinding. A name the attacker controls resolves to 127.0.0.1, so the
+#   request really does arrive on loopback -- carrying `Host: evil.example`.
+#   Nothing looked at the Host, so `curl -H 'Host: evil.example'
+#   http://127.0.0.1:8786/guardian/stats` answered 200 with every setting in
+#   it, and /v1/chat/completions answered too.
+#
+#   A simple cross-origin POST. `text/plain` is a CORS-safelisted content type,
+#   so a page on any origin can POST a chat completion to 127.0.0.1 with no
+#   preflight. The page cannot READ the reply, but the request still ran: the
+#   local GPU spent, the local model prompted, a span written.
+#
+# So on a loopback bind: the Host must name loopback, and an Origin header --
+# which only a browser sends, and which a CLI never does -- must be loopback
+# too. GUARDIAN_ALLOWED_ORIGINS adds origins for a browser UI served from
+# somewhere else. A non-loopback GUARDIAN_HOST is a deliberate choice about a
+# network this proxy cannot see, so it keeps the old behaviour unchanged.
+LOOPBACK_HOSTNAMES = ("localhost", "127.0.0.1", "::1")
+ALLOWED_ORIGINS = tuple(o.strip().rstrip("/") for o in os.environ.get(
+    "GUARDIAN_ALLOWED_ORIGINS", "").split(",") if o.strip())
+
+
+def _is_loopback_name(name: str) -> bool:
+    """True for `localhost` and for any loopback IP literal. An IP literal is
+    safe to accept by itself: DNS cannot point a name at one."""
+    name = (name or "").strip().strip("[]").lower()
+    if not name:
+        return False
+    if name == "localhost":
+        return True
+    try:
+        import ipaddress
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return False
+
+
+def _host_header_name(value: str) -> str:
+    """The host out of a Host header, port removed. `[::1]:8786` -> `::1`."""
+    value = (value or "").strip()
+    if value.startswith("["):                      # bracketed IPv6, with or without port
+        return value[1:].split("]", 1)[0]
+    # A bare IPv6 address has several colons and no port; host:port has one.
+    return value.rsplit(":", 1)[0] if value.count(":") == 1 else value
+
+
+def bind_is_loopback() -> bool:
+    """Whether the configured bind address only reaches this machine."""
+    return _is_loopback_name(GUARDIAN_HOST)
+
+
+def loopback_guard_refusal(headers) -> Optional[JSONResponse]:
+    """The 403 to send, or None when the request may proceed. Split out from
+    the middleware so a test can read the decision without an app."""
+    if not bind_is_loopback():
+        return None
+    host = _host_header_name(headers.get("host", ""))
+    # An empty Host is HTTP/1.0 or a raw socket, not a browser; the old
+    # behaviour (no check at all) is kept for it rather than breaking clients
+    # that never send one.
+    if host and not _is_loopback_name(host):
+        return JSONResponse(status_code=403, content={"error": {
+            "message": "Context Guardian is bound to a loopback address and "
+                       "answers only loopback host names. Set GUARDIAN_HOST "
+                       "deliberately to serve another name.",
+            "type": "host_not_allowed"}})
+    origin = (headers.get("origin") or "").strip()
+    if origin:
+        from urllib.parse import urlparse as _urlparse
+        try:
+            allowed = _is_loopback_name(_urlparse(origin).hostname or "")
+        except ValueError:
+            allowed = False
+        if not allowed and origin.rstrip("/") not in ALLOWED_ORIGINS:
+            return JSONResponse(status_code=403, content={"error": {
+                "message": "Cross-origin requests are refused. Add the origin "
+                           "to GUARDIAN_ALLOWED_ORIGINS to allow it.",
+                "type": "origin_not_allowed"}})
+    return None
+
+
+@app.middleware("http")
+async def _loopback_guard(request: Request, call_next):
+    refusal = loopback_guard_refusal(request.headers)
+    if refusal is not None:
+        log.warning("refused a request to %s: %s", request.url.path,
+                    json.loads(bytes(refusal.body))["error"]["type"])
+        return refusal
+    return await call_next(request)
+
+
 # model name -> window /api/show reported, or None when asking failed. Filled
 # once per model and kept for the life of the process.
 _ollama_windows: Dict[str, Optional[int]] = {}

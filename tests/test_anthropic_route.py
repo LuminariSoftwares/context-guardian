@@ -11,7 +11,7 @@ import json
 import httpx
 import pytest
 
-from _proxy_stub import SUMMARY, load
+from _proxy_stub import LOOPBACK, SUMMARY, load
 
 SSE = (b'event: message_start\ndata: {"type":"message_start"}\n\n',
        b'event: content_block_delta\ndata: {"type":"content_block_delta",'
@@ -72,7 +72,7 @@ def _post(g, body, stream=False):
     from fastapi.testclient import TestClient
     headers = {"content-type": "application/json", "x-api-key": "local",
                "anthropic-version": "2023-06-01"}
-    client = TestClient(g.app)
+    client = TestClient(g.app, base_url=LOOPBACK)
     if stream:
         with client.stream("POST", "/v1/messages", content=body, headers=headers) as r:
             return r.status_code, b"".join(r.iter_bytes())

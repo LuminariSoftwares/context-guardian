@@ -11,7 +11,7 @@ import json
 import httpx
 import pytest
 
-from _proxy_stub import SUMMARY, events, load, wire
+from _proxy_stub import LOOPBACK, SUMMARY, events, load, wire
 
 
 def _over_budget_body(extra=""):
@@ -23,7 +23,7 @@ def _post(g, body, headers=None):
     from fastapi.testclient import TestClient
     head = {"content-type": "application/json"}
     head.update(headers or {})
-    return TestClient(g.app).post("/v1/chat/completions", content=body, headers=head)
+    return TestClient(g.app, base_url=LOOPBACK).post("/v1/chat/completions", content=body, headers=head)
 
 
 # The summary call, told apart from a forwarded chat request by the opening

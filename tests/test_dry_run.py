@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from _proxy_stub import SUMMARY, events, load, post, wire
+from _proxy_stub import LOOPBACK, SUMMARY, events, load, post, wire
 
 
 def _over_budget_body():
@@ -59,9 +59,9 @@ def test_dry_run_is_a_counter_on_stats_and_the_dashboard(monkeypatch, tmp_path):
     from fastapi.testclient import TestClient
 
     g = load(monkeypatch, tmp_path, GUARDIAN_DRY_RUN="1")
-    stats = TestClient(g.app).get("/guardian/stats").json()
+    stats = TestClient(g.app, base_url=LOOPBACK).get("/guardian/stats").json()
     assert stats["dry_run"] is True and stats["dry_runs"] == 0
-    html = TestClient(g.app).get("/guardian/health").text
+    html = TestClient(g.app, base_url=LOOPBACK).get("/guardian/health").text
     assert 'card("Dry runs"' in html
 
 

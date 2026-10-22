@@ -102,8 +102,10 @@ async def _run(cg, turns, seed):
                               content=_stream())
 
     cg._http_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    # A loopback base_url, so the Host header is one the proxy's loopback
+    # guard accepts -- the same address a real client uses.
     proxy = httpx.AsyncClient(transport=httpx.ASGITransport(app=cg.app),
-                              base_url="http://proxy")
+                              base_url="http://127.0.0.1:8786")
     history = [{"role": "system", "content": "You are a coding assistant."}]
     sent_tokens, added_ms = [], []
     try:

@@ -8,7 +8,7 @@ import sys
 import warnings
 from pathlib import Path
 
-from _proxy_stub import load
+from _proxy_stub import LOOPBACK, load
 
 
 def test_importing_the_proxy_emits_no_on_event_deprecation(monkeypatch, tmp_path):
@@ -33,7 +33,7 @@ def test_the_lifespan_client_carries_a_request_and_closes(monkeypatch, tmp_path)
 
     g = load(monkeypatch, tmp_path, GUARDIAN_UPSTREAM_URL="http://127.0.0.1:9/v1")
     g._http_client = None
-    with TestClient(g.app) as client:
+    with TestClient(g.app, base_url=LOOPBACK) as client:
         assert g._http_client is not None
         r = client.get("/v1/models")
         assert r.status_code == 502
