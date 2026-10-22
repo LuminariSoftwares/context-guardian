@@ -1,8 +1,15 @@
 name: node
 
+# Third-party actions are pinned to a commit SHA, not a tag: a tag is mutable,
+# and moving it runs new code in a job that has the repository and a token.
+# The comment after each SHA is the tag it was at when it was pinned.
+
 on:
   push:
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   node:
@@ -12,8 +19,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
           node-version: "22"
       - run: npm install --no-package-lock --legacy-peer-deps

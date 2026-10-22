@@ -21,21 +21,29 @@ import os
 import sys
 from pathlib import Path
 
+import cg_paths
+
 PACKAGE_ROOT = Path(__file__).resolve().parent
 SNIPPET_CHARS = 80
 DEFAULT_MAX_HITS = 50
 
 
 def span_dir() -> Path:
-    """The proxy's own resolution: $GUARDIAN_SPAN_DIR (also from the .env beside
-    this file, which the proxy loads too), else <here>/logs/guardian_spans."""
+    """The proxy's own resolution: $GUARDIAN_SPAN_DIR (also from the .env the
+    proxy loads), else <data dir>/logs/guardian_spans. The data directory is
+    the checkout for a clone and a per-user directory for an installed
+    package -- see cg_paths.py, which the proxy and the MCP server share, so
+    all three read the archive the proxy wrote."""
+    data = cg_paths.data_dir()
     try:
         from dotenv import load_dotenv
-        load_dotenv(PACKAGE_ROOT / ".env", override=False)
+        load_dotenv(data / cg_paths.ENV_FILENAME, override=False)
+        if data != PACKAGE_ROOT:
+            load_dotenv(PACKAGE_ROOT / cg_paths.ENV_FILENAME, override=False)
     except ImportError:  # pragma: no cover -- optional, never fatal
         pass
     return Path(os.environ.get("GUARDIAN_SPAN_DIR",
-                               str(PACKAGE_ROOT / "logs" / "guardian_spans")))
+                               str(data / cg_paths.SPANS_SUBDIR)))
 
 
 def message_text(m) -> str:

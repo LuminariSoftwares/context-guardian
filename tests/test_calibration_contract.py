@@ -19,6 +19,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from _proxy_stub import LOOPBACK
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
@@ -125,7 +127,7 @@ def _wire(g, prompt_tokens):
 def _chat(g, model="m1", chars=35000):
     from fastapi.testclient import TestClient
     body = {"model": model, "messages": [{"role": "user", "content": "a" * chars}]}
-    return TestClient(g.app).post("/v1/chat/completions", json=body)
+    return TestClient(g.app, base_url=LOOPBACK).post("/v1/chat/completions", json=body)
 
 
 def test_proxy_response_is_unchanged_and_sample_recorded(g):
@@ -134,7 +136,7 @@ def test_proxy_response_is_unchanged_and_sample_recorded(g):
     assert r.status_code == 200
     assert r.json()["usage"]["prompt_tokens"] == 8000
     from fastapi.testclient import TestClient
-    stats = TestClient(g.app).get("/guardian/stats").json()
+    stats = TestClient(g.app, base_url=LOOPBACK).get("/guardian/stats").json()
     assert stats["calibration"]["m1"]["samples"] == 1
 
 

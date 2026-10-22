@@ -22,6 +22,8 @@ from pathlib import Path
 
 import pytest
 
+from _proxy_stub import LOOPBACK
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
@@ -155,7 +157,7 @@ def test_partition_uses_budget_and_keeps_tool_pairs_whole(budget_guardian):
 def test_stats_reports_mode(budget_guardian):
     testclient = pytest.importorskip("fastapi.testclient")
     g = budget_guardian
-    client = testclient.TestClient(g.app)
+    client = testclient.TestClient(g.app, base_url=LOOPBACK)
     body = client.get("/guardian/stats").json()
     # The value has to come off the route, not a constant in the test: bind
     # it to the module's own mode flag the way the route does.

@@ -77,6 +77,32 @@ def _percentile(values, pct):
     return ordered[rank]
 
 
+# The compaction note the proxy adds names the span file and the recall script
+# by absolute path, so the size of what reaches the upstream depended on how
+# long those paths happen to be -- and the span directory is a temporary one,
+# so `tokens_after` moved with TMPDIR: 160341 / 160370 / 161066 for the same
+# --turns and --seed on one machine, and a different figure again in any other
+# checkout. A benchmark whose number depends on where it ran is not a
+# benchmark. Both paths are folded to a fixed-width placeholder before the
+# tokens are counted, so the figure is a property of the compaction and
+# reproduces anywhere.
+CANONICAL_SPAN_DIR = "/cg/spans"
+CANONICAL_RECALL = "/cg/cg_recall_cli.py"
+
+
+def _canonical(messages, span_dir, recall):
+    """The forwarded messages with this machine's paths folded away."""
+    out = []
+    for m in messages:
+        content = m.get("content") if isinstance(m, dict) else None
+        if isinstance(content, str) and (span_dir in content or recall in content):
+            m = dict(m)
+            m["content"] = content.replace(span_dir, CANONICAL_SPAN_DIR).replace(
+                recall, CANONICAL_RECALL)
+        out.append(m)
+    return out
+
+
 async def _run(cg, turns, seed):
     import httpx
 
@@ -90,7 +116,8 @@ async def _run(cg, turns, seed):
         if b"BEGIN_TRANSCRIPT" in body:
             return httpx.Response(200, json={"choices": [{"message": {
                 "role": "assistant", "content": SUMMARY}, "finish_reason": "stop"}]})
-        received_tokens.append(cg.estimate_tokens(json.loads(body)["messages"]))
+        received_tokens.append(cg.estimate_tokens(_canonical(
+            json.loads(body)["messages"], str(cg.SPAN_DIR), str(cg.RECALL_SCRIPT))))
         reply = json.dumps({"choices": [{"message": {"role": "assistant",
                                                      "content": "ok"},
                                          "finish_reason": "stop"}]}).encode()
@@ -102,8 +129,10 @@ async def _run(cg, turns, seed):
                               content=_stream())
 
     cg._http_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    # A loopback base_url, so the Host header is one the proxy's loopback
+    # guard accepts -- the same address a real client uses.
     proxy = httpx.AsyncClient(transport=httpx.ASGITransport(app=cg.app),
-                              base_url="http://proxy")
+                              base_url="http://127.0.0.1:8786")
     history = [{"role": "system", "content": "You are a coding assistant."}]
     sent_tokens, added_ms = [], []
     try:

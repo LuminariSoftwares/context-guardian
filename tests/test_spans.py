@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+from _proxy_stub import LOOPBACK
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 MARKER = "[Context Guardian auto-compaction"
@@ -189,6 +191,6 @@ def test_upstream_timeout_defaults_are_not_httpx_defaults(guardian):
 
 def test_stats_reports_the_new_config(guardian):
     from fastapi.testclient import TestClient
-    data = TestClient(guardian.app).get("/guardian/stats").json()
+    data = TestClient(guardian.app, base_url=LOOPBACK).get("/guardian/stats").json()
     assert data["upstream_timeout_seconds"] == guardian.UPSTREAM_TIMEOUT_SECONDS
     assert "spans" in data.get("code_version", "")

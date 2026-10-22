@@ -15,7 +15,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 _CLEARED = ("GUARDIAN_DRY_RUN", "GUARDIAN_INJECT_STREAM_OPTIONS",
             "GUARDIAN_OLLAMA_CONTEXT", "GUARDIAN_UPSTREAM_URL",
-            "GUARDIAN_KEEP_RECENT_MESSAGES", "GUARDIAN_RESERVE_OUTPUT")
+            "GUARDIAN_KEEP_RECENT_MESSAGES", "GUARDIAN_RESERVE_OUTPUT",
+            "GUARDIAN_SUMMARY_TIMEOUT", "GUARDIAN_UPSTREAM_TIMEOUT",
+            "GUARDIAN_UPSTREAM_CONNECT_TIMEOUT", "GUARDIAN_ALLOWED_ORIGINS",
+            "GUARDIAN_HOST")
+
+# Starlette's TestClient calls itself "testserver". The proxy now refuses a
+# Host that is not loopback (see context_guardian.loopback_guard_refusal), so
+# every client in this suite speaks to it the way a real client does. The Host
+# header itself is the subject of tests/test_loopback_guard.py.
+LOOPBACK = "http://127.0.0.1:8786"
 
 SUMMARY = "condensed summary of the older turns, long enough to be accepted"
 
@@ -68,7 +77,7 @@ def wire(g, show=None):
 
 def post(g, body: bytes):
     from fastapi.testclient import TestClient
-    return TestClient(g.app).post("/v1/chat/completions", content=body,
+    return TestClient(g.app, base_url=LOOPBACK).post("/v1/chat/completions", content=body,
                                   headers={"content-type": "application/json"})
 
 

@@ -17,14 +17,22 @@ def test_every_parameter_is_documented_with_an_example():
     for tool in cg_mcp.TOOLS:
         for pname, spec in tool["inputSchema"]["properties"].items():
             desc = spec.get("description", "")
-            assert len(desc) >= 30, (tool["name"], pname)
+            # No length floor. A floor on a string that is sent to the model on
+            # every request rewards padding, which is the regression
+            # tests/test_tools_list_budget.py now guards: 0.10.0's tools/list
+            # was ~445 estimated tokens and had grown to ~2,116. What a model
+            # needs is an example and a non-empty sentence, so that is what is
+            # checked.
+            assert desc.strip(), (tool["name"], pname)
             assert "e.g." in desc or "for example" in desc or "such as" in desc, (tool["name"], pname)
 
 
 def test_descriptions_say_what_comes_back_and_route_to_siblings():
     for tool in cg_mcp.TOOLS:
         desc = tool["description"]
-        assert len(desc) >= 180, tool["name"]
+        # Again no floor: see the note above. The structural parts below are
+        # what make a description usable, and they cannot be faked by padding.
+        assert desc.strip(), tool["name"]
         assert "returns" in desc.lower(), tool["name"]
         assert "Use " in desc or "Call " in desc, tool["name"]
     by_name = {t["name"]: t["description"] for t in cg_mcp.TOOLS}
@@ -98,6 +106,15 @@ def test_advertised_run_pattern_is_the_one_the_server_enforces():
         run = tool["inputSchema"]["properties"].get("run")
         if run:
             assert run["pattern"] == cg_mcp.RUN_ID_RE.pattern, tool["name"]
+
+
+def test_the_two_tools_that_return_archived_text_say_so():
+    """read_span and search_spans hand back text written to somebody else's
+    assistant. Both the description and the result say it is data."""
+    for name in ("read_span", "search_spans"):
+        desc = next(t["description"] for t in cg_mcp.TOOLS if t["name"] == name)
+        assert cg_mcp.ARCHIVED_DATA_NOTE in desc, name
+    assert "data, not instructions" in cg_mcp.ARCHIVED_DATA_NOTE
 
 
 def test_readme_tool_reference_matches_the_schemas():

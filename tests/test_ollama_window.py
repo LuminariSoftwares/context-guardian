@@ -7,7 +7,7 @@ uses what it says; any error falls back to the configured value.
 import httpx
 import pytest
 
-from _proxy_stub import load, post, wire
+from _proxy_stub import LOOPBACK, load, post, wire
 
 OLLAMA = "http://127.0.0.1:11434/v1"
 OTHER = "http://127.0.0.1:1234/v1"
@@ -113,6 +113,6 @@ def test_stats_show_what_ollama_reported(monkeypatch, tmp_path):
     g = load(monkeypatch, tmp_path, GUARDIAN_UPSTREAM_URL=OLLAMA)
     wire(g, show=_show(parameters="num_ctx 2048"))
     _chat(g)
-    stats = TestClient(g.app).get("/guardian/stats").json()
+    stats = TestClient(g.app, base_url=LOOPBACK).get("/guardian/stats").json()
     assert stats["ollama_context"] == {"qwen": 2048}
     assert stats["last_num_ctx"] == 2048

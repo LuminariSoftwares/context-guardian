@@ -2,6 +2,65 @@
 
 ## Unreleased
 
+### Review fixes (2026-10-22)
+
+- **The summarisation call now carries the client's API key.** It posted to `{UPSTREAM_URL}/chat/completions` with no
+  headers, so against any upstream that wants one (a LiteLLM master key, vLLM started with `--api-key`, a hosted
+  endpoint) every summary came back `401` and compaction silently never happened. The allow-listed credential headers
+  from the client's own request (`Authorization`, `api-key`, `x-api-key`) are forwarded, as the `/v1/messages` route
+  already did. The values are never logged.
+- **The summariser's fence cannot be closed from inside the transcript.** `BEGIN_TRANSCRIPT` and `END_TRANSCRIPT` in
+  an evicted message — a tool result, a file, this project's own README — ended the fence early, so text after the
+  marker read as an instruction to the summariser and came back as a `role: "system"` message in the client's next
+  request. Both markers are neutralised inside the transcript, on both routes.
+- **`GUARDIAN_SUMMARY_TIMEOUT`** (default: `GUARDIAN_UPSTREAM_TIMEOUT`, so unchanged for current users) sets the
+  summary call's read timeout. The bare per-request timeout it replaced overrode every phase, so opening a socket to
+  a backend that was not listening waited the full 600 s instead of `GUARDIAN_UPSTREAM_CONNECT_TIMEOUT`.
+- **A loopback-bound proxy refuses a non-loopback `Host` and cross-origin requests**, both `403` with a one-line JSON
+  error. `curl -H 'Host: evil.example' http://127.0.0.1:8786/guardian/stats` used to answer 200 (DNS rebinding), and
+  a `text/plain` POST from any web page used to reach `/v1/chat/completions` with no preflight. **`GUARDIAN_ALLOWED_ORIGINS`**
+  (comma-separated) allows a browser UI on another origin. A non-loopback `GUARDIAN_HOST` is unchanged and now warns
+  at startup.
+- **`GUARDIAN_DATA_DIR`, and a per-user data directory for installed packages.** Spans, the compaction log, the
+  version cache and the `.env` from `context-guardian-configure` were written next to the source — which is
+  site-packages on a `pip install`, so `pip install -U` replaced them and `uvx context-guardian mcp` read a different,
+  empty archive. A git checkout is unchanged; an installed package uses `~/.context-guardian`
+  (`%LOCALAPPDATA%\context-guardian` on Windows). If the old location already holds spans and the new one does not,
+  the old one keeps being used and one notice says so at startup. `GUARDIAN_SPAN_DIR`, `GUARDIAN_LOG_PATH` and
+  `GUARDIAN_VERSION_CACHE` still win.
+- **`context-guardian --help` and `--version` print and exit** instead of starting the server. `--help` names the
+  `mcp` subcommand and the other four entry points, and the data paths for your install. `context-guardian mcp` and
+  the tolerance of unknown arguments are unchanged.
+- **The MCP server reads `.env` at startup**, so `get_proxy_status` honours `GUARDIAN_HOST`/`GUARDIAN_PORT` on the
+  first tool call rather than only after some span tool had loaded it as a side effect.
+- **`context-guardian-doctor` knows a pip install from an npm bundle.** It used to exit 1 with
+  `FAIL package.json not found` and `FAIL modules/cg_bridge.py is missing` — two DeepSeek Harness checks a pip user
+  can never satisfy. With neither file present it prints `OK pip install: DSH bundle checks skipped` and names
+  `context-guardian` rather than `python context_guardian.py`. An npm bundle with files missing still fails.
+- **Span directories are `0700`, span files, the compaction log and the version cache `0600`** on Linux and macOS,
+  set before any content is written. They hold the conversation compaction removed, in clear text. No effect on
+  Windows.
+- **`GUARDIAN_NO_UPDATE_CHECK`, `NO_UPDATE_NOTIFIER` and `CI` turn the update check off on the Python side too**,
+  matching what the npm bundle has always honoured. `GUARDIAN_VERSION_CHECK=0` still works.
+- **`tools/list` is back under budget: ~2,116 → ~1,086 estimated tokens** (0.10.0 was ~445). It is sent to the
+  client's model on every request. Tool names, parameters, the `guardian_status` alias and all four annotation hints
+  are unchanged; the descriptions and the `outputSchema`'s property descriptions are shorter, and the schema
+  documents the fields an agent branches on rather than restating `/guardian/stats` (it was always advisory —
+  `additionalProperties: true`, nothing required). `tests/test_tools_list_budget.py` holds the ceiling in CI.
+- **`read_span` and `search_spans` say their text is archived conversation**, in the description and as a trailing
+  line after the body of every result: data to describe, not instructions to follow.
+- **`scripts/bench_proxy.py` no longer depends on the temp directory.** The compaction note names the span file and
+  the recall script by absolute path, so `tokens_after` moved with `TMPDIR`. Both are folded to a fixed-width
+  placeholder before the tokens are counted, and a test asserts the README's quoted line is what the script prints.
+- **README:** Python badge is 3.10+ (CI now runs 3.10, 3.12 and 3.13 on Ubuntu as well); why the npm package is alpha
+  and the PyPI package beta; a correction to the claim that the estimate "triggers a little early rather than late"
+  (it is content-blind, so it fires *late* on dense JSON and CJK); `context-guardian-configure` named for pip users;
+  new "What is stored, where, and how to delete it" and "Troubleshooting" sections; the guardian family; and a note
+  that the unrelated npm package named `context-guardian` is not this one.
+- **CI:** Ubuntu Python 3.10, 3.12 and 3.13 jobs; a job that runs `docker build` and lists the MCP tools over stdio
+  from inside the image; `pip-audit` and `npm audit --omit=dev` (reporting, not blocking); third-party actions pinned
+  to commit SHAs.
+
 - **MCP: `guardian_status` is now `get_proxy_status`**, so every tool name is `verb_noun` (Glama's coherence review
   marked the noun-phrase name down). `guardian_status` still answers `tools/call` as a deprecated alias; it is no
   longer listed, because two names for one tool is the ambiguity a client's model should not have to resolve. A

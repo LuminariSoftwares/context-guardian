@@ -15,8 +15,13 @@ Re-run any time to change your answers, or edit .env directly.
 import sys
 from pathlib import Path
 
+import cg_paths
+
 REPO_ROOT = Path(__file__).resolve().parent
-ENV_PATH = REPO_ROOT / ".env"
+# Not REPO_ROOT / ".env": on a pip install REPO_ROOT is site-packages, so the
+# wizard wrote the user's config into a directory `pip install -U` replaces.
+# cg_paths puts it where the proxy and the MCP server look for it.
+ENV_PATH = cg_paths.env_file()
 
 # Context-window presets, smallest to largest, with rough guidance.
 #

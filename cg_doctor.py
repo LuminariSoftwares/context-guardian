@@ -152,6 +152,28 @@ def _number_findings(work: dict) -> list[dict]:
                         RESERVE_FIX))
     return found
 
+def is_npm_bundle(root: Path) -> bool:
+    """Whether this install is the DSH (npm) bundle rather than the pip wheel.
+
+    The bundle's own marker is the Python bridge: the wheel ships only
+    top-level modules (py-modules in pyproject.toml), never modules/ and never
+    a package.json. On a pip install the doctor used to report
+
+        FAIL package.json not found
+        FAIL modules/cg_bridge.py is missing
+
+    and exit 1 -- two DSH-bundle checks failing because a pip user has no DSH
+    bundle and never will. Exit 1 is what a CI job and a support reply read, so
+    the first thing a pip user was told was that their working install was
+    broken.
+
+    The bridge, NOT the absence of package.json, decides: a bundle whose
+    package.json really is missing is a broken install, and must keep failing.
+    """
+    root = Path(root)
+    return (root / "modules" / "cg_bridge.py").is_file() or (root / "package.json").is_file()
+
+
 def doctor(root: Path = PACKAGE_ROOT, env: dict | None = None, preset: Path | None = None,
            http_get=None, run=None, which=shutil.which) -> list[dict]:
     """Run every check and return the findings, in check order."""
@@ -165,19 +187,23 @@ def doctor(root: Path = PACKAGE_ROOT, env: dict | None = None, preset: Path | No
     out = []
 
     # 1. package + proxy version
+    bundle = is_npm_bundle(root)
     name, data = PKG_FALLBACK_NAME, None
-    try:
-        data = json.loads((root / "package.json").read_text(encoding="utf-8"))
-    except OSError:
-        data = None
-    except ValueError:
-        data = "bad"
-    if isinstance(data, dict) and isinstance(data.get("version"), str) and data["version"]:
-        name = str(data.get("name") or PKG_FALLBACK_NAME)
-        out.append(_f("ok", "package: {} {}".format(name, data["version"])))
+    if not bundle:
+        out.append(_f("ok", "pip install: DSH bundle checks skipped"))
     else:
-        bad = "package.json is not valid JSON" if data == "bad" else "package.json not found"
-        out.append(_f("error", bad, "run the doctor from the installed package folder (npm ls dsh-context-guardian shows where)"))
+        try:
+            data = json.loads((root / "package.json").read_text(encoding="utf-8"))
+        except OSError:
+            data = None
+        except ValueError:
+            data = "bad"
+        if isinstance(data, dict) and isinstance(data.get("version"), str) and data["version"]:
+            name = str(data.get("name") or PKG_FALLBACK_NAME)
+            out.append(_f("ok", "package: {} {}".format(name, data["version"])))
+        else:
+            bad = "package.json is not valid JSON" if data == "bad" else "package.json not found"
+            out.append(_f("error", bad, "run the doctor from the installed package folder (npm ls dsh-context-guardian shows where)"))
     try:
         match = VERSION_RE.search((root / "context_guardian.py").read_text(encoding="utf-8", errors="replace"))
     except OSError:
@@ -200,6 +226,9 @@ def doctor(root: Path = PACKAGE_ROOT, env: dict | None = None, preset: Path | No
         out.append(_f("warn", f"window: pinned to {w['value']} by numCtx in {preset}",
                       "delete the numCtx line so the engine uses the window DSH reports for your model; "
                       f"keep it only if {w['value']} really is your model's window"))
+    elif not bundle:
+        out.append(_f("ok", f"window: no GUARDIAN_NUM_CTX, so the proxy uses its default "
+                            f"{PROXY_DEFAULT_NUM_CTX}"))
     else:
         out.append(_f("ok", "window: the engine uses the window DSH reports for the session; "
                             f"the proxy uses its default {PROXY_DEFAULT_NUM_CTX}"))
@@ -216,7 +245,10 @@ def doctor(root: Path = PACKAGE_ROOT, env: dict | None = None, preset: Path | No
     except Exception:  # noqa: BLE001 -- any transport or parse failure means "not reachable"
         stats = None
     if stats is None:
-        out.append(_f("warn", f"proxy not reachable at {url}", "optional: the DSH bundle works without it. To run it: python context_guardian.py"))
+        start = "python context_guardian.py" if bundle else "context-guardian"
+        why = ("optional: the DSH bundle works without it. " if bundle
+               else "the span tools work without it. ")
+        out.append(_f("warn", f"proxy not reachable at {url}", f"{why}To run it: {start}"))
     else:
         running = stats.get("num_ctx")
         whole = isinstance(running, int) and not isinstance(running, bool)
@@ -226,7 +258,9 @@ def doctor(root: Path = PACKAGE_ROOT, env: dict | None = None, preset: Path | No
             out.append(_f("warn", f"proxy is running with num_ctx {running} but GUARDIAN_NUM_CTX is {w['value']}",
                           "restart the proxy so it re-reads GUARDIAN_NUM_CTX"))
 
-    # 5. the Python bridge
+    # 5. the Python bridge -- the DSH bundle's, so only when there is one.
+    if not bundle:
+        return out
     bridge = root / "modules" / "cg_bridge.py"
     if not bridge.is_file():
         out.append(_f("error", "modules/cg_bridge.py is missing", f"reinstall the package: npm i {PKG_FALLBACK_NAME}@latest"))

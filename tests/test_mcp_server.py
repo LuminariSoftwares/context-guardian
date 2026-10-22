@@ -172,7 +172,10 @@ def test_search_spans_max_limits_the_hits(client):
     res = client.call("tools/call", {"name": "search_spans",
                                      "arguments": {"term": "e", "max": 1}})["result"]
     lines = res["content"][0]["text"].splitlines()
-    assert len(lines) == 2 and lines[1].startswith("(stopped at 1 hits")
+    import cg_mcp
+    assert lines[-1] == cg_mcp.ARCHIVED_DATA_NOTE      # after the body, always
+    body = [ln for ln in lines[:-2] if ln]
+    assert len(body) == 2 and body[1].startswith("(stopped at 1 hits")
 
 
 def test_the_0_10_name_guardian_status_still_answers(client):
