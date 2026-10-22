@@ -27,6 +27,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, Optional
 
+import cg_paths
 import cg_recall_cli
 
 SERVER_NAME = "context-guardian"
@@ -204,6 +205,29 @@ TOOLS = [
 DEPRECATED_ALIASES = {"guardian_status": "get_proxy_status"}
 
 
+def load_config() -> None:
+    """Read the .env `context-guardian-configure` wrote, once, at startup.
+
+    get_proxy_status builds its URL from GUARDIAN_HOST / GUARDIAN_PORT, and
+    nothing here had ever loaded that file -- so a user on a non-default port
+    was told the proxy was unreachable at 127.0.0.1:8786 until some span tool
+    happened to run first and load .env as a side effect of
+    cg_recall_cli.span_dir(). Which tool the client called first decided
+    whether the status tool worked.
+
+    A real environment variable still wins (override=False), as it does in the
+    proxy. Missing file, missing python-dotenv: both are silent, as before.
+    """
+    data = cg_paths.data_dir()
+    try:
+        from dotenv import load_dotenv
+    except ImportError:  # pragma: no cover -- optional, never fatal
+        return
+    load_dotenv(data / cg_paths.ENV_FILENAME, override=False)
+    if data != cg_paths.PACKAGE_DIR:
+        load_dotenv(cg_paths.PACKAGE_DIR / cg_paths.ENV_FILENAME, override=False)
+
+
 class ToolError(Exception):
     """A failure the client's model should read as a tool result."""
 
@@ -376,6 +400,7 @@ def handle(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def main() -> int:
+    load_config()
     # The transport is UTF-8 whatever the console code page (Windows).
     for stream in (sys.stdin, sys.stdout):
         try:

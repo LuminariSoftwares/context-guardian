@@ -350,6 +350,7 @@ cp .env.example .env
 | Variable | Default | What it does |
 |---|---|---|
 | `GUARDIAN_PORT` | `8786` | Port Guardian itself listens on |
+| `GUARDIAN_DATA_DIR` | the checkout, or a per-user directory | Where the span archive, the compaction log, the version cache and `.env` live. A git checkout uses itself, so a clone keeps writing to `<repo>/logs` exactly as before. An installed package (`pip install`, `uvx`) uses `~/.context-guardian`, or `%LOCALAPPDATA%\context-guardian` on Windows — site-packages is replaced by `pip install -U`, and `uvx` builds a different environment from the one the proxy runs in. If spans already exist in the old site-packages location and the new directory is empty, the old one keeps being used and one notice says so. `GUARDIAN_SPAN_DIR`, `GUARDIAN_LOG_PATH` and `GUARDIAN_VERSION_CACHE` still win over this |
 | `GUARDIAN_UPSTREAM_URL` | `http://localhost:11434/v1` | The OpenAI-compatible backend Guardian forwards to |
 | `GUARDIAN_NUM_CTX` | `32768` | Your model's real context window, in tokens — keep this in sync with your actual backend/model config. On Ollama the proxy can read it per model instead: see `GUARDIAN_OLLAMA_CONTEXT` |
 | `GUARDIAN_OLLAMA_CONTEXT` | `auto` | When the upstream is Ollama (`auto`: the upstream URL is on port 11434; `1` always, `0` never), ask `/api/show` once per model and budget against the `num_ctx` it reports. A model that reports only its trained `context_length` can lower `GUARDIAN_NUM_CTX` but never raise it, since Ollama may run it at less. Any error falls back to `GUARDIAN_NUM_CTX` for that model for the rest of the run |
@@ -362,11 +363,11 @@ cp .env.example .env
 | `GUARDIAN_UPSTREAM_TIMEOUT` | `600` | Seconds to wait for the upstream backend to respond |
 | `GUARDIAN_UPSTREAM_CONNECT_TIMEOUT` | `10` | Seconds to wait for the upstream connection itself |
 | `GUARDIAN_SUMMARY_TIMEOUT` | `GUARDIAN_UPSTREAM_TIMEOUT` | Seconds to wait for the summarisation call specifically. It sends the largest prompt Guardian ever builds, so it inherits the long upstream read timeout; set this to give it a different ceiling. The connection itself always uses `GUARDIAN_UPSTREAM_CONNECT_TIMEOUT` |
-| `GUARDIAN_LOG_PATH` | `<repo>/logs/context_guardian_log.json` | Where compaction events are logged (JSON lines) |
+| `GUARDIAN_LOG_PATH` | `<data dir>/logs/context_guardian_log.json` | Where compaction events are logged (JSON lines) |
 | `GUARDIAN_HOST` | `127.0.0.1` | Interface Guardian binds. **Leave this alone unless you know what you are doing** — Guardian fronts your backend with no authentication |
 | `GUARDIAN_ALLOWED_ORIGINS` | unset | Extra browser origins allowed to call Guardian while it is bound to a loopback address, comma-separated and matched exactly (e.g. `http://localhost:3000,https://ui.example`). Loopback origins are always allowed and a request with no `Origin` header — every CLI — is unaffected. Only consulted on a loopback bind |
 | `GUARDIAN_RESERVE_OUTPUT` | `8192` | Tokens held back for the model's *output*. The window has to hold the reply and (for reasoning models) the thinking too, so compaction triggers against what is LEFT. If this is ever ≥ `GUARDIAN_NUM_CTX` it is clamped to half the window and logged — fix the config |
-| `GUARDIAN_SPAN_DIR` | `<repo>/logs/guardian_spans` | Where evicted messages are archived before folding. This is what makes compaction lossless on disk |
+| `GUARDIAN_SPAN_DIR` | `<data dir>/logs/guardian_spans` | Where evicted messages are archived before folding. This is what makes compaction lossless on disk |
 | `GUARDIAN_KEEP_SPANS` | `500` | How many span files to keep. `0` keeps none |
 | `GUARDIAN_KEEP_SUMMARIES` | `1` | How many of Guardian's own previous summaries stay in the window. Retired ones are folded into the next span, not discarded |
 | `GUARDIAN_MIN_SUMMARY_CHARS` | `40` | A summary shorter than this is treated as a FAILED summarisation and nothing is evicted. See 0.4.0 in the changelog for why this exists |
@@ -375,8 +376,8 @@ cp .env.example .env
 | `GUARDIAN_SUMMARY_REASONING_EFFORT` | unset | Passed as `reasoning_effort` on the summarisation call only. Non-standard, so off by default; `low` roughly halved summarisation latency on gpt-oss |
 | `GUARDIAN_VERBOSE` | `1` | Print a visible multi-line banner on every compaction (what it cut, tokens before/after, tokens saved). Set `0` for the old single-line log entry |
 | `GUARDIAN_COST_PER_1M_INPUT_USD` | `0` | Price of 1M input tokens on the hosted API you're *avoiding* by running locally. When set, Guardian reports the running dollar value of the tokens compaction has kept you from re-sending. `0` (default) omits the cost line — you're on a local model, there's no real bill |
-| `GUARDIAN_VERSION_CHECK` | `1` | On startup, ask PyPI once (2s timeout, cached 24h, fully fail-open) whether a newer `context-guardian` exists and print one line if so. Set `0` to disable — airgapped/privacy setups never touch the network |
-| `GUARDIAN_VERSION_CACHE` | `<repo>/logs/.version_check_cache.json` | Where the update check caches PyPI's answer so frequent restarts don't re-hit the network (24h TTL) |
+| `GUARDIAN_VERSION_CHECK` | `1` | On startup, ask PyPI once (2s timeout, cached 24h, fully fail-open) whether a newer `context-guardian` exists and print one line if so. Set `0` to disable — airgapped/privacy setups never touch the network. `GUARDIAN_NO_UPDATE_CHECK`, `NO_UPDATE_NOTIFIER` and `CI` also turn it off, which is what the npm bundle has always honoured — one opt-out works on both halves |
+| `GUARDIAN_VERSION_CACHE` | `<data dir>/logs/.version_check_cache.json` | Where the update check caches PyPI's answer so frequent restarts don't re-hit the network (24h TTL) |
 | `GUARDIAN_DRY_RUN` | `0` | `1`: compute every compaction (the summariser is still called) and log it as a `dry_run` event with the same fields as a real one, but forward the client's request byte-for-byte. Counted on the health dashboard. For watching what the proxy would do before letting it |
 | `GUARDIAN_INJECT_STREAM_OPTIONS` | `0` | `1`: add `stream_options: {"include_usage": true}` to streaming chat requests that do not already carry `stream_options`, so the usage frame reaches the calibrator. Off by default because the client then receives one extra final frame with empty `choices`, which some clients do not expect |
 

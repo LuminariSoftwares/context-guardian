@@ -104,9 +104,34 @@ from starlette.background import BackgroundTask
 # per-person. A real environment variable still wins, which is what an operator
 # expects.
 REPO_DIR = Path(__file__).resolve().parent
+
+# Where the data goes. REPO_DIR is the checkout when you cloned and
+# site-packages when you pip-installed, so deriving the span archive, the log,
+# the version cache and the .env from it put an installed proxy's data inside
+# site-packages: wiped by `pip install -U`, invisible in the user's home
+# directory, and not the archive `uvx context-guardian mcp` reads, because uvx
+# builds its own environment. cg_paths decides: a checkout keeps using itself,
+# an installed package uses ~/.context-guardian (%LOCALAPPDATA%\context-guardian
+# on Windows), and an existing archive in the old place keeps being used with a
+# notice. See cg_paths.py.
+import cg_paths
+
+_DATA_DIR_NOTICE: Optional[str] = None
+
+
+def _data_dir_notice(message: str) -> None:
+    global _DATA_DIR_NOTICE
+    _DATA_DIR_NOTICE = message
+
+
+DATA_DIR = cg_paths.data_dir(notify=_data_dir_notice)
 try:
     from dotenv import load_dotenv
-    load_dotenv(REPO_DIR / ".env", override=False)
+    load_dotenv(DATA_DIR / cg_paths.ENV_FILENAME, override=False)
+    if DATA_DIR != REPO_DIR:
+        # A checkout's .env still loads even when the data lives elsewhere:
+        # someone who set GUARDIAN_DATA_DIR did not thereby move their config.
+        load_dotenv(REPO_DIR / cg_paths.ENV_FILENAME, override=False)
 except ImportError:  # pragma: no cover -- optional, never fatal
     pass
 
@@ -203,11 +228,31 @@ except ValueError:
 # exists and print a single line if so. Fully fail-open -- offline, airgapped,
 # or PyPI-down all produce silence, never a delay or a traceback. Set
 # GUARDIAN_VERSION_CHECK=0 to disable (airgapped / privacy setups).
-VERSION_CHECK = os.environ.get("GUARDIAN_VERSION_CHECK", "1") not in ("0", "false", "False")
+# The JavaScript half of this family (update_check.js) has always honoured
+# GUARDIAN_NO_UPDATE_CHECK, NO_UPDATE_NOTIFIER and CI; the Python half honoured
+# only GUARDIAN_VERSION_CHECK. One family, one opt-out: all four work on both
+# sides now. The three shared names follow update_check.js's rule exactly --
+# set and not "0"/"false" means off -- so `CI=0` in a shell profile does not
+# silence a real user.
+UPDATE_CHECK_OPT_OUTS = ("GUARDIAN_NO_UPDATE_CHECK", "NO_UPDATE_NOTIFIER", "CI")
+
+
+def _update_check_enabled(env=None) -> bool:
+    env = os.environ if env is None else env
+    if env.get("GUARDIAN_VERSION_CHECK", "1") in ("0", "false", "False"):
+        return False
+    for name in UPDATE_CHECK_OPT_OUTS:
+        value = (env.get(name) or "").strip()
+        if value and value.lower() not in ("0", "false"):
+            return False
+    return True
+
+
+VERSION_CHECK = _update_check_enabled()
 # Result is cached here so frequent restarts do not hammer PyPI; a known-newer
 # result keeps printing from cache even while offline.
 VERSION_CACHE_PATH = Path(os.environ.get(
-    "GUARDIAN_VERSION_CACHE", str(REPO_DIR / "logs" / ".version_check_cache.json")))
+    "GUARDIAN_VERSION_CACHE", str(DATA_DIR / cg_paths.VERSION_CACHE_SUBPATH)))
 VERSION_CACHE_TTL_SECONDS = 86_400  # re-ask PyPI at most once a day
 PYPI_JSON_URL = "https://pypi.org/pypi/context-guardian/json"
 # -----------------------------------------------------------------------------
@@ -239,7 +284,7 @@ SUMMARY_TIMEOUT_SECONDS = float(os.environ.get(
 # the proxy was started from elsewhere, and nothing warned. The archive that
 # 0.3.0 exists to provide was silently going somewhere nobody would look.
 SPAN_DIR = Path(os.environ.get(
-    "GUARDIAN_SPAN_DIR", str(REPO_DIR / "logs" / "guardian_spans")))
+    "GUARDIAN_SPAN_DIR", str(DATA_DIR / cg_paths.SPANS_SUBDIR)))
 KEEP_SPANS = int(os.environ.get("GUARDIAN_KEEP_SPANS", "500"))
 # How far write_span will walk forward to find a free index when two
 # concurrent compactions compute the same one. Bounded so a directory full of
@@ -365,10 +410,52 @@ RUN_ID = time.strftime("%Y%m%d-%H%M%S")
 # Same story, and the README already documented this default as
 # logs/context_guardian_log.json -- the docs were right and the code was not.
 LOG_PATH = Path(os.environ.get(
-    "GUARDIAN_LOG_PATH", str(REPO_DIR / "logs" / "context_guardian_log.json")))
+    "GUARDIAN_LOG_PATH", str(DATA_DIR / cg_paths.LOG_SUBPATH)))
 
 logging.basicConfig(level=logging.INFO, format="[ContextGuardian] %(message)s")
 log = logging.getLogger("context_guardian")
+
+# Spans are the conversation compaction removed, in clear text, and the log
+# carries a 500-character preview of every summary. They were created with the
+# process umask -- 0755 on the directory and 0644 on the files on most systems
+# -- so any other local account could read a user's whole session. The modes
+# below are the same ones ssh insists on for ~/.ssh.
+#
+# Housekeeping, never a reason to lose a request: a filesystem that cannot
+# represent POSIX modes (a Windows share, an exotic mount) is silently fine,
+# and on Windows chmod does nothing useful at all.
+PRIVATE_DIR_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
+
+
+def _make_private(path: Path) -> None:
+    """0600 on a file. Silent on any failure, including "not there"."""
+    try:
+        os.chmod(path, PRIVATE_FILE_MODE)
+    except OSError:
+        pass
+
+
+def _make_private_dir(path: Path) -> None:
+    """0700 on a directory. Silent on any failure."""
+    try:
+        os.chmod(path, PRIVATE_DIR_MODE)
+    except OSError:
+        pass
+
+
+def _private_mkdir(path: Path) -> None:
+    """mkdir -p with every level this call creates set to 0700.
+
+    mkdir(mode=...) only applies to the LAST component and is masked by the
+    umask, so the modes are set explicitly afterwards -- and only on the
+    directories that did not already exist, so pointing GUARDIAN_SPAN_DIR at a
+    directory the user already shares on purpose does not change it.
+    """
+    missing = [p for p in (path, *path.parents) if not p.exists()]
+    path.mkdir(parents=True, exist_ok=True)
+    for made in missing:
+        _make_private_dir(made)
 
 
 # Running estimate of tokens "in flight" for the current conversation.
@@ -1116,7 +1203,7 @@ def write_span(messages: List[Dict[str, Any]], summary: str,
     path = None
     try:
         d = SPAN_DIR / RUN_ID
-        d.mkdir(parents=True, exist_ok=True)
+        _private_mkdir(d)
 
         # CLAIM the index instead of assuming it is free.
         #
@@ -1140,6 +1227,9 @@ def write_span(messages: List[Dict[str, Any]], summary: str,
                 fh = open(attempt, "x", encoding="utf-8")
             except FileExistsError:
                 continue
+            # Before a byte is written: the file must never exist, even for an
+            # instant, with the umask's mode.
+            _make_private(attempt)
             path, index = attempt, candidate
             break
         if fh is None:
@@ -1197,10 +1287,17 @@ def log_event(event: Dict[str, Any]) -> None:
     """Append one JSON line to the compaction log. Never raises -- logging
     must not be able to break the actual request path."""
     try:
-        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _private_mkdir(LOG_PATH.parent)
         event["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        new_file = not LOG_PATH.exists()
         with open(LOG_PATH, "a", encoding="utf-8") as f:
+            if new_file:
+                _make_private(LOG_PATH)
             f.write(json.dumps(event) + "\n")
+        if not new_file:
+            # A log written by an older version is 0644; tighten it on the way
+            # past rather than leaving one upgrade's worth of history readable.
+            _make_private(LOG_PATH)
     except Exception as exc:  # pragma: no cover -- logging must be best-effort
         log.warning("Failed to write log entry (continuing anyway): %s", exc)
 
@@ -1843,10 +1940,11 @@ def _version_check_worker() -> None:
                 if resp.status_code == 200:
                     latest = str(resp.json()["info"]["version"])
                     try:
-                        VERSION_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                        _private_mkdir(VERSION_CACHE_PATH.parent)
                         VERSION_CACHE_PATH.write_text(
                             json.dumps({"checked_at": time.time(), "latest": latest}),
                             encoding="utf-8")
+                        _make_private(VERSION_CACHE_PATH)
                     except Exception:
                         pass  # cache is an optimisation, not a requirement
             except Exception:
@@ -2530,22 +2628,42 @@ def keep_recent_label() -> str:
     return "budget %g%%" % round(KEEP_RECENT_FRACTION * 100, 2)
 
 
-def main():
-    """Console entry point (`context-guardian`) and `python context_guardian.py`."""
-    if sys.argv[1:2] == ["mcp"]:  # `context-guardian mcp` = context-guardian-mcp (the MCP Registry runs `uvx context-guardian mcp`)
-        import cg_mcp
-        sys.exit(cg_mcp.main())
+USAGE = """context-guardian -- compaction proxy for any OpenAI-compatible backend
+
+  context-guardian              start the proxy (default: 127.0.0.1:{port}, forwarding to {upstream})
+  context-guardian mcp          run the stdio MCP server instead (same as context-guardian-mcp)
+  context-guardian --version    print the version and exit
+  context-guardian --help       print this and exit
+
+Other commands installed alongside it:
+
+  context-guardian-doctor       check the install and the running proxy, with a fix: line for anything wrong
+  context-guardian-configure    interactive setup; writes the .env this proxy reads
+  context-guardian-recall       search the spans compaction archived
+  context-guardian-mcp          the stdio MCP server, for an MCP client's config
+
+Configuration is environment variables, or a .env in the data directory
+({data}). The one setting that matters per-person is GUARDIAN_NUM_CTX
+(currently {num_ctx}): your model's real context window. The full table is in
+the README: https://github.com/LuminariSoftwares/context-guardian#configure
+
+  spans   {spans}
+  log     {log}
+
+Point your client's OPENAI_BASE_URL at http://127.0.0.1:{port}/v1 once it is running.
+"""
+
+
+def usage() -> str:
+    return USAGE.format(port=GUARDIAN_PORT, upstream=UPSTREAM_URL,
+                        data=DATA_DIR, num_ctx=NUM_CTX, spans=SPAN_DIR,
+                        log=LOG_PATH)
+
+
+def serve() -> None:
+    """Start the HTTP server. Split out of main() so the flag handling above it
+    can be tested without binding a port."""
     import uvicorn
-    log.info(
-        "Starting Context Guardian v%s on port %d, forwarding to %s "
-        "(num_ctx=%d, threshold=%.2f, keep_recent=%s). "
-        "Health view: http://%s:%d/guardian/health",
-        guardian_version(), GUARDIAN_PORT, UPSTREAM_URL, NUM_CTX,
-        COMPACT_THRESHOLD, keep_recent_label(), GUARDIAN_HOST, GUARDIAN_PORT,
-    )
-    # Fire-and-forget PyPI update check on a daemon thread. Only from main(), so
-    # importing `app` in the test suite never reaches the network.
-    start_version_check()
     # BIND 127.0.0.1, NOT 0.0.0.0 (fixed 2026-08-22, bandit B104).
     # This proxy fronts the backend with NO authentication. Bound to 0.0.0.0
     # it accepted /v1/chat/completions from anyone on the LAN: free use of the
@@ -2554,6 +2672,48 @@ def main():
     # If a container or another host does need it, set GUARDIAN_HOST
     # deliberately rather than reverting this line.
     uvicorn.run(app, host=GUARDIAN_HOST, port=GUARDIAN_PORT)
+
+
+def main():
+    """Console entry point (`context-guardian`) and `python context_guardian.py`."""
+    if sys.argv[1:2] == ["mcp"]:  # `context-guardian mcp` = context-guardian-mcp (the MCP Registry runs `uvx context-guardian mcp`)
+        import cg_mcp
+        sys.exit(cg_mcp.main())
+    # BOTH of these used to fall through and start uvicorn: `context-guardian
+    # --version` bound port 8786 and sat there, so the only way to read the
+    # version was /guardian/stats from a second terminal. Unknown arguments are
+    # still ignored rather than rejected, which is the documented behaviour --
+    # a wrapper may pass flags of its own.
+    args = sys.argv[1:]
+    if "--version" in args or "-V" in args:
+        print("context-guardian %s" % guardian_version())
+        return
+    if "--help" in args or "-h" in args:
+        print(usage())
+        return
+    log.info(
+        "Starting Context Guardian v%s on port %d, forwarding to %s "
+        "(num_ctx=%d, threshold=%.2f, keep_recent=%s). "
+        "Health view: http://%s:%d/guardian/health",
+        guardian_version(), GUARDIAN_PORT, UPSTREAM_URL, NUM_CTX,
+        COMPACT_THRESHOLD, keep_recent_label(), GUARDIAN_HOST, GUARDIAN_PORT,
+    )
+    if _DATA_DIR_NOTICE:
+        log.info("%s", _DATA_DIR_NOTICE)
+    if not bind_is_loopback():
+        # Not a refusal -- someone set this on purpose, and a container has to.
+        # But it is the one setting that turns a local tool into an open one,
+        # and it was previously silent.
+        log.warning(
+            "GUARDIAN_HOST is %s, which is not a loopback address: this proxy "
+            "will accept requests from the network with NO authentication, "
+            "giving anyone who can reach port %d free use of your backend and "
+            "your GPU. Put it behind something that authenticates, or set "
+            "GUARDIAN_HOST=127.0.0.1.", GUARDIAN_HOST, GUARDIAN_PORT)
+    # Fire-and-forget PyPI update check on a daemon thread. Only from main(), so
+    # importing `app` in the test suite never reaches the network.
+    start_version_check()
+    serve()
 
 
 if __name__ == "__main__":

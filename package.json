@@ -26,6 +26,7 @@
     "context_guardian.py",
     "configure.py",
     "cg_configure.py",
+    "cg_paths.py",
     "cg_handoff.js",
     "cg_provenance.js",
     "cg_autorecall.js",
