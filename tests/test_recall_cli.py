@@ -111,7 +111,7 @@ async def test_the_command_in_the_summary_finds_the_evicted_text(monkeypatch, tm
           if "context_guardian" in sys.modules
           else importlib.import_module("context_guardian"))
 
-    async def _fake_summarize(client, model, older_messages):
+    async def _fake_summarize(client, model, older_messages, headers=None):
         return "condensed summary of the older turns, long enough to be accepted"
     monkeypatch.setattr(cg, "summarize_older_messages", _fake_summarize)
 

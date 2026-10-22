@@ -219,6 +219,11 @@ PYPI_JSON_URL = "https://pypi.org/pypi/context-guardian/json"
 UPSTREAM_TIMEOUT_SECONDS = float(os.environ.get("GUARDIAN_UPSTREAM_TIMEOUT", "600.0"))
 UPSTREAM_CONNECT_TIMEOUT_SECONDS = float(
     os.environ.get("GUARDIAN_UPSTREAM_CONNECT_TIMEOUT", "10.0"))
+# The summariser's own read timeout. Defaults to GUARDIAN_UPSTREAM_TIMEOUT, so
+# nothing changes for a user who has only ever set that one; set it when the
+# summary call needs a different ceiling from a forwarded chat request.
+SUMMARY_TIMEOUT_SECONDS = float(os.environ.get(
+    "GUARDIAN_SUMMARY_TIMEOUT", str(UPSTREAM_TIMEOUT_SECONDS)))
 
 # Where compacted spans are evicted to. Compaction used to DESTROY the folded
 # messages and keep a 500-character preview in the log; now the full span goes
@@ -292,6 +297,32 @@ CONDENSE_PROMPT = (
     "BEGIN_TRANSCRIPT\n"
 )
 FENCE_SUFFIX = "\nEND_TRANSCRIPT\n"
+# The markers above are a fence, and a fence only holds if the data inside it
+# cannot write the closing marker itself.
+#
+# The transcript is agent conversation: tool results, file contents, this
+# project's own README. Any of it may contain the literal string
+# END_TRANSCRIPT -- and the fenced prompt pastes it in raw, so a message that
+# carries the marker ends the fence early and everything after it reads as
+# instructions addressed to the summariser. The summary then comes back as a
+# role "system" message in the client's next request, so whatever the text
+# after the marker asked for arrives in the window with system authority.
+#
+# Both markers are neutralised, not just the closing one: a second
+# BEGIN_TRANSCRIPT would let the transcript open a fence of its own around
+# text it wants treated as data by the next reader. The hyphenated form keeps
+# the words legible to the summariser (so the attempt is described, not
+# hidden) while matching neither marker.
+FENCE_MARKERS = ("BEGIN_TRANSCRIPT", "END_TRANSCRIPT")
+
+
+def _fence_safe(text: str) -> str:
+    """One rendered message with the fence markers defanged. Same string back
+    when it carries neither, which is every ordinary message."""
+    for marker in FENCE_MARKERS:
+        if marker in text:
+            text = text.replace(marker, "[%s in data]" % marker.replace("_", "-"))
+    return text
 
 # gpt-oss spends its whole budget in the reasoning channel and emits no final
 # message; "low" cut the same call from 10.3s to 4.8s. OFF by default all the
@@ -1172,6 +1203,43 @@ def _why_empty(data: Any):
     return finish, name
 
 
+# Headers the proxy's OWN summarisation call carries over from the client's
+# request. The forwarded chat request already passes the client's credentials
+# through; the summary call is a request the client never made, and it went out
+# bare -- so against any upstream that wants a key (a LiteLLM master key, vLLM
+# started with --api-key, a hosted endpoint) every summary came back 401 and
+# compaction silently never happened. Same allow-list idea as
+# ANTHROPIC_FORWARD_HEADERS below: credentials and nothing else, so a client's
+# Accept-Encoding or Content-Length cannot ride along and break the call.
+SUMMARY_FORWARD_HEADERS = ("authorization", "api-key", "x-api-key")
+
+
+def _summary_headers(headers: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """The allow-listed credential headers out of the client's request, in the
+    client's own spelling. Empty when the client sent none -- an unkeyed local
+    backend must not start receiving an empty Authorization.
+
+    The values are never logged, here or anywhere: this function returns them
+    and the caller hands them straight to httpx.
+    """
+    if not headers:
+        return {}
+    return {k: v for k, v in headers.items()
+            if k.lower() in SUMMARY_FORWARD_HEADERS and v}
+
+
+def _summary_timeout() -> "httpx.Timeout":
+    """The summary call's timeout.
+
+    A bare `timeout=<seconds>` replaces EVERY phase, connect included, so the
+    600 s read timeout this call needs was also making it wait 600 s to open a
+    socket to a backend that was not listening. Connect stays at the client's
+    own short limit; only the read is long.
+    """
+    return httpx.Timeout(SUMMARY_TIMEOUT_SECONDS,
+                         connect=UPSTREAM_CONNECT_TIMEOUT_SECONDS)
+
+
 def _summary_request(model: str, prompt: str) -> Dict[str, Any]:
     """The body of the summarisation call. Split out so a test can read it."""
     body: Dict[str, Any] = {
@@ -1241,13 +1309,19 @@ def extract_assistant_text(data: Any,
 
 
 async def summarize_older_messages(
-    client: httpx.AsyncClient, model: str, older_messages: List[Dict[str, Any]]
+    client: httpx.AsyncClient, model: str, older_messages: List[Dict[str, Any]],
+    headers: Optional[Dict[str, str]] = None,
 ) -> Optional[str]:
     """Ask the same backend to condense the older portion of the
     conversation. Returns None on any failure -- caller must fail open
     (forward the original, uncompacted request) rather than silently drop
-    history on a broken summarization call."""
-    transcript = "\n\n".join(render_for_summary(m) for m in older_messages)
+    history on a broken summarization call.
+
+    `headers` is the client's own request headers; the allow-listed
+    credentials in them are carried over so a keyed upstream answers.
+    """
+    transcript = "\n\n".join(_fence_safe(render_for_summary(m))
+                             for m in older_messages)
     prompt = CONDENSE_PROMPT + transcript + FENCE_SUFFIX
 
     # A transcript with no substance is not summarisable, and asking anyway is
@@ -1273,14 +1347,16 @@ async def summarize_older_messages(
         resp = await client.post(
             f"{UPSTREAM_URL}/chat/completions",
             json=_summary_request(model, prompt),
+            headers=_summary_headers(headers),
             # NOT a hardcoded 120. This is the LARGEST prompt Guardian ever
             # sends -- a real span measured ~31,000 characters -- so it is the
             # call most likely to need the long timeout, and it was the one
             # call ignoring GUARDIAN_UPSTREAM_TIMEOUT. A user who raised that
             # setting because summarisation timed out would have found it
             # still timing out at 120s, while a test asserted timeouts were
-            # env-tunable.
-            timeout=UPSTREAM_TIMEOUT_SECONDS,
+            # env-tunable. GUARDIAN_SUMMARY_TIMEOUT splits it off from the
+            # forwarded request's; connect stays short either way.
+            timeout=_summary_timeout(),
         )
         resp.raise_for_status()
         data = resp.json()
@@ -1411,7 +1487,8 @@ def _log_dry_run(messages, system_msgs, to_summarize, to_keep, summary,
         log.warning("dry run bookkeeping failed, request unaffected: %s", exc)
 
 
-async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> Dict[str, Any]:
+async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any],
+                        headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """Returns a (possibly rewritten) payload. Never returns something with
     LESS information than the original unless the summarization call
     actually succeeded -- see fail-open comment above."""
@@ -1499,7 +1576,8 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any]) -> D
                  "(keeping %d in-window).", len(part["retired_summaries"]),
                  len(part["kept_summaries"]))
 
-    summary = await summarize_older_messages(client, payload.get("model", ""), to_summarize)
+    summary = await summarize_older_messages(client, payload.get("model", ""),
+                                             to_summarize, headers)
     span_path = None
     if summary is None or len(summary.strip()) < MIN_SUMMARY_CHARS:
         # Fail open: forward the original request untouched rather than
@@ -2059,11 +2137,12 @@ async def _tapped_stream(chunks, upstream_resp: httpx.Response,
 
 
 async def rewrite_chat_payload(client: httpx.AsyncClient,
-                               payload: Dict[str, Any]) -> Dict[str, Any]:
+                               payload: Dict[str, Any],
+                               headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """Everything the proxy may change in a chat/completions body. Returns the
     SAME object when nothing changed, so the caller can forward the original
     bytes."""
-    return with_stream_options(await maybe_compact(client, payload))
+    return with_stream_options(await maybe_compact(client, payload, headers))
 
 
 def with_stream_options(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2129,14 +2208,14 @@ async def _summarize_anthropic(client: httpx.AsyncClient, model: str,
                                headers: Dict[str, str]) -> Optional[str]:
     """The same fenced condense prompt, sent to the upstream's /messages.
     None on any failure; the caller fails open."""
-    transcript = "\n\n".join("[%s]: %s" % (m.get("role", "unknown"),
-                                            _anthropic_text(m.get("content")))
-                              for m in older)
+    transcript = "\n\n".join(_fence_safe("[%s]: %s" % (
+        m.get("role", "unknown"), _anthropic_text(m.get("content"))))
+        for m in older)
     if len(transcript.strip()) < MIN_TRANSCRIPT_CHARS:
         return None
     try:
         resp = await client.post(
-            f"{UPSTREAM_URL}/messages", timeout=UPSTREAM_TIMEOUT_SECONDS,
+            f"{UPSTREAM_URL}/messages", timeout=_summary_timeout(),
             headers={k: v for k, v in headers.items()
                      if k.lower() in ANTHROPIC_FORWARD_HEADERS},
             json={"model": model, "max_tokens": ANTHROPIC_SUMMARY_MAX_TOKENS,
@@ -2267,7 +2346,7 @@ async def proxy(path: str, request: Request):
             # a bug in compaction, a dry run, an injected field -- costs the
             # rewrite, never the request: it goes upstream as the client sent it.
             try:
-                rewritten = await rewrite_chat_payload(client, payload)
+                rewritten = await rewrite_chat_payload(client, payload, headers)
             except Exception as exc:                       # noqa: BLE001
                 log.error("Rewriting the request failed (%s: %s). Forwarding "
                           "it unchanged.", type(exc).__name__, exc)

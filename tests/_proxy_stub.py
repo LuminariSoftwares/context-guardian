@@ -15,7 +15,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 _CLEARED = ("GUARDIAN_DRY_RUN", "GUARDIAN_INJECT_STREAM_OPTIONS",
             "GUARDIAN_OLLAMA_CONTEXT", "GUARDIAN_UPSTREAM_URL",
-            "GUARDIAN_KEEP_RECENT_MESSAGES", "GUARDIAN_RESERVE_OUTPUT")
+            "GUARDIAN_KEEP_RECENT_MESSAGES", "GUARDIAN_RESERVE_OUTPUT",
+            "GUARDIAN_SUMMARY_TIMEOUT", "GUARDIAN_UPSTREAM_TIMEOUT",
+            "GUARDIAN_UPSTREAM_CONNECT_TIMEOUT", "GUARDIAN_ALLOWED_ORIGINS",
+            "GUARDIAN_HOST")
 
 SUMMARY = "condensed summary of the older turns, long enough to be accepted"
 

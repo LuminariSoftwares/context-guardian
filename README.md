@@ -361,6 +361,7 @@ cp .env.example .env
 | `GUARDIAN_CALIBRATE` | `1` | Learn each model's real tokens-per-character from the usage figures the backend returns, and correct the estimate with it. Read per request; set `0` to use the raw estimate |
 | `GUARDIAN_UPSTREAM_TIMEOUT` | `600` | Seconds to wait for the upstream backend to respond |
 | `GUARDIAN_UPSTREAM_CONNECT_TIMEOUT` | `10` | Seconds to wait for the upstream connection itself |
+| `GUARDIAN_SUMMARY_TIMEOUT` | `GUARDIAN_UPSTREAM_TIMEOUT` | Seconds to wait for the summarisation call specifically. It sends the largest prompt Guardian ever builds, so it inherits the long upstream read timeout; set this to give it a different ceiling. The connection itself always uses `GUARDIAN_UPSTREAM_CONNECT_TIMEOUT` |
 | `GUARDIAN_LOG_PATH` | `<repo>/logs/context_guardian_log.json` | Where compaction events are logged (JSON lines) |
 | `GUARDIAN_HOST` | `127.0.0.1` | Interface Guardian binds. **Leave this alone unless you know what you are doing** — Guardian fronts your backend with no authentication |
 | `GUARDIAN_RESERVE_OUTPUT` | `8192` | Tokens held back for the model's *output*. The window has to hold the reply and (for reasoning models) the thinking too, so compaction triggers against what is LEFT. If this is ever ≥ `GUARDIAN_NUM_CTX` it is clamped to half the window and logged — fix the config |

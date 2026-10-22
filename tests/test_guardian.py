@@ -57,7 +57,7 @@ async def test_maybe_compact_below_threshold_is_noop(guardian):
 
 @pytest.mark.asyncio
 async def test_maybe_compact_triggers_and_fails_open_on_summarization_error(guardian, monkeypatch):
-    async def _failing_summarize(client, model, older_messages):
+    async def _failing_summarize(client, model, older_messages, headers=None):
         return None  # simulates a failed summarization call
 
     monkeypatch.setattr(guardian, "summarize_older_messages", _failing_summarize)
@@ -75,7 +75,7 @@ async def test_maybe_compact_triggers_and_fails_open_on_summarization_error(guar
 
 @pytest.mark.asyncio
 async def test_maybe_compact_triggers_and_compacts_on_success(guardian, monkeypatch):
-    async def _fake_summarize(client, model, older_messages):
+    async def _fake_summarize(client, model, older_messages, headers=None):
         # Must clear MIN_SUMMARY_CHARS. The original literal here was 32 chars
         # and this test went green on a summary the proxy now refuses -- the
         # test asserted "compaction happened", never "the summary was usable".
@@ -173,7 +173,7 @@ async def test_empty_or_tiny_summary_does_not_compact(guardian, monkeypatch, deg
     This is the regression the whole 0.3.1 change exists for. Each of these
     values is truthy-or-empty output that the old `is None` check waved through.
     """
-    async def _degenerate_summarize(client, model, older_messages):
+    async def _degenerate_summarize(client, model, older_messages, headers=None):
         return degenerate
 
     monkeypatch.setattr(guardian, "summarize_older_messages", _degenerate_summarize)
@@ -198,7 +198,7 @@ async def test_the_users_task_survives_a_refused_compaction(guardian, monkeypatc
     the task text, not on message counts: a count assertion would have passed
     while the content was blank.
     """
-    async def _empty_summarize(client, model, older_messages):
+    async def _empty_summarize(client, model, older_messages, headers=None):
         return ""
 
     monkeypatch.setattr(guardian, "summarize_older_messages", _empty_summarize)
@@ -312,7 +312,7 @@ async def test_the_transcript_is_sent_between_the_markers(guardian, monkeypatch)
                                  "finish_reason": "stop"}]}
 
     class _FakeClient:
-        async def post(self, url, json=None, timeout=None):
+        async def post(self, url, json=None, timeout=None, headers=None):
             sent["body"] = json
             return _FakeResp()
 
@@ -379,7 +379,7 @@ async def test_a_tool_call_answer_is_no_text_not_a_summary(guardian):
                                                          "arguments": "{}"}}]}}]}
 
     class _FakeClient:
-        async def post(self, url, json=None, timeout=None):
+        async def post(self, url, json=None, timeout=None, headers=None):
             return _FakeResp()
 
     got = await guardian.summarize_older_messages(
@@ -509,7 +509,7 @@ async def test_a_transcript_with_no_substance_is_refused(guardian):
     called = []
 
     class _C:
-        async def post(self, url, json=None, timeout=None):
+        async def post(self, url, json=None, timeout=None, headers=None):
             called.append(url)
             raise AssertionError("should never reach the backend")
 
@@ -827,7 +827,7 @@ def test_the_compacted_body_is_what_reaches_upstream(wired, monkeypatch):
 
     g, seen = wired
 
-    async def _ok(client, model, older):
+    async def _ok(client, model, older, headers=None):
         return "condensed summary of the older turns, " + "y" * 200
 
     monkeypatch.setattr(g, "summarize_older_messages", _ok)
@@ -918,7 +918,7 @@ async def test_compaction_event_records_kept_messages(guardian, monkeypatch):
     so the log (and the dashboard) can show what keep-recent actually did."""
     import json as _json
 
-    async def _fake_summarize(client, model, older_messages):
+    async def _fake_summarize(client, model, older_messages, headers=None):
         return "condensed summary of the older turns, long enough to be accepted"
     monkeypatch.setattr(guardian, "summarize_older_messages", _fake_summarize)
 
