@@ -2,6 +2,209 @@
 
 ## Unreleased
 
+## PyPI context-guardian 0.12.0 (not yet released)
+
+The archive becomes something you can check. Every span is sealed in a hash chain `--verify` walks, every recall
+leaves a counts-only receipt, a model can skim the archive before opening it, a whole session can be journaled
+(opt-in), and Claude Code sessions can be archived through its hooks. The version moves to 0.12.0 in
+`pyproject.toml`, `__version__`, the MCP server and `server.json` together; the npm package (`dsh-context-guardian`)
+keeps its own version line, and its engine changes here ship with its next release. No breaking changes: every new behaviour has an off switch, and
+everything that existed answers as before.
+
+### Sealed archive
+
+- **The span archive is sealed, so "lossless on disk" can be checked.** Every span file is hashed as it sits on disk
+  (written to a temp file, fsynced, renamed into place, then read back) and chained into `<run>/chain.jsonl`: one
+  line per file with its SHA-256, the previous line's hash and its own. Nothing could check the README's promise
+  before; an edited, truncated or deleted span looked exactly like an untouched one. On by default;
+  **`GUARDIAN_SEAL=0`** writes no chain. A seal that fails is logged and counted (`seal.failures` in
+  `/guardian/stats`), and the request proceeds unchanged.
+- **`context-guardian-recall --verify [--run RUN_ID | --all]`** walks each chain and prints `OK` or the first break
+  per run: `content-changed`, `file-missing` (deleted with no prune record), `entry-edited`, `entry-reordered`,
+  `chain-forked`, `unsealed-file` or `anchor-mismatch`. Exit 0 only when every checked run is OK. Without `--run` or
+  `--all` it checks the most recent run.
+- **Retention no longer looks like tampering.** When `GUARDIAN_KEEP_SPANS` prunes a span, a chained `pruned` line is
+  written first, and the verifier reports the file as pruned, as expected.
+- **Tamper-evident, not tamper-proof, and anchoring for the difference.** Anyone who can write the directory can
+  rehash a whole chain. **`GUARDIAN_SEAL_ANCHOR_PATH`** appends every new head to a file meant to live outside the
+  data directory, and `--verify` checks the chain against it when it exists. Each run's head is in
+  `/guardian/stats` (`seal.head`) and `--verify --heads`.
+- **`--verify --seal-existing`** seals spans written before 0.12.0 into a chain whose lines say `"backfilled": true`:
+  verifiable from now on, and labelled honestly as sealed late.
+- **The DeepSeek Harness engine writes the same chain** (`cg_seal.js`), so its spans verify with the Python verifier;
+  one golden hash pins the canonical form in both test suites. The engine reads the same `GUARDIAN_SEAL` and
+  `GUARDIAN_SEAL_ANCHOR_PATH`.
+- **`docs/ARCHIVE_FORMAT.md`** specifies the span file, the chain, the lock and the anchor precisely enough to write an
+  independent verifier.
+
+### Recall receipts
+
+- **Receipts: real numbers instead of adjectives.** Every recall path (`context-guardian-recall`, the MCP span tools)
+  and every compaction appends one counts-only line to `<data dir>/logs/receipts.jsonl`
+  (**`GUARDIAN_RECEIPTS_PATH`**): query terms as a count, spans matched and opened, characters returned, characters
+  archived, whether the summary carried an archive pointer, tokens saved. The proxy also counts recall tool calls it
+  sees in later requests' `tool_calls` (`search_spans`, `mcp__context-guardian__search_spans`, a shell call to
+  `context-guardian-recall`), once per call although clients resend the history every turn.
+- **Counts only, by construction.** A receipt can hold a tool name from a fixed list, a timestamp and integers or
+  booleans, nothing else; a test plants a unique string in the conversation, the query and the path and asserts it
+  appears in no receipt and no output. Nothing leaves the machine. **`GUARDIAN_RECEIPTS=0`** records nothing.
+- **`context-guardian-recall --receipts [--since 7d]`** prints archive size, recall calls, spans opened, the share of
+  the archive read back, tokens saved and seal status. **`--share`** prints the same as a five-line block with no
+  paths, no text and no run ids. A corrupt receipts line is skipped.
+- `/guardian/stats` gains a `receipts` block and `/guardian/health` a receipts line with this run's seal head.
+
+### Skim, then open
+
+- **A digest line per span in `<run>/index.jsonl`**: the first sentence of the summary Guardian already made (no
+  extra model call), the top eight keywords, message count and size. **`GUARDIAN_INDEX=0`** writes none.
+  **`context-guardian-recall --reindex`** builds it for archives written before it existed (digest from the stored
+  summary, or the first user message's opening, labelled `first-user-message`), and produces exactly what live
+  indexing writes. The DSH engine writes the same lines.
+- **MCP `list_digests`: skim the archive in a few hundred tokens.** Newest first, one line per span, hard-capped by
+  `max_tokens` (default 400) measured with the proxy's own estimator on the finished text, ending with an
+  `N more spans` line.
+- **MCP `search_spans` ranks its hits**: the whole phrase first, then by how many of the query's words a message
+  carries, then the newer span first. A single term matches exactly as before.
+- **MCP `read_span` opens a message range** (`start`, `end`) and returns each message's content exactly as archived:
+  a plain text message verbatim, anything else as its JSON. A read past the 20,000-character cap ends with the
+  `start=`/`end=` that reads the rest.
+- **MCP `get_seal_status`** runs the archive verifier from inside the client.
+- **The compaction summary's archive pointer names the tools** (`list_digests`, `search_spans`, `read_span`), so a
+  model with the MCP server connected knows the archive is reachable.
+- `tools/list` grows from ~1,086 to ~1,591 estimated tokens for the two new tools and two parameters (each tool's
+  fixed structure costs ~150 before its description); the CI ceiling moves from 1,100 to 1,600.
+
+### Always-on capture (opt-in)
+
+- **`GUARDIAN_CAPTURE=journal` records the whole session**, not just what compaction evicts: every new message of a
+  run, once, in `<run>/journal.jsonl`. Clients resend the whole history and compaction rewrites it, so a message is
+  identified by a hash of its role, content, tool calls and tool call id, and counted: a resent history adds nothing,
+  and a message that genuinely repeats is journaled each time. Each line records the request that first carried it.
+- **Sealed into the same chain in batches** (every 64 lines, every 5 s of activity, at rotation, at shutdown) with a
+  running hash, so a seal costs the same however large the file; lines written after the last seal are reported as an
+  uncovered tail, not a break. Measured: ~1.0 ms median per request to capture a resent history, ~1.6 ms once it
+  reaches 241 messages / ~225 KB (Python 3.11, Linux container).
+- **`GUARDIAN_CAPTURE_MAX_MB`** (default 200) caps one run, rotating to `journal.N.jsonl`; past the cap, capture stops
+  for that run with one log line and requests are untouched.
+- `context-guardian-recall`, `search_spans` and `read_span` (`index` 0, with `start`/`end`) cover the journal.
+  `/guardian/stats` gains a `capture` block.
+- **Off by default**: it writes every message to disk in clear text and grows with the session.
+
+### Claude Code adapter
+
+- **`context-guardian-claude-code`: archive, seal and recall Claude Code sessions.** Claude Code compacts its own
+  window and by default talks to Anthropic's API directly; routing it through the proxy (`ANTHROPIC_BASE_URL`) stays
+  possible, but its hooks hand a command the session id and the transcript path, which needs no routing change. **`capture`** (the hook entry point) copies the transcript lines it has not copied before into sealed,
+  indexed spans under a `cc-<session_id>` run; `context-guardian-recall`, `--verify` and the MCP tools read them like
+  any other run. It tracks a byte offset per session (and recovers it from the spans themselves if a capture was cut
+  off), copies only complete lines, splits a long first capture into 2 MB spans, always exits 0, logs instead of
+  failing, and exits on a hard internal timeout (20 s, under the hook's 30 s). PreCompact treats exit 2 as "block
+  compaction"; an archiver must never do that. Replayed against a real 3.6 MB transcript: two spans in 0.22 s,
+  `--verify` OK, a second capture adds nothing.
+- **`install`** prints the hooks JSON (PreCompact and SessionEnd, `timeout` 30) and the `claude mcp add` command for
+  the recall server. **`--apply`** backs the settings file up to `settings.json.bak-<YYYYMMDD-HHMMSS>`, merges the
+  hooks next to the ones already there without touching them, and prints a diff; `uninstall --apply` is the exact
+  reverse. Nothing is edited without `--apply`, and a settings file that does not parse is refused. `--scope
+  user|project|local` or `--settings PATH`; `CLAUDE_CONFIG_DIR` is honoured.
+- **`status`**: hooks installed, sessions captured, last capture, seal status.
+- Archived transcript lines are read through to the message inside them for search, roles and digests; a span whose
+  user turns are all tool results takes its digest from the first message with text (`first-message`).
+
+### Summary memo (follow-up)
+
+- **The same history is no longer re-summarised on every request.** The proxy is invisible to its client, so the
+  client keeps resending its whole history; once past the budget, every request summarised the evicted prefix from
+  scratch (one summariser call and one new, mostly duplicate span per turn: 3 requests made 3 full summaries and 3
+  overlapping spans on both routes). **`GUARDIAN_SUMMARY_MEMO`** (default 32 entries, in memory, LRU; `0` off)
+  remembers each compaction by the identity hashes of the evicted messages. An equal range reuses its summary and
+  pointer (no summariser call, no span, the same bytes forwarded, so the backend's prefix cache survives); a range that
+  extends a remembered one is summarised as the earlier summary plus only the new messages, in the same fence, and
+  archived as a span of the new messages with `continues` naming the span before it; an edited or reordered history
+  gets a full summary. Measured over a 20-turn replay: summariser input 623,572 -> 69,566 characters on
+  `/v1/chat/completions` (784,734 -> 83,360 on `/v1/messages`), 494 -> 0 duplicated archived messages; a retried
+  request makes no call. `summaries_generated`, `summaries_reused` and `summaries_extended` are in `/guardian/stats`,
+  the compaction log (`summary_source`) and the receipts. The DSH engine does not have the problem: DSH replaces the
+  compacted range with the checkpoint in its own session, so a region is never presented twice.
+
+### Messages calibration (follow-up)
+
+- **`/v1/messages` now calibrates.** `usage_prompt_tokens()` returned `None` for the Messages usage block, and the
+  route had no calibration tap, so its per-model estimate never corrected itself. The prompt total is now
+  `input_tokens + cache_read_input_tokens + cache_creation_input_tokens` (whichever are present: `input_tokens` alone
+  is only the uncached part), read from the body or, when streaming, from `message_start`'s `message.usage`; a
+  `message_delta` that carries only `output_tokens` is skipped rather than taken as the answer. The route has the same
+  pass-through tap as chat/completions under the same `GUARDIAN_CALIBRATE` switch, and its estimate now applies the
+  learned factor. With no compaction the response bytes are unchanged. Checked against vLLM (`AnthropicUsage`,
+  `_build_anthropic_usage`, `message_stream_converter`) and llama.cpp's server (`to_json_anthropic`,
+  `to_json_anthropic_stream`).
+
+### Window detection on vLLM and llama.cpp (follow-up)
+
+- **The proxy asks vLLM and llama-server for each model's window, not only Ollama.** One-model-at-a-time servers get
+  switched between models whose windows differ sevenfold, and `GUARDIAN_NUM_CTX` is one number per process.
+  **`GUARDIAN_DETECT_CONTEXT`** (`auto` by default, `1`, `0`) asks once per model: an Ollama upstream through
+  `/api/show` exactly as before (`GUARDIAN_OLLAMA_CONTEXT` still works), any other upstream through vLLM's
+  `GET /v1/models` (`max_model_len`; a LoRA adapter with none takes its base model's) and then llama.cpp's
+  `GET /props` (`default_generation_settings.n_ctx`, the per-slot window one request gets, never `n_ctx_train`). Any
+  error falls back to `GUARDIAN_NUM_CTX`. **Safety rule:** an explicit `GUARDIAN_NUM_CTX` is lowered by a smaller
+  reported window and never raised by a larger one; left unset, the reported window is used. The source is logged
+  once per model (`vLLM reports 262144 for <model>`), shown in `/guardian/stats` (`context_detected`) and by
+  `context-guardian-doctor`. The probes carry the client's credential headers, for a keyed server. Checked against
+  vLLM main (`ModelCard.max_model_len`, `show_available_models`) and llama.cpp master (`get_res_props`,
+  `n_ctx_slot`).
+
+### Changed (follow-up 2)
+
+- **Ollama follows the `min()` rule too.** With `GUARDIAN_NUM_CTX` set, the `num_ctx` Ollama reports can lower it
+  but no longer raise it, the same rule as vLLM and llama.cpp; with it unset, Ollama's `num_ctx` is used as before.
+  If you set `GUARDIAN_NUM_CTX` below your Ollama window, the proxy now compacts at your setting, not at Ollama's
+  larger window.
+
+### Detected windows go stale (follow-up 2)
+
+- **A detected window is asked for again.** It was filled once per model for the life of the process, so restarting
+  vLLM or llama-server with a smaller window under the same model name left the proxy budgeting against the old,
+  larger one. The window is now asked again on the request after the upstream rejects one for its context length (a
+  400 or 413 whose body says so: vLLM's `Input length (N) exceeds model's maximum context length (M).`, llama.cpp's
+  `exceed_context_size_error`, Ollama's `the prompt is longer than the context length ...`), and once it is
+  **`GUARDIAN_DETECT_TTL`** seconds old (default 600, `0` never). At most once per model per TTL window; one request
+  waits on the probe while concurrent ones keep the last good window, and a failed probe keeps it too. The proxy never
+  retries the rejected request; the client does, and its retry gets the fresh window. `detect_ttl` is in
+  `/guardian/stats`.
+
+### llama.cpp `/props` must name the model (follow-up 2)
+
+- **A `/props` window is used only for the model it describes.** Behind a model switcher, or in llama-server's router
+  mode, `/props` can describe whichever model is loaded rather than the one requested; vLLM's check matched the model
+  id and llama.cpp's did not. The probe is now `GET /props?model=<model>&autoload=false` (router mode proxies it to
+  that model's instance, `get_router_props`, and `autoload=false` keeps a probe from loading a model; a single
+  llama-server ignores both), and its window is trusted only when `model_alias` (`meta.model_name`), `model_path`, its
+  file name or stem, or an alias on the matching `/v1/models` card is the requested model, or when it names none and
+  `/v1/models` lists exactly one model. Otherwise the proxy falls back to `GUARDIAN_NUM_CTX` and logs why once per
+  model. Checked against llama.cpp master (`get_res_props`, `get_res_model_info`, `get_router_props`, `is_autoload`).
+
+### Concurrent identical compactions (follow-up 2)
+
+- **Two requests compacting the same history at once make one summary.** The memo was looked up before the
+  summariser call and stored after it, so two concurrent requests with the same evicted range each made a summariser
+  call and wrote a duplicate span. The first request now registers the range (by its message hashes) as in flight;
+  a concurrent one waits for it and takes its summary and span through the memo. A failed or short summary resolves
+  to "no summary" for every waiter, so each fails open exactly as before. The table is bounded (64) and cleared as
+  each summary settles; any error in it means "summarise alone".
+
+### Memo drift probe (follow-up 2)
+
+- **`scripts/memo_drift_probe.py` measures whether extended summaries keep early facts.** The suite's stub summariser
+  returns a fixed text, so it cannot. The script replays a scripted conversation (default 30 turns, 5 invented facts
+  planted in the first 3) through the proxy against a real OpenAI-compatible backend (`--upstream`, `--model`), once
+  with the memo on and once with `GUARDIAN_SUMMARY_MEMO=0`, and prints one line per compaction (which facts the
+  summary still carries) and a table of facts kept, summariser calls and summariser input characters. It talks only
+  to `--upstream` (no update check, no environment proxy, detection off), reads none of your `GUARDIAN_*` settings
+  or `.env`, and writes only to a temporary directory it removes. Not run in CI and no result is claimed here;
+  `tests/test_memo_drift_probe.py` checks only its mechanics, against a stub.
+
+### Release process
+
 - **Releases publish from CI by trusted publishing (OIDC), not from a stored API token.** Publishing a GitHub Release
   runs `.github/workflows/release.yml`: the tag must equal `pyproject.toml`'s version (PyPI and npm are independent
   version lines; npm publishes `package.json`'s version only when it is not already on the registry, and a release

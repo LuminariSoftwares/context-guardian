@@ -70,11 +70,13 @@ Configuration is environment variables (or a .env beside this file, written
 by `context-guardian-configure`); see the README for the full list.
 """
 
+import asyncio
 import collections
 import contextlib
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -91,7 +93,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 # PyPI, importlib.metadata reports the same string off the wheel; this constant
 # is the fallback for a bare `python context_guardian.py` run out of a checkout,
 # where no distribution metadata exists. Keep it in lockstep with pyproject.toml.
-__version__ = "0.11.0"  # keep equal to pyproject.toml version
+__version__ = "0.12.0"  # keep equal to pyproject.toml version
 from starlette.background import BackgroundTask
 
 # Load .env BEFORE any config is read.
@@ -115,6 +117,7 @@ REPO_DIR = Path(__file__).resolve().parent
 # on Windows), and an existing archive in the old place keeps being used with a
 # notice. See cg_paths.py.
 import cg_paths
+import cg_archive
 
 _DATA_DIR_NOTICE: Optional[str] = None
 
@@ -144,7 +147,12 @@ GUARDIAN_HOST = os.environ.get("GUARDIAN_HOST", "127.0.0.1")
 # documented 11434. The README was right and the code was not. Set
 # GUARDIAN_UPSTREAM_URL for any other backend.
 UPSTREAM_URL = os.environ.get("GUARDIAN_UPSTREAM_URL", "http://localhost:11434/v1")
-NUM_CTX = int(os.environ.get("GUARDIAN_NUM_CTX", "32768"))  # keep in sync with OLLAMA_CONTEXT_LENGTH
+# Whether the operator set the window, as opposed to taking the default: a
+# window a server reports may LOWER an explicit GUARDIAN_NUM_CTX, never raise
+# it (see context_window). Empty counts as unset.
+_NUM_CTX_ENV = os.environ.get("GUARDIAN_NUM_CTX", "").strip()
+NUM_CTX_EXPLICIT = _NUM_CTX_ENV != ""
+NUM_CTX = int(_NUM_CTX_ENV) if NUM_CTX_EXPLICIT else 32768  # keep in sync with OLLAMA_CONTEXT_LENGTH
 COMPACT_THRESHOLD = float(os.environ.get("GUARDIAN_COMPACT_THRESHOLD", "0.85"))
 # RESERVE_OUTPUT (added 2026-08-21) -- the defect this fixes:
 # COMPACT_THRESHOLD is a fraction of the WHOLE window, and the whole window has
@@ -187,6 +195,31 @@ COUNT_TOOLS = os.environ.get("GUARDIAN_COUNT_TOOLS", "1") not in ("0", "false", 
 # Ollama's port 11434"; "1" always asks, "0" never does. Any error falls back
 # to GUARDIAN_NUM_CTX for that model.
 OLLAMA_CONTEXT = os.environ.get("GUARDIAN_OLLAMA_CONTEXT", "auto").strip().lower()
+# DETECT_CONTEXT: the general switch. One-model-at-a-time servers (vLLM,
+# llama-server) get switched between models whose windows differ sevenfold
+# (38K to 256K), and GUARDIAN_NUM_CTX is one number per process -- wrong for
+# most of those models. "auto" (default): an Ollama upstream is asked through
+# /api/show exactly as before; any other upstream is asked once per model
+# through vLLM's GET /v1/models (max_model_len) and then llama.cpp's GET
+# /props (the per-slot n_ctx). "1" asks every upstream all three ways; "0"
+# asks nothing (GUARDIAN_OLLAMA_CONTEXT=1 still forces the Ollama question).
+DETECT_CONTEXT = os.environ.get("GUARDIAN_DETECT_CONTEXT", "auto").strip().lower()
+
+
+def _detect_ttl(raw: str) -> int:
+    try:
+        n = int(raw.strip())
+    except ValueError:
+        return 600
+    return n if n >= 0 else 600
+
+
+# DETECT_TTL: a detected window goes stale when the server is restarted with a
+# smaller one under the same model name. The window is asked again once it is
+# this many seconds old, and on the request after the upstream rejected one
+# for context length -- either at most once per model per TTL window. "0"
+# never asks again.
+DETECT_TTL = _detect_ttl(os.environ.get("GUARDIAN_DETECT_TTL", "600"))
 OLLAMA_DEFAULT_PORT = 11434
 # /api/show answers from disk in milliseconds; this only bounds a hung server.
 OLLAMA_SHOW_TIMEOUT_SECONDS = 5.0
@@ -286,6 +319,76 @@ SUMMARY_TIMEOUT_SECONDS = float(os.environ.get(
 SPAN_DIR = Path(os.environ.get(
     "GUARDIAN_SPAN_DIR", str(DATA_DIR / cg_paths.SPANS_SUBDIR)))
 KEEP_SPANS = int(os.environ.get("GUARDIAN_KEEP_SPANS", "500"))
+# SEAL: every span written is hashed AS IT IS ON DISK and chained into
+# <run>/chain.jsonl, so `context-guardian-recall --verify` can prove the
+# archive still holds what compaction removed. Before this, "lossless on disk"
+# was a promise nothing could check: an edited, truncated or deleted span
+# looked exactly like an untouched one. Default ON; GUARDIAN_SEAL=0 writes no
+# chain (and leaves the run reported as unsealed by --verify). A seal that
+# fails is logged and the request proceeds unchanged -- see cg_archive.py.
+SEAL = os.environ.get("GUARDIAN_SEAL", "1").strip().lower() not in ("0", "false", "no", "off")
+# Tamper-EVIDENT is not tamper-PROOF: whoever can write the span directory can
+# rehash a whole chain. Set this to a file outside the data directory (synced
+# storage, another disk) and every new head is appended there too; --verify
+# then checks the chain against it.
+SEAL_ANCHOR_PATH = os.environ.get("GUARDIAN_SEAL_ANCHOR_PATH", "").strip() or None
+# SUMMARY MEMO: the proxy is invisible to its client, so the client keeps
+# resending its whole, uncompacted history. Once a conversation crossed the
+# budget, EVERY request summarised the evicted prefix from scratch -- one
+# summariser call (seconds to minutes on a local model) and one new span
+# holding mostly the same messages, every turn. Measured on b053b7e: three
+# requests, each the last plus one turn, made three full summaries and three
+# overlapping spans, on both routes.
+# The memo remembers, per compaction, the identity hashes of the evicted range
+# (cg_archive.message_hash, the journal's), its summary, span and pointer. An
+# equal range is reused (no summariser call, no span); a range that extends a
+# remembered one is summarised as (previous summary + the new messages) and
+# archived as a span of the new messages only, pointing at the span it
+# continues; anything else is summarised in full, as before. In memory only,
+# at most this many entries (LRU); 0 turns it off. Any memo error means "no
+# memo".
+try:
+    SUMMARY_MEMO = max(0, int(os.environ.get("GUARDIAN_SUMMARY_MEMO", "32")))
+except ValueError:
+    SUMMARY_MEMO = 32
+# The label an extension gives the previous summary inside the fence, so the
+# summariser reads it as what came before rather than as one more message.
+EARLIER_SUMMARY_ROLE = "earlier summary"
+# INDEX: one digest line per span in <run>/index.jsonl -- the first sentence of
+# the summary already made here, top keywords, sizes -- so a model can skim the
+# whole archive in a few hundred tokens (MCP list_digests) instead of opening
+# spans to find out what is in them. No extra model call. GUARDIAN_INDEX=0
+# writes none; list_digests then indexes on the fly, and --reindex rebuilds it.
+INDEX = os.environ.get("GUARDIAN_INDEX", "1").strip().lower() not in ("0", "false", "no", "off")
+# CAPTURE: GUARDIAN_CAPTURE=journal records the whole session, not just what
+# compaction evicts -- every new message of this run, once, into
+# <run>/journal.jsonl, sealed into the same chain in batches. OFF by default:
+# it writes every message to disk in clear text, which is a privacy decision a
+# user should make, and it grows with the session. GUARDIAN_CAPTURE_MAX_MB caps
+# one run (default 200); past it capture stops for that run, once, with a log
+# line, and requests are untouched. See cg_archive.Journal.
+CAPTURE = os.environ.get("GUARDIAN_CAPTURE", "off").strip().lower()
+try:
+    CAPTURE_MAX_MB = float(os.environ.get("GUARDIAN_CAPTURE_MAX_MB", "200"))
+except ValueError:
+    CAPTURE_MAX_MB = 200.0
+# RECEIPTS: counts-only evidence of what the archive is worth -- characters
+# archived, compactions whose summary points at the archive, and recall tool
+# calls the model actually made, seen in the tool_calls of later requests.
+# Appended to <data dir>/logs/receipts.jsonl (GUARDIAN_RECEIPTS_PATH) as
+# integers and booleans only; read per event, so GUARDIAN_RECEIPTS=0 takes
+# effect without a restart. Never leaves the machine. See cg_archive.py.
+# The recall tools as the model sees them. MCP clients prefix a server's tools
+# (`mcp__context-guardian__search_spans` in Claude Code), so a call is matched
+# on its last name segment; a shell call is matched on the command it runs.
+RECEIPTS_PATH = Path(os.environ.get("GUARDIAN_RECEIPTS_PATH", "").strip()
+                     or DATA_DIR / cg_paths.RECEIPTS_SUBPATH)
+RECALL_TOOL_NAMES = ("search_spans", "read_span", "list_spans", "list_digests",
+                     "get_seal_status")
+RECALL_COMMAND = "context-guardian-recall"
+# Clients resend the whole history every request, so one recall call arrives
+# again and again. Remembered by id, bounded, so it is counted once.
+RECALL_SEEN_MAX = 10_000
 # How far write_span will walk forward to find a free index when two
 # concurrent compactions compute the same one. Bounded so a directory full of
 # spans cannot turn into an unbounded loop on the request path.
@@ -495,7 +598,37 @@ _state = {
     # Differs from num_ctx when Ollama's /api/show reported the model's own.
     "last_num_ctx": NUM_CTX,
     "last_input_budget": 0,
+    # Seals that could not be written (see seal_file). Non-zero means some
+    # spans of this run will verify as unsealed.
+    "seal_failures": 0,
+    # Where each applied compaction's summary came from (GUARDIAN_SUMMARY_MEMO):
+    # a full summariser call, a remembered summary reused as is, or a remembered
+    # summary extended with only the newly evicted messages.
+    "summaries_generated": 0,
+    "summaries_reused": 0,
+    "summaries_extended": 0,
+    # Span files actually written this run; the archive pointer counts these.
+    "spans_written": 0,
 }
+
+# GUARDIAN_SUMMARY_MEMO: tuple of evicted-message hashes -> {"hashes", "summary",
+# "span", "pointer", "chained"}, oldest first. Per process (= per run), never
+# written to disk.
+_summary_memo: "collections.OrderedDict[tuple, Dict[str, Any]]" = collections.OrderedDict()
+# Evicted-range hashes -> the future of the summary being made for them right
+# now. A concurrent request with the same range waits for it instead of making
+# its own summariser call and span. Bounded; entries leave when they settle.
+_summary_inflight: Dict[tuple, "asyncio.Future"] = {}
+SUMMARY_INFLIGHT_MAX = 64
+
+# The capture journal, created on first use when GUARDIAN_CAPTURE=journal.
+_journal: Optional[cg_archive.Journal] = None
+_capture_failures = {"count": 0}
+
+# Receipts counters for this process: what /guardian/stats shows. The file
+# keeps the durable record across restarts; see note_compaction_receipt.
+_receipts = {"chars_archived": 0, "compactions_with_pointer": 0, "recall_calls_seen": 0}
+_recall_seen: "collections.OrderedDict[str, None]" = collections.OrderedDict()
 
 # When this process started, for the health view's uptime line.
 STARTED_AT = time.time()
@@ -570,10 +703,31 @@ def _prompt_tokens_from(obj: Any) -> Optional[int]:
     """
     try:
         usage = obj.get("usage")
+        # A Messages-API stream reports its input usage in the FIRST event,
+        # message_start, inside the message: {"type": "message_start",
+        # "message": {"usage": {...}}}.
+        if not isinstance(usage, dict) and isinstance(obj.get("message"), dict):
+            usage = obj["message"].get("usage")
         if isinstance(usage, dict):
             n = usage.get("prompt_tokens")
             if isinstance(n, int) and not isinstance(n, bool) and n > 0:
                 return n
+            # The Messages shape. The prompt the model read is everything the
+            # three input fields count: fresh input, input read from the
+            # prompt cache, and input written to it. input_tokens alone is
+            # only the uncached part -- believing it would teach the
+            # calibrator that a cached prompt is tiny, and the estimate would
+            # shrink until compaction fired late. A usage block with no
+            # input_tokens (message_delta carries output_tokens only) is not a
+            # prompt figure at all.
+            if isinstance(usage.get("input_tokens"), int) and not isinstance(usage.get("input_tokens"), bool):
+                total = 0
+                for key in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
+                    v = usage.get(key)
+                    if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+                        total += v
+                if total > 0:
+                    return total
 
         n = obj.get("prompt_eval_count")
         if isinstance(n, int) and not isinstance(n, bool) and n > 0:
@@ -739,6 +893,7 @@ async def _lifespan(_app: FastAPI):
     try:
         yield
     finally:
+        flush_journal()
         if _http_client is not None:
             await _http_client.aclose()
 
@@ -842,8 +997,24 @@ async def _loopback_guard(request: Request, call_next):
 
 
 # model name -> window /api/show reported, or None when asking failed. Filled
-# once per model and kept for the life of the process.
+# when a model is first asked, and refreshed as _detected is (below).
 _ollama_windows: Dict[str, Optional[int]] = {}
+# model name -> {"window": what the server reported, "source": Ollama | vLLM |
+# llama.cpp, "used": the window budgeted against}, or None when nothing was
+# reported. Asked once per model, then again per DETECT_TTL (see
+# context_window); a failed re-probe keeps the last good entry.
+_detected: Dict[str, Optional[Dict[str, Any]]] = {}
+_detected_at: Dict[str, float] = {}       # when each model was last asked
+_last_reprobe: Dict[str, float] = {}      # when each model was last asked AGAIN
+_reprobe_due: set = set()                 # rejected for context length since
+_probing: Dict[str, "asyncio.Future"] = {}
+_clock = time.monotonic
+
+# What vLLM, llama.cpp and Ollama say when a request is over the window, in
+# the body of a 400 (or Ollama's 413). See tests/test_detect_refresh.py for
+# each server's exact text and where it is in their source.
+CONTEXT_REJECTION = re.compile(r"context[ _](length|size|window)|maximum context|max_model_len")
+CONTEXT_REJECTION_MAX_BYTES = 65536
 
 
 def upstream_is_ollama() -> bool:
@@ -884,21 +1055,207 @@ def window_from_show(data: Any) -> Optional[int]:
     return None
 
 
-async def context_window(client: httpx.AsyncClient, model: str) -> int:
-    """The window to budget this model against. GUARDIAN_NUM_CTX unless the
-    upstream is Ollama and /api/show says otherwise. Never raises."""
-    if not model or not upstream_is_ollama():
+def _vllm_window(data: Any, model: str) -> Optional[int]:
+    """max_model_len for `model` out of vLLM's GET /v1/models, or None.
+
+    vLLM fills max_model_len on its base model cards and leaves it null on
+    LoRA adapter cards (vllm/entrypoints/openai/models/serving.py); an adapter
+    runs in the base model's window, so when the asked-for id has none and
+    exactly one card has one, that is the window. May raise on junk."""
+    cards = [c for c in data.get("data") or [] if isinstance(c, dict)]
+
+    def window(card):
+        n = card.get("max_model_len")
+        return n if isinstance(n, int) and not isinstance(n, bool) and n > 0 else None
+
+    for card in cards:
+        if card.get("id") == model and window(card):
+            return window(card)
+    sized = [window(c) for c in cards if window(c)]
+    return sized[0] if len(sized) == 1 else None
+
+
+def _llama_window(data: Any) -> Optional[int]:
+    """The per-slot context out of llama-server's GET /props, or None.
+
+    default_generation_settings.n_ctx is the slot's context (slot_n_ctx in
+    tools/server/server-context.cpp): what ONE request gets, which with
+    several slots and no unified KV cache is the total divided by the slots.
+    Not n_ctx_train, which is only what the model was trained for. May raise."""
+    n = (data.get("default_generation_settings") or {}).get("n_ctx")
+    return n if isinstance(n, int) and not isinstance(n, bool) and n > 0 else None
+
+
+def _props_names(props: Any, models: Any) -> set:
+    """The names llama-server's GET /props gives the model it describes:
+    model_alias (meta.model_name: the first --alias, else the model's name,
+    else the file name), model_path with its file name and stem, and the
+    aliases its /v1/models card lists. Empty when it names none."""
+    names = set()
+    alias = props.get("model_alias")
+    if isinstance(alias, str) and alias:
+        names.add(alias)
+    path = props.get("model_path")
+    if isinstance(path, str) and path and path != "none":
+        base = path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        names.update({path, base, base[:-5] if base.lower().endswith(".gguf") else base})
+    cards = models.get("data") if isinstance(models, dict) else None
+    for card in cards if isinstance(cards, list) else []:
+        if isinstance(card, dict) and card.get("id") in names:
+            names.update(a for a in card.get("aliases") or [] if isinstance(a, str))
+    names.discard("")
+    return names
+
+
+_props_distrust_logged: set = set()
+
+
+def _props_trusted(props: Any, model: str, models: Any) -> bool:
+    """Behind a model switcher or in llama-server's router mode, /props can
+    describe whichever model is loaded, not the one asked for. Trust it only
+    when it names `model`, or when it names none and /v1/models lists exactly
+    one model; otherwise say why, once per model."""
+    names = _props_names(props, models)
+    if names:
+        if model in names:
+            return True
+        why = "it describes %s" % sorted(names)[0]
+    else:
+        cards = (models or {}).get("data") if isinstance(models, dict) else None
+        if isinstance(cards, list) and len(cards) == 1:
+            return True
+        why = "it names no model and /v1/models does not list exactly one"
+    if model not in _props_distrust_logged:
+        _props_distrust_logged.add(model)
+        log.info("llama.cpp /props window not used for %s: %s; using GUARDIAN_NUM_CTX=%d",
+                 model, why, NUM_CTX)
+    return False
+
+
+async def _ask_json(client: httpx.AsyncClient, method: str, url: str,
+                    headers: Optional[Dict[str, str]], **kw) -> Any:
+    resp = await client.request(method, url, headers=_summary_headers(headers),
+                                timeout=OLLAMA_SHOW_TIMEOUT_SECONDS, **kw)
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def context_window(client: httpx.AsyncClient, model: str,
+                         headers: Optional[Dict[str, str]] = None) -> int:
+    """The window to budget this model against. Never raises.
+
+    GUARDIAN_NUM_CTX unless the upstream reports one, asked once per model
+    (see DETECT_CONTEXT). One safety rule for Ollama, vLLM and llama.cpp: an
+    explicit GUARDIAN_NUM_CTX is lowered by a smaller reported window and never
+    raised by a larger one; with no explicit setting the reported window is
+    used. Ollama's trained context_length only ever lowers (window_from_show).
+    The credential headers of the client's request go along, for a keyed server.
+    """
+    if not model:
         return NUM_CTX
-    if model not in _ollama_windows:
+    try:
+        if model not in _detected:
+            await _probe(client, model, headers, first=True)
+        elif _reprobe_wanted(model):
+            await _probe(client, model, headers, first=False)
+    except Exception as exc:                               # noqa: BLE001
+        log.debug("window probe for %s failed: %s", model, exc)
+    entry = _detected.get(model)
+    return entry["used"] if entry else NUM_CTX
+
+
+def _reprobe_wanted(model: str) -> bool:
+    if DETECT_TTL <= 0:
+        return False
+    return model in _reprobe_due or _clock() - _detected_at.get(model, 0.0) >= DETECT_TTL
+
+
+async def _probe(client, model, headers, first: bool) -> None:
+    """Ask the upstream for `model`'s window, one request at a time.
+
+    A first probe is shared: a concurrent request for the same new model waits
+    for its answer rather than asking too. A re-probe runs on the path of the
+    request that started it only; a concurrent request goes on with the last
+    good window. A re-probe that finds nothing keeps the last good window."""
+    pending = _probing.get(model)
+    if pending is not None:
+        if first:
+            await asyncio.shield(pending)
+        return
+    done = asyncio.get_running_loop().create_future()
+    _probing[model] = done
+    try:
+        _reprobe_due.discard(model)
+        if not first:
+            _last_reprobe[model] = _clock()
+        found = await _detect_window(client, model, headers)
+        if first or found is not None:
+            old = _detected.get(model)
+            _detected[model] = found
+            if not first and old and found and old["used"] != found["used"]:
+                log.warning("the window for %s changed from %d to %d", model, old["used"], found["used"])
+        else:
+            log.info("asking again for the window of %s found nothing; keeping the last good one", model)
+        _detected_at[model] = _clock()
+    finally:
+        _probing.pop(model, None)
+        done.set_result(None)
+
+
+def note_rejection(model: str, status: int, body: bytes, encoding: Optional[str] = None) -> None:
+    """Called with the body of an upstream 400/413. A context-length rejection
+    means the window this proxy budgets against may be stale (the server was
+    restarted with a smaller one): ask again on the next request, at most
+    once per model per DETECT_TTL. The rejected request is not retried; the
+    client does that. Never raises."""
+    try:
+        if status not in (400, 413) or not model or DETECT_TTL <= 0 or model not in _detected:
+            return
+        if encoding:
+            if encoding.strip().lower() not in ("gzip", "deflate"):
+                return
+            import zlib
+            body = zlib.decompressobj(47).decompress(body, CONTEXT_REJECTION_MAX_BYTES)
+        if not CONTEXT_REJECTION.search(body.decode("utf-8", "replace").lower()):
+            return
+        last = _last_reprobe.get(model)
+        if last is not None and _clock() - last < DETECT_TTL:
+            return
+        if model not in _reprobe_due:
+            log.info("the upstream rejected a request for %s for its context length; "
+                     "asking for its window again on the next request", model)
+        _reprobe_due.add(model)
+    except Exception as exc:                               # noqa: BLE001
+        log.debug("context rejection check failed: %s", exc)
+
+
+async def _rejection_tap(chunks, upstream_resp: httpx.Response, model: str):
+    """Pass an error response through untouched, keeping a capped copy for
+    note_rejection once it has been delivered."""
+    buffer = bytearray()
+    try:
+        async for chunk in chunks:
+            if len(buffer) < CONTEXT_REJECTION_MAX_BYTES:
+                buffer += chunk[:CONTEXT_REJECTION_MAX_BYTES - len(buffer)]
+            yield chunk
+    finally:
+        note_rejection(model, upstream_resp.status_code, bytes(buffer),
+                       upstream_resp.headers.get("content-encoding"))
+
+
+async def _detect_window(client, model, headers) -> Optional[Dict[str, Any]]:
+    root = UPSTREAM_URL.rstrip("/")
+    bare = root[:-3] if root.endswith("/v1") else root
+    off = DETECT_CONTEXT in ("0", "false", "no", "off")
+    ollama_forced = OLLAMA_CONTEXT in ("1", "true", "yes", "on")
+    ollama_off = OLLAMA_CONTEXT in ("0", "false", "no", "off")
+    ask_ollama = ollama_forced or (not off and not ollama_off and (
+        upstream_is_ollama() or DETECT_CONTEXT in ("1", "true", "yes", "on")))
+    if ask_ollama:
         found = None
-        root = UPSTREAM_URL.rstrip("/")
-        if root.endswith("/v1"):
-            root = root[:-3]
         try:
-            resp = await client.post(f"{root}/api/show", json={"model": model},
-                                     timeout=OLLAMA_SHOW_TIMEOUT_SECONDS)
-            resp.raise_for_status()
-            found = window_from_show(resp.json())
+            found = window_from_show(await _ask_json(client, "POST", f"{bare}/api/show", headers,
+                                                     json={"model": model}))
             log.info("Ollama reports a %s-token window for %s%s.",
                      found if found else "unstated", model,
                      "" if found else "; using GUARDIAN_NUM_CTX=%d" % NUM_CTX)
@@ -906,8 +1263,43 @@ async def context_window(client: httpx.AsyncClient, model: str) -> int:
             log.warning("Ollama /api/show for %s failed (%s: %s); using "
                         "GUARDIAN_NUM_CTX=%d for this model.", model,
                         type(exc).__name__, exc, NUM_CTX)
-        _ollama_windows[model] = found
-    return _ollama_windows[model] or NUM_CTX
+        if found or model not in _ollama_windows:      # a failed re-probe keeps the last good one
+            _ollama_windows[model] = found
+        # An Ollama upstream is answered by Ollama alone, as in 0.11.0, and
+        # its num_ctx follows the same min() rule as vLLM and llama.cpp.
+        if found or upstream_is_ollama():
+            if not found:
+                return None
+            return {"window": found, "source": "Ollama",
+                    "used": min(NUM_CTX, found) if NUM_CTX_EXPLICIT else found}
+    if off:
+        return None
+    models = None
+    found = None
+    source = "vLLM"
+    try:
+        models = await _ask_json(client, "GET", f"{root}/models", headers)
+        found = _vllm_window(models, model)
+    except Exception as exc:                               # noqa: BLE001
+        log.debug("vLLM window probe for %s: %s", model, exc)
+    if not found:
+        source = "llama.cpp"
+        try:
+            # ?model= selects the model's instance in router mode (a single
+            # llama-server ignores it); autoload=false: a probe loads nothing.
+            props = await _ask_json(client, "GET", f"{bare}/props", headers,
+                                    params={"model": model, "autoload": "false"})
+            found = _llama_window(props)
+            if found and not _props_trusted(props, model, models):
+                found = None
+        except Exception as exc:                           # noqa: BLE001
+            log.debug("llama.cpp window probe for %s: %s", model, exc)
+            found = None
+    if not found:
+        return None
+    log.info("%s reports %d for %s", source, found, model)
+    return {"window": found, "source": source,
+            "used": min(NUM_CTX, found) if NUM_CTX_EXPLICIT else found}
 
 
 def estimate_tool_tokens(payload: Dict[str, Any]) -> int:
@@ -1191,7 +1583,7 @@ def partition_messages(messages: List[Dict[str, Any]],
 
 
 def write_span(messages: List[Dict[str, Any]], summary: str,
-               index: int) -> Optional[str]:
+               index: int, continues: Optional[str] = None) -> Optional[str]:
     """Persist the messages about to be folded away, BEFORE folding them.
 
     Called on the request path, so it must never raise. A failed span write
@@ -1199,73 +1591,209 @@ def write_span(messages: List[Dict[str, Any]], summary: str,
     the request, which is worse. Returns the path written, or None -- and None
     is recorded in the compaction log so a missing span is visible rather than
     silently assumed to exist.
+
+    The file itself is written by cg_archive.write_span_file, which the Claude
+    Code adapter shares:
+
+      * It CLAIMS the index instead of assuming it is free. The caller passes
+        `_state["compactions_performed"] + 1`, and that counter is only
+        incremented AFTER this returns -- with an awaited network call (the
+        summariser) in between. In an async server that await is a yield
+        point, so two requests that both cross the threshold reliably compute
+        the SAME index. Both wrote `0004.json`; the second silently replaced
+        the first, and the surviving summary pointed the model at a file
+        containing somebody else's conversation. An exclusive create makes the
+        loser step to the next free index instead of clobbering.
+      * The content goes to a temp file, is fsynced, and replaces the claim in
+        one rename. Written in place (as before 0.12.0) a crash mid-write left
+        a torn span under the final name, and there was no moment at which
+        "the bytes on disk" were final -- which is the moment the seal hashes.
+      * A failed write removes the claim: an empty or half-written NNNN.json
+        reads as an archived span to recall, prune and the DSH bridge.
     """
-    path = None
     try:
         d = SPAN_DIR / RUN_ID
         _private_mkdir(d)
 
-        # CLAIM the index instead of assuming it is free.
-        #
-        # The caller passes `_state["compactions_performed"] + 1`, and that
-        # counter is only incremented AFTER this returns -- with an awaited
-        # network call (the summariser) sitting in between. In an async server
-        # that await is a yield point, so two requests that both cross the
-        # threshold reliably compute the SAME index. Both wrote `0004.json`;
-        # the second silently replaced the first, the archive lost a span with
-        # no error and no log line, and the surviving summary pointed the model
-        # at a file containing somebody else's conversation.
-        #
-        # The README's headline promise is "lossy in context, lossless on
-        # disk". Under concurrency it was lossy on disk too. `x` mode makes the
-        # create atomic at the filesystem level, so the loser of a race steps
-        # to the next free index rather than clobbering.
-        path, fh = None, None
-        for candidate in range(index, index + MAX_SPAN_INDEX_PROBE):
-            attempt = d / f"{candidate:04d}.json"
-            try:
-                fh = open(attempt, "x", encoding="utf-8")
-            except FileExistsError:
-                continue
-            # Before a byte is written: the file must never exist, even for an
-            # instant, with the umask's mode.
-            _make_private(attempt)
-            path, index = attempt, candidate
-            break
-        if fh is None:
+        def payload(claimed: int) -> Dict[str, Any]:
+            body = {
+                "run_id": RUN_ID,
+                "index": claimed,
+                "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "num_ctx": NUM_CTX,
+                "message_count": len(messages),
+                "summary": summary,
+                "messages": messages,
+            }
+            if continues:
+                # An extended summary's span holds only the newly evicted
+                # messages; the earlier ones are in the span it continues.
+                body["continues"] = continues
+            return body
+
+        written = cg_archive.write_span_file(d, index, payload, probe=MAX_SPAN_INDEX_PROBE)
+        if written is None:
             log.warning("could not claim a span index near %d after %d "
                         "attempts -- this span is LOST, not deferred.",
                         index, MAX_SPAN_INDEX_PROBE)
             return None
-
-        payload = {
-            "run_id": RUN_ID,
-            "index": index,
-            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "num_ctx": NUM_CTX,
-            "message_count": len(messages),
-            "summary": summary,
-            "messages": messages,
-        }
-        # The file is already created and held open, so the atomic-rename
-        # dance is gone: the exclusive create IS the claim. A torn write is
-        # handled below: the claimed file is removed and the caller sees None.
-        with fh:
-            json.dump(payload, fh, ensure_ascii=False, indent=1)
-        written, path = path, None
+        path, index, body = written
+        _state["spans_written"] += 1
+        seal_file(path)
+        index_span(path, body)
         prune_spans()
-        return str(written)
+        return str(path)
     except Exception as exc:                               # noqa: BLE001
-        # The claimed file is empty or half-written. Left in place it would
-        # read as an archived span to recall, prune and the DSH bridge.
-        if path is not None:
-            try:
-                path.unlink()
-            except OSError:
-                pass
         log.warning("could not write span %d: %s. The compaction still "
                     "proceeds; this span is LOST, not deferred.", index, exc)
         return None
+
+
+def seal_file(path: Path, kind: str = "span") -> Optional[Dict[str, Any]]:
+    """Hash a file as it is on disk now and chain it into its run's
+    chain.jsonl. Returns the entry, or None when sealing is off or failed.
+
+    Never raises: a seal is evidence ABOUT the archive, and failing to write
+    evidence must not cost the archive or the request. A failure is logged
+    once per occurrence and counted in /guardian/stats; --verify will then
+    report the file as unsealed, which is the honest outcome.
+    """
+    if not SEAL:
+        return None
+    try:
+        path = Path(path)
+        entry = cg_archive.append_entry(
+            path.parent, path.parent.name,
+            {"type": kind, "file": path.name, "sha256": cg_archive.sha256_file(path)},
+            anchor_path=SEAL_ANCHOR_PATH)
+        if entry.pop("_anchor_failed", False):
+            log.warning("sealed %s but could not append its head to the anchor "
+                        "file %s.", path.name, SEAL_ANCHOR_PATH)
+        return entry
+    except Exception as exc:                               # noqa: BLE001
+        _state["seal_failures"] += 1
+        log.warning("could not seal %s (%s: %s). The file is written and the "
+                    "request proceeds; --verify will report it as unsealed.",
+                    getattr(path, "name", path), type(exc).__name__, exc)
+        return None
+
+
+def index_span(path: Path, payload: Dict[str, Any]) -> None:
+    """Append the span's digest line to its run's index.jsonl. Never raises:
+    the index can always be rebuilt from the spans (--reindex), so losing a
+    line costs a skim, never a request."""
+    if not INDEX:
+        return
+    try:
+        cg_archive.append_index(Path(path).parent, cg_archive.index_entry(payload, Path(path).name))
+    except Exception as exc:                               # noqa: BLE001
+        log.warning("could not index %s (%s: %s); the span is written. "
+                    "context-guardian-recall --reindex rebuilds the index.",
+                    Path(path).name, type(exc).__name__, exc)
+
+
+def capture_messages(messages: Any, system: Any = None) -> None:
+    """GUARDIAN_CAPTURE=journal: journal this request's new messages. Never
+    raises and never touches the request: a journal that cannot be written is
+    a missing record, not a reason to fail the user's call."""
+    global _journal
+    if CAPTURE != "journal":
+        return
+    try:
+        if _journal is None:
+            _journal = cg_archive.Journal(SPAN_DIR / RUN_ID, RUN_ID,
+                                          int(CAPTURE_MAX_MB * 1_000_000), seal=SEAL,
+                                          anchor_path=SEAL_ANCHOR_PATH, skip=is_guardian_summary)
+        if system:
+            messages = [{"role": "system", "content": system}] + list(messages or [])
+        was_stopped = _journal.stopped
+        _journal.capture(messages)
+        if _journal.stopped and not was_stopped:
+            log.warning("capture journal for run %s reached GUARDIAN_CAPTURE_MAX_MB "
+                        "(%g MB); capture stops for this run. Requests are "
+                        "unaffected and compaction still archives spans.",
+                        RUN_ID, CAPTURE_MAX_MB)
+    except Exception as exc:                               # noqa: BLE001
+        _capture_failures["count"] += 1
+        # Once loud, then quiet: a broken journal fails the same way on every
+        # request, and a warning per request would bury everything else.
+        (log.warning if _capture_failures["count"] == 1 else log.debug)(
+            "could not write the capture journal (%s: %s). The request is "
+            "unaffected.", type(exc).__name__, exc)
+
+
+def flush_journal() -> None:
+    """Seal what the journal has not sealed yet (shutdown). Never raises."""
+    try:
+        if _journal is not None:
+            _journal.flush()
+    except Exception as exc:                               # noqa: BLE001
+        log.warning("could not seal the capture journal at shutdown: %s", exc)
+
+
+def note_compaction_receipt(archived: List[Dict[str, Any]], pointer: str,
+                            tokens_saved: int, source: str = "generated") -> None:
+    """Count one applied compaction for the receipts. `archived` is what this
+    compaction wrote to disk (nothing, for a reused summary). Never raises."""
+    try:
+        chars = _json_chars(archived) if archived else 0
+        _receipts["chars_archived"] += chars
+        if pointer:
+            _receipts["compactions_with_pointer"] += 1
+        cg_archive.record_receipt("proxy.compaction", path=RECEIPTS_PATH, chars_archived=chars,
+                                  pointer=bool(pointer), tokens_saved=int(tokens_saved),
+                                  reused=source == "reused", extended=source == "extended")
+    except Exception as exc:                               # noqa: BLE001
+        log.debug("receipt not recorded, request unaffected: %s", exc)
+
+
+def _recall_call_keys(messages: Any) -> List[str]:
+    """A stable key per recall tool call in a message list: the call's id when
+    it has one, else a hash of its name and arguments. Both the OpenAI shape
+    (assistant tool_calls) and the Anthropic one (tool_use blocks)."""
+    import hashlib
+    keys = []
+    for m in messages if isinstance(messages, list) else []:
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        calls = []
+        for call in m.get("tool_calls") or []:
+            if isinstance(call, dict):
+                fn = call.get("function") or {}
+                calls.append((call.get("id"), fn.get("name"), fn.get("arguments")))
+        content = m.get("content")
+        for block in content if isinstance(content, list) else []:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                calls.append((block.get("id"), block.get("name"), block.get("input")))
+        for call_id, name, arguments in calls:
+            name = str(name or "")
+            short = name.rsplit("__", 1)[-1].rsplit(".", 1)[-1]
+            args_text = arguments if isinstance(arguments, str) else _json_dump(arguments)
+            if short not in RECALL_TOOL_NAMES and RECALL_COMMAND not in args_text:
+                continue
+            keys.append(str(call_id) if call_id else
+                        hashlib.sha256((name + "\0" + args_text).encode("utf-8", "replace")).hexdigest())
+    return keys
+
+
+def note_recall_calls(messages: Any) -> int:
+    """Count recall tool calls this proxy has not seen before. Never raises."""
+    try:
+        new = 0
+        for key in _recall_call_keys(messages):
+            if key in _recall_seen:
+                continue
+            _recall_seen[key] = None
+            if len(_recall_seen) > RECALL_SEEN_MAX:
+                _recall_seen.popitem(last=False)
+            new += 1
+        if new:
+            _receipts["recall_calls_seen"] += new
+            cg_archive.record_receipt("proxy.recall_seen", path=RECEIPTS_PATH, calls=new)
+        return new
+    except Exception as exc:                               # noqa: BLE001
+        log.debug("recall receipt not recorded, request unaffected: %s", exc)
+        return 0
 
 
 def prune_spans() -> None:
@@ -1278,6 +1806,22 @@ def prune_spans() -> None:
         # few functions up; it was missed here.
         doomed = files[:len(files) - KEEP_SPANS] if len(files) > KEEP_SPANS else []
         for old_file in doomed:
+            # In a sealed run, a deletion with no record is exactly what
+            # tampering looks like. The prune is recorded FIRST: if that fails
+            # the file stays (housekeeping can wait), rather than leaving a
+            # gap the verifier must report as missing.
+            if ((old_file.parent / cg_archive.CHAIN_FILE).exists()
+                    and cg_archive.SPAN_NAME_RE.match(old_file.name)):
+                try:
+                    cg_archive.append_entry(
+                        old_file.parent, old_file.parent.name,
+                        {"type": "pruned", "file": old_file.name,
+                         "sha256": cg_archive.sha256_file(old_file)},
+                        anchor_path=SEAL_ANCHOR_PATH)
+                except Exception as exc:                   # noqa: BLE001
+                    log.warning("could not record the prune of %s (%s); keeping "
+                                "the file.", old_file, exc)
+                    continue
             old_file.unlink(missing_ok=True)
     except Exception:                                      # noqa: BLE001
         pass
@@ -1576,7 +2120,151 @@ async def summarize_older_messages(
         return None
 
 
-def _span_pointer(to_summarize: List[Dict[str, Any]], span_path: Optional[str]) -> str:
+def _message_hashes(messages: List[Dict[str, Any]]) -> tuple:
+    return tuple(cg_archive.message_hash(m) if isinstance(m, dict)
+                 else cg_archive.message_hash({"content": str(m)}) for m in messages)
+
+
+def memo_lookup(hashes: tuple):
+    """("reuse" | "extend" | "full", the remembered entry or None). The longest
+    remembered range that is a prefix of `hashes` wins; a range that is not a
+    prefix (the client edited or reordered its history) matches nothing."""
+    best = None
+    for entry in _summary_memo.values():
+        h = entry["hashes"]
+        if len(h) <= len(hashes) and hashes[:len(h)] == h and (best is None or len(h) > len(best["hashes"])):
+            best = entry
+    if best is None:
+        return "full", None
+    return ("reuse" if len(best["hashes"]) == len(hashes) else "extend"), best
+
+
+def memo_store(hashes: tuple, summary: str, span: Optional[str], pointer: str, chained: bool) -> None:
+    _summary_memo[hashes] = {"hashes": hashes, "summary": summary, "span": span,
+                             "pointer": pointer, "chained": chained}
+    _summary_memo.move_to_end(hashes)
+    while len(_summary_memo) > SUMMARY_MEMO:
+        _summary_memo.popitem(last=False)
+
+
+async def _memo_summary(to_summarize: List[Dict[str, Any]], summarise) -> Dict[str, Any]:
+    """The summary for this evicted range, through the memo when it can help.
+
+    Returns {"summary", "source": generated|reused|extended, "entry", "hashes",
+    "new": the messages this compaction has to archive}. `summarise` is the
+    route's own summariser (fence, headers and endpoint unchanged). A memo
+    that fails for any reason is treated as empty: the full summary is what
+    0.11.0 did, so it is always a safe answer.
+    """
+    plan, entry, hashes = "full", None, None
+    if SUMMARY_MEMO > 0 and not DRY_RUN:
+        try:
+            hashes = _message_hashes(to_summarize)
+            plan, entry = memo_lookup(hashes)
+        except Exception as exc:                           # noqa: BLE001
+            log.debug("summary memo unavailable, summarising in full: %s", exc)
+            plan, entry, hashes = "full", None, None
+    if plan == "reuse":
+        return {"summary": entry["summary"], "source": "reused", "entry": entry,
+                "hashes": hashes, "new": []}
+    mine = None
+    if hashes is not None:
+        waited = await _await_inflight(hashes)
+        if waited is not None:
+            return waited
+        mine = _claim_inflight(hashes)
+    try:
+        if plan == "extend":
+            new = to_summarize[len(entry["hashes"]):]
+            earlier = {"role": EARLIER_SUMMARY_ROLE, "content": entry["summary"]}
+            summary = await summarise([earlier] + new)
+            return {"summary": summary, "source": "extended", "entry": entry, "hashes": hashes, "new": new}
+        summary = await summarise(to_summarize)
+        return {"summary": summary, "source": "generated", "entry": None, "hashes": hashes,
+                "new": to_summarize}
+    finally:
+        if mine is not None:
+            # Settled on the loop's next turn, not now: the caller stores the
+            # memo (_apply_memo) without awaiting in between, so by then a
+            # good summary is in the memo and a failed one is not.
+            _settle_later(hashes, mine)
+
+
+async def _await_inflight(hashes: tuple) -> Optional[Dict[str, Any]]:
+    """When the same range is being summarised for another request, wait for
+    it: its summary, through the memo (reused), or "no summary" when it failed,
+    so this request fails open as that one did. None means summarise alone,
+    which is also the answer to any error in here."""
+    try:
+        pending = _summary_inflight.get(hashes)
+        if pending is None:
+            return None
+        await asyncio.shield(pending)
+        plan, entry = memo_lookup(hashes)
+        if plan == "reuse":
+            return {"summary": entry["summary"], "source": "reused", "entry": entry,
+                    "hashes": hashes, "new": []}
+        return {"summary": None, "source": "generated", "entry": None, "hashes": hashes, "new": []}
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:                               # noqa: BLE001
+        log.debug("summary de-dup unavailable, summarising alone: %s", exc)
+        return None
+
+
+def _claim_inflight(hashes: tuple) -> Optional["asyncio.Future"]:
+    try:
+        if len(_summary_inflight) >= SUMMARY_INFLIGHT_MAX:
+            return None
+        fut = asyncio.get_running_loop().create_future()
+        _summary_inflight[hashes] = fut
+        return fut
+    except Exception as exc:                               # noqa: BLE001
+        log.debug("summary de-dup unavailable, summarising alone: %s", exc)
+        return None
+
+
+def _settle_later(hashes: tuple, fut: "asyncio.Future") -> None:
+    def settle():
+        try:
+            if _summary_inflight.get(hashes) is fut:
+                del _summary_inflight[hashes]
+        except Exception as exc:                           # noqa: BLE001
+            log.debug("summary de-dup cleanup failed: %s", exc)
+        if not fut.done():
+            fut.set_result(None)
+    try:
+        asyncio.get_running_loop().call_soon(settle)
+    except Exception:                                      # noqa: BLE001
+        settle()
+
+
+def _apply_memo(result: Dict[str, Any], to_summarize: List[Dict[str, Any]]):
+    """Archive and point for a summary from _memo_summary, then remember it.
+    Returns (span_path, pointer). Never raises past the span write, which
+    already fails open by itself."""
+    source, entry, summary = result["source"], result["entry"], result["summary"]
+    if source == "reused":
+        span_path, pointer = entry["span"], entry["pointer"]
+    elif source == "extended":
+        prev = Path(entry["span"]).name if entry.get("span") else None
+        span_path = write_span(result["new"], summary, _state["spans_written"] + 1, continues=prev)
+        pointer = _span_pointer(to_summarize, span_path, chained=True)
+    else:
+        span_path = write_span(to_summarize, summary, _state["spans_written"] + 1)
+        pointer = _span_pointer(to_summarize, span_path)
+    _state["summaries_" + source] += 1
+    if result["hashes"] is not None:
+        try:
+            memo_store(result["hashes"], summary, span_path, pointer,
+                       chained=source == "extended" or bool(entry and entry.get("chained")))
+        except Exception as exc:                           # noqa: BLE001
+            log.debug("summary memo not updated: %s", exc)
+    return span_path, pointer
+
+
+def _span_pointer(to_summarize: List[Dict[str, Any]], span_path: Optional[str],
+                  chained: bool = False) -> str:
     # Name the span file IN the summary the model receives. This is the whole
     # difference between an archive and a recovery path: Guardian is a proxy and
     # cannot hand the model a tool, but every agentic client it fronts already
@@ -1595,18 +2283,22 @@ def _span_pointer(to_summarize: List[Dict[str, Any]], span_path: Optional[str]) 
     # The size figure is what lets it decide; the search hint is what keeps
     # it cheap.
     span_tokens = estimate_tokens(to_summarize)
-    n_spans = _state["compactions_performed"] + 1
+    n_spans = _state["spans_written"]
+    where = (f"saved across spans ending at {span_path} (each names the span it "
+             f"continues)" if chained else f"saved at {span_path}")
     # Name the DIRECTORY, not just this file. Older summaries are retired
     # from the window now, so their individual pointers go with them -- one
     # pointer at the whole archive is what keeps the earlier spans findable.
     return (f"\n\n[Full text of those {len(to_summarize)} messages "
-            f"(~{span_tokens} tokens) saved at {span_path}. "
+            f"(~{span_tokens} tokens) {where}. "
             f"{n_spans} span(s) so far this session, all under "
             f"{SPAN_DIR / RUN_ID}. They are LARGER than the room that "
             f"was freed -- do not read them whole. Search instead: "
             f"`context-guardian-recall \"<term>\" --run {RUN_ID}` "
             f"(from a source checkout: `python {RECALL_SCRIPT} "
-            f"\"<term>\" --run {RUN_ID}`).]")
+            f"\"<term>\" --run {RUN_ID}`). With the context-guardian MCP "
+            f"server: list_digests to skim, search_spans to find, read_span "
+            f"to open a message range.]")
 
 
 def _summary_message(to_summarize: List[Dict[str, Any]], summary: str,
@@ -1625,7 +2317,8 @@ def _compaction_event(name: str, index: int, messages: List[Dict[str, Any]],
                       new_messages: List[Dict[str, Any]],
                       to_keep: List[Dict[str, Any]], estimated: int,
                       message_tokens: int, tool_tokens: int,
-                      span_path: Optional[str], summary: str) -> Dict[str, Any]:
+                      span_path: Optional[str], summary: str,
+                      summary_source: str = "generated") -> Dict[str, Any]:
     """The log record of one compaction. A dry run writes the same record
     under its own event name, so the two can be compared field for field."""
     # Compute the "after" figures once and reuse -- estimate_tokens walks every
@@ -1656,6 +2349,8 @@ def _compaction_event(name: str, index: int, messages: List[Dict[str, Any]],
         "span_file": span_path,
         "span_written": span_path is not None,
         "summary_preview": summary[:500],
+        # generated | reused | extended (GUARDIAN_SUMMARY_MEMO).
+        "summary_source": summary_source,
     }
 
 
@@ -1686,6 +2381,7 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any],
     actually succeeded -- see fail-open comment above."""
     messages = payload.get("messages", [])
     _state["requests_seen"] += 1
+    note_recall_calls(messages)
 
     message_tokens = estimate_tokens(messages)
     tool_tokens = estimate_tool_tokens(payload)
@@ -1704,7 +2400,7 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any],
     # Compact against the budget the INPUT is actually allowed to occupy, which
     # is the window minus the space the model needs to think and answer. Take
     # whichever limit is stricter so lowering COMPACT_THRESHOLD still works.
-    num_ctx = await context_window(client, calib_model)
+    num_ctx = await context_window(client, calib_model, headers)
     threshold_tokens = effective_threshold(num_ctx=num_ctx)
     _state["last_num_ctx"] = num_ctx
     _state["last_input_budget"] = threshold_tokens
@@ -1768,8 +2464,9 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any],
                  "(keeping %d in-window).", len(part["retired_summaries"]),
                  len(part["kept_summaries"]))
 
-    summary = await summarize_older_messages(client, payload.get("model", ""),
-                                             to_summarize, headers)
+    memo = await _memo_summary(
+        to_summarize, lambda msgs: summarize_older_messages(client, payload.get("model", ""), msgs, headers))
+    summary = memo["summary"]
     span_path = None
     if summary is None or len(summary.strip()) < MIN_SUMMARY_CHARS:
         # Fail open: forward the original request untouched rather than
@@ -1807,10 +2504,10 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any],
         return payload
 
     # Evict to disk BEFORE the messages are replaced. If this ran after, a crash
-    # between the two would lose the span with nothing to show it existed.
-    span_path = write_span(to_summarize, summary, _state["compactions_performed"] + 1)
-
-    pointer = _span_pointer(to_summarize, span_path)
+    # between the two would lose the span with nothing to show it existed. A
+    # reused summary writes nothing: its messages are already archived.
+    # No await between _memo_summary and here: a concurrent waiter reads the memo this stores (_settle_later).
+    span_path, pointer = _apply_memo(memo, to_summarize)
 
     new_messages = system_msgs + [_summary_message(to_summarize, summary, pointer)] + to_keep
     new_payload = dict(payload)
@@ -1819,11 +2516,12 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any],
     _state["compactions_performed"] += 1
     event = _compaction_event("compaction", _state["compactions_performed"],
                               messages, new_messages, to_keep, estimated,
-                              message_tokens, tool_tokens, span_path, summary)
+                              message_tokens, tool_tokens, span_path, summary, memo["source"])
     tokens_after = event["estimated_tokens_after"]
     tokens_saved = event["tokens_saved"]
     _state["tokens_saved_total"] += tokens_saved
     log_event(event)
+    note_compaction_receipt(memo["new"], pointer, tokens_saved, memo["source"])
 
     if VERBOSE:
         # A visible banner, not a line that scrolls past in a busy log. This is
@@ -2001,6 +2699,11 @@ async def stats():
         "inject_stream_options": INJECT_STREAM_OPTIONS,
         "ollama_context_enabled": upstream_is_ollama(),
         "ollama_context": {m: n for m, n in _ollama_windows.items() if n},
+        "detect_context": DETECT_CONTEXT,
+        "detect_ttl": DETECT_TTL,
+        "num_ctx_explicit": NUM_CTX_EXPLICIT,
+        # What each model's server reported and where from, and the window used.
+        "context_detected": {m: e for m, e in _detected.items() if e},
         "uptime_seconds": round(time.time() - STARTED_AT, 1),
         "cost_per_1m_input_usd": COST_PER_1M_INPUT_USD,
         "cost_saved_usd": cost_saved_usd(),
@@ -2014,6 +2717,12 @@ async def stats():
         "run_id": RUN_ID,
         "span_dir": str(SPAN_DIR),
         "upstream": UPSTREAM_URL,
+        "seal": seal_status(),
+        "receipts": {"enabled": cg_archive.receipts_enabled(), **_receipts},
+        "capture": {"mode": CAPTURE if CAPTURE == "journal" else "off",
+                    "cap_mb": CAPTURE_MAX_MB, "failures": _capture_failures["count"],
+                    **(_journal.stats() if _journal is not None else
+                       {"messages": 0, "requests": 0, "bytes": 0, "files": 0, "stopped": False})},
         **_state,
         # What the proxy has learned about its own estimate error, per model.
         # `last_raw_estimate` above is the pre-correction figure; this is what
@@ -2024,6 +2733,19 @@ async def stats():
         "note": ("last_known_total_tokens now INCLUDES the tools array. "
                  "last_tool_tokens is the part compaction cannot touch."),
     })
+
+
+def seal_status() -> Dict[str, Any]:
+    """This run's chain head, for /guardian/stats. Copy the head somewhere the
+    data directory's writers cannot reach and it pins the archive as it is
+    now; GUARDIAN_SEAL_ANCHOR_PATH does that automatically. Never raises."""
+    last = cg_archive.head(SPAN_DIR / RUN_ID) if SEAL else None
+    return {"enabled": SEAL,
+            "run_id": RUN_ID,
+            "head": last["entry_hash"] if last else None,
+            "seq": last["seq"] if last else 0,
+            "anchor_path_set": SEAL_ANCHOR_PATH is not None,
+            "failures": _state["seal_failures"]}
 
 
 @app.get("/guardian/events")
@@ -2125,6 +2847,7 @@ _HEALTH_HTML = """<!doctype html>
   #notice.show{display:block}
   code{background:#21262d;padding:1px 5px;border-radius:4px}
   footer{padding:6px 22px 22px;color:#8b949e;font-size:12px}
+  .receipts{padding:0 22px;color:#8b949e;font-size:13px;max-width:996px}
   [hidden]{display:none!important}
 </style></head><body>
 <header>
@@ -2148,6 +2871,7 @@ _HEALTH_HTML = """<!doctype html>
 
 <div class="advice" id="advice" hidden></div>
 <main id="cards"></main>
+<div class="receipts" id="receipts"></div>
 <footer>Auto-refreshing every 3s from <code>/guardian/stats</code> + <code>/guardian/events</code>. Local, unauthenticated, loopback-only.</footer>
 
 <script>
@@ -2252,6 +2976,13 @@ async function tick(){
       `conversation on top of this floor but cannot shrink the floor itself. To free real room, load `+
       `fewer MCP servers (e.g. <code>--mcp-config &lt;file&gt; --strict-mcp-config</code>).`;
   } else { adv.hidden=true; }
+
+  // Receipts: counts only, local only (GUARDIAN_RECEIPTS). The seal head is the
+  // value to copy elsewhere to pin the archive as it is now.
+  const r=s.receipts||{}, seal=s.seal||{};
+  $("receipts").textContent=r.enabled===false?"Receipts off (GUARDIAN_RECEIPTS=0).":
+    `Receipts this run: ${fmt(r.compactions_with_pointer)} compaction(s) archived ${fmt(r.chars_archived)} chars, `+
+    `${fmt(r.recall_calls_seen)} recall call(s) seen · seal ${seal.enabled===false?"off":seal.head?"head "+seal.head.slice(0,12)+"… at seq "+seal.seq:"no spans yet"}`;
 
   const n=$("notice");
   if(s.update_available){n.className="show";
@@ -2431,13 +3162,20 @@ async def maybe_compact_anthropic(client: httpx.AsyncClient, payload: Dict[str, 
     if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
         return payload
     _state["requests_seen"] += 1
+    note_recall_calls(messages)
     system = payload.get("system")
     system_tokens = int(len(_anthropic_text(system)) / CHARS_PER_TOKEN_ESTIMATE)
     message_tokens = estimate_tokens(messages) + system_tokens
     tool_tokens = estimate_tool_tokens(payload)
     estimated = message_tokens + tool_tokens
     model = str(payload.get("model") or "")
-    num_ctx = await context_window(client, model)
+    # Same rule as chat/completions: the raw figure is what the response tap
+    # divides the backend's report by, the corrected one is what is compared
+    # with the budget.
+    _state["last_raw_estimate"] = estimated
+    if calibration_enabled():
+        estimated = int(estimated * CALIBRATOR.factor(model))
+    num_ctx = await context_window(client, model, headers)
     threshold_tokens = effective_threshold(num_ctx=num_ctx)
     _state["last_known_total_tokens"] = estimated
     _state["last_num_ctx"] = num_ctx
@@ -2454,7 +3192,9 @@ async def maybe_compact_anthropic(client: httpx.AsyncClient, payload: Dict[str, 
     log.info("Anthropic request ~%d tokens >= threshold %d -- compacting %d "
              "message(s).", estimated, threshold_tokens, len(to_summarize))
 
-    summary = await _summarize_anthropic(client, model, to_summarize, headers)
+    memo = await _memo_summary(
+        to_summarize, lambda msgs: _summarize_anthropic(client, model, msgs, headers))
+    summary = memo["summary"]
     if summary is None or len(summary.strip()) < MIN_SUMMARY_CHARS:
         _state["summaries_rejected_empty"] += 1
         log_event({"event": "compaction_refused", "reason": "empty_or_short_summary",
@@ -2470,9 +3210,9 @@ async def maybe_compact_anthropic(client: httpx.AsyncClient, payload: Dict[str, 
                      estimated, message_tokens, tool_tokens)
         return payload
 
-    span_path = write_span(to_summarize, summary, _state["compactions_performed"] + 1)
-    note = _summary_message(to_summarize, summary,
-                            _span_pointer(to_summarize, span_path))["content"]
+    # No await between _memo_summary and here: a concurrent waiter reads the memo this stores (_settle_later).
+    span_path, pointer = _apply_memo(memo, to_summarize)
+    note = _summary_message(to_summarize, summary, pointer)["content"]
     out = dict(payload)
     if isinstance(system, list):
         out["system"] = system + [{"type": "text", "text": note}]
@@ -2484,10 +3224,11 @@ async def maybe_compact_anthropic(client: httpx.AsyncClient, payload: Dict[str, 
     event = _compaction_event("compaction", _state["compactions_performed"], messages,
                               system_msgs + [{"role": "system", "content": note}] + to_keep,
                               to_keep, estimated, message_tokens, tool_tokens,
-                              span_path, summary)
+                              span_path, summary, memo["source"])
     event["route"] = "messages"
     _state["tokens_saved_total"] += event["tokens_saved"]
     log_event(event)
+    note_compaction_receipt(memo["new"], pointer, event["tokens_saved"], memo["source"])
     log.info("Compacted Anthropic request %d -> %d messages, ~%d -> ~%d tokens.",
              len(messages), len(to_keep), estimated, event["estimated_tokens_after"])
     return out
@@ -2522,6 +3263,8 @@ async def proxy(path: str, request: Request):
     # calibration switched on; `None` is the "stream it untouched" signal.
     calib_model = None
     calib_estimate = None
+    # The model a chat or messages request names, for note_rejection.
+    window_model = ""
     if path == "chat/completions" and request.method == "POST" and body_bytes:
         try:
             payload = json.loads(body_bytes)
@@ -2535,6 +3278,8 @@ async def proxy(path: str, request: Request):
         # an object is not something this proxy understands; pass it through
         # untouched and let the backend rule on it.
         if isinstance(payload, dict):
+            window_model = str(payload.get("model") or "")
+            capture_messages(payload.get("messages"))
             # FAIL-OPEN for the whole rewrite step. Whatever raises in here --
             # a bug in compaction, a dry run, an injected field -- costs the
             # rewrite, never the request: it goes upstream as the client sent it.
@@ -2561,15 +3306,27 @@ async def proxy(path: str, request: Request):
                                   + estimate_tool_tokens(payload))
 
     elif path == "messages" and request.method == "POST" and body_bytes:
-        # Anthropic Messages API: same fail-open contract. The response is
-        # never touched (no calibration tap), so with no compaction the
+        # Anthropic Messages API: same fail-open contract. The response goes
+        # through the same pass-through calibration tap as chat/completions,
+        # which copies bytes and never alters them, so with no compaction the
         # stream is byte-identical both ways.
         try:
             payload = json.loads(body_bytes)
             if isinstance(payload, dict):
+                window_model = str(payload.get("model") or "")
+                capture_messages(payload.get("messages"), payload.get("system"))
                 rewritten = await maybe_compact_anthropic(client, payload, headers)
                 if rewritten is not payload:
                     body_bytes = json.dumps(rewritten).encode("utf-8")
+                # The calibration tap, as on chat/completions: before 0.12.0
+                # this route had none, so its estimate never learned from the
+                # usage the backend reports. The raw size of what is actually
+                # forwarded, compacted or not.
+                if calibration_enabled() and isinstance(rewritten.get("messages"), list):
+                    calib_model = str(rewritten.get("model") or "")
+                    calib_estimate = (estimate_tokens(rewritten["messages"])
+                                      + int(len(_anthropic_text(rewritten.get("system"))) / CHARS_PER_TOKEN_ESTIMATE)
+                                      + estimate_tool_tokens(rewritten))
         except Exception as exc:                           # noqa: BLE001
             log.error("Rewriting the /v1/messages request failed (%s: %s). "
                       "Forwarding it unchanged.", type(exc).__name__, exc)
@@ -2613,6 +3370,8 @@ async def proxy(path: str, request: Request):
                                      calib_model, calib_estimate)
     else:
         body_stream = upstream_resp.aiter_raw()
+    if window_model and upstream_resp.status_code in (400, 413):
+        body_stream = _rejection_tap(body_stream, upstream_resp, window_model)
     return StreamingResponse(
         body_stream,
         status_code=upstream_resp.status_code,

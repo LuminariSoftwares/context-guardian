@@ -61,7 +61,7 @@ jobs:
           by_id = {r.get("id"): r for r in replies}
           assert by_id[1]["result"]["serverInfo"]["name"] == "context-guardian", by_id[1]
           names = sorted(t["name"] for t in by_id[2]["result"]["tools"])
-          assert names == ["get_proxy_status", "list_spans", "read_span", "search_spans"], names
+          assert names == ["get_proxy_status", "get_seal_status", "list_digests", "list_spans", "read_span", "search_spans"], names
           print("tools/list over stdio:", ", ".join(names))
           PY
 

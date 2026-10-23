@@ -37,7 +37,7 @@
  *
  * MIT licensed.
  */
-import { appendFileSync, closeSync, mkdirSync, openSync, readdirSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { COMPILER_REV, DEFAULT_NOISE_PATTERNS, RECALL_GUIDE, compileNoisePatterns, compileRegion, isCheckpointSource, joinCompiledEntries, parseToolArguments } from './vendor/compiler.js'
@@ -47,6 +47,7 @@ import { ANCHORS_REV, findLostAnchors, lostConstraints, renderCarried } from './
 import { buildHandoff, writeHandoff } from './cg_handoff.js'
 import { staleRecall } from './cg_autorecall.js'
 import { staleAssertions, steerText } from './cg_postcheck.js'
+import { pruneSealed, writeSealedSpan } from './cg_seal.js'
 import { randomUUID } from 'node:crypto'
 
 export const name = 'context-guardian-engine'
@@ -208,6 +209,12 @@ export function resolveEngineOptions(config = {}, env = process.env) {
     })(),
     staleRecall: staleRecallOn,
     postAnswerCheck: postAnswerCheckOn,
+    // The sealed archive (cg_seal.js): the same switch and anchor file the Python proxy reads, so one setting
+    // covers both front doors. Default ON; only the four spellings turn it off.
+    seal: !['0', 'false', 'no', 'off'].includes(String(env.GUARDIAN_SEAL ?? '').trim().toLowerCase()),
+    sealAnchorPath: String(env.GUARDIAN_SEAL_ANCHOR_PATH ?? '').trim(),
+    // The skim index (index.jsonl), same switch as the proxy's.
+    index: !['0', 'false', 'no', 'off'].includes(String(env.GUARDIAN_INDEX ?? '').trim().toLowerCase()),
   }
 }
 
@@ -766,49 +773,27 @@ export function apply(ctx, config) {
     return last === undefined ? 'none yet in this session' : `${last.kind} (${last.detail}) at ${last.at}, trigger ${last.trigger}`
   }
 
-  // ── span archive (context_guardian.py `write_span` format) ───────────────
+  // ── span archive (context_guardian.py `write_span` format, sealed: cg_seal.js) ─
   let spanIndex = 0
   const writeSpan = (session, messages, summary) => {
     try {
-      const dir = join(options.spanDir, runId)
-      mkdirSync(dir, { recursive: true })
-      for (let attempt = 0; attempt < 50; attempt += 1) {
-        const index = spanIndex + 1 + attempt
-        const path = join(dir, `${String(index).padStart(4, '0')}.json`)
-        let fd
-        try { fd = openSync(path, 'wx') } catch (error) { if (error?.code === 'EEXIST') continue; throw error }
-        try {
-          writeSync(fd, JSON.stringify({
-            run_id: runId, index, at: new Date().toISOString().replace('T', ' ').slice(0, 19), num_ctx: options.numCtx,
-            message_count: messages.length, summary, messages, session_id: String(session?.id ?? ''), engine: ENGINE_REV,
-          }, null, 1))
-        } catch (error) {
-          // The claimed file is empty or half-written; left in place it reads as an archived span.
-          closeSync(fd); fd = undefined
-          try { unlinkSync(path) } catch { /* already gone */ }
-          throw error
-        } finally { if (fd !== undefined) closeSync(fd) }
-        spanIndex = index
-        pruneSpans()
-        return path
-      }
+      const { path, index } = writeSealedSpan({
+        spanDir: options.spanDir, runId, startIndex: spanIndex + 1, anchorPath: options.sealAnchorPath, seal: options.seal, index: options.index,
+        warn: message => log.warn(message),
+        payload: index => ({
+          run_id: runId, index, at: new Date().toISOString().replace('T', ' ').slice(0, 19), num_ctx: options.numCtx,
+          message_count: messages.length, summary, messages, session_id: String(session?.id ?? ''), engine: ENGINE_REV,
+        }),
+      })
+      spanIndex = index
+      pruneSpans()
+      return path
     } catch (error) {
       log.warn(`context-guardian engine: span NOT archived (${error.message}); compaction proceeds`)
     }
     return null
   }
-  const pruneSpans = () => {
-    try {
-      const files = []
-      for (const run of readdirSync(options.spanDir)) {
-        const dir = join(options.spanDir, run)
-        if (!statSync(dir).isDirectory()) continue
-        for (const file of readdirSync(dir)) if (/^\d+\.json$/.test(file)) files.push(join(dir, file))
-      }
-      files.sort()
-      for (const doomed of files.slice(0, Math.max(0, files.length - options.keepSpans))) unlinkSync(doomed)
-    } catch { /* housekeeping only */ }
-  }
+  const pruneSpans = () => pruneSealed({ spanDir: options.spanDir, keepSpans: options.keepSpans, anchorPath: options.sealAnchorPath, warn: message => log.warn(message) })
 
   // ── the summarize hook ───────────────────────────────────────────────────
   const service = ctx.compaction

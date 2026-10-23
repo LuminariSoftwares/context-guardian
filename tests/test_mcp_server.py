@@ -103,7 +103,7 @@ def test_the_hints_match_what_each_tool_does(client):
         assert tool["annotations"]["destructiveHint"] is False, name
     # Only the status tool opens a socket (to the proxy on loopback).
     assert tools["get_proxy_status"]["annotations"]["openWorldHint"] is True
-    for name in ("list_spans", "search_spans", "read_span"):
+    for name in ("list_digests", "list_spans", "search_spans", "read_span", "get_seal_status"):
         assert tools[name]["annotations"]["openWorldHint"] is False, name
 
 

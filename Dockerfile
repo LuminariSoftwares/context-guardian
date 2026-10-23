@@ -11,7 +11,7 @@ FROM ${BASE_IMAGE}
 
 WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
-COPY context_guardian.py cg_doctor.py cg_configure.py cg_recall_cli.py cg_mcp.py cg_paths.py ./
+COPY context_guardian.py cg_doctor.py cg_configure.py cg_recall_cli.py cg_mcp.py cg_paths.py cg_archive.py cg_claude_code.py ./
 RUN pip install --no-cache-dir . \
  && useradd --create-home --uid 10001 guardian
 USER guardian

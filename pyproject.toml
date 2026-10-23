@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "context-guardian"
-version = "0.11.0"
+version = "0.12.0"
 description = "A tiny proxy in front of any OpenAI-compatible LLM backend that compacts conversation history before the context window fills, so local-model coding CLIs don't hard-die from overflow."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -43,9 +43,10 @@ context-guardian-doctor = "cg_doctor:main"
 context-guardian-configure = "cg_configure:main"
 context-guardian-recall = "cg_recall_cli:main"
 context-guardian-mcp = "cg_mcp:main"
+context-guardian-claude-code = "cg_claude_code:main"
 
 [tool.setuptools]
-py-modules = ["context_guardian", "cg_doctor", "cg_configure", "cg_recall_cli", "cg_mcp", "cg_paths"]
+py-modules = ["context_guardian", "cg_doctor", "cg_configure", "cg_recall_cli", "cg_mcp", "cg_paths", "cg_archive", "cg_claude_code"]
 # configure.py stays out of the wheel on purpose: a top-level module named `configure` would collide with
 # other packages. The wizard ships as cg_configure (console script `context-guardian-configure`); configure.py
 # is a 3-line shim for clones (2026-10-03).

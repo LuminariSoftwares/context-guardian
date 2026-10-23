@@ -47,6 +47,9 @@ SOURCE_MARKERS = (".git", "pyproject.toml", "package.json")
 SPANS_SUBDIR = Path("logs") / "guardian_spans"
 LOG_SUBPATH = Path("logs") / "context_guardian_log.json"
 VERSION_CACHE_SUBPATH = Path("logs") / ".version_check_cache.json"
+# Counts-only recall receipts (cg_archive.record_receipt). Under logs/ so a
+# checkout's .gitignore covers it.
+RECEIPTS_SUBPATH = Path("logs") / "receipts.jsonl"
 ENV_FILENAME = ".env"
 
 MIGRATION_NOTICE = (

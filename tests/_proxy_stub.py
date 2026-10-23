@@ -18,7 +18,8 @@ _CLEARED = ("GUARDIAN_DRY_RUN", "GUARDIAN_INJECT_STREAM_OPTIONS",
             "GUARDIAN_KEEP_RECENT_MESSAGES", "GUARDIAN_RESERVE_OUTPUT",
             "GUARDIAN_SUMMARY_TIMEOUT", "GUARDIAN_UPSTREAM_TIMEOUT",
             "GUARDIAN_UPSTREAM_CONNECT_TIMEOUT", "GUARDIAN_ALLOWED_ORIGINS",
-            "GUARDIAN_HOST")
+            "GUARDIAN_HOST", "GUARDIAN_DETECT_CONTEXT", "GUARDIAN_DETECT_TTL",
+            "GUARDIAN_SUMMARY_MEMO")
 
 # Starlette's TestClient calls itself "testserver". The proxy now refuses a
 # Host that is not loopback (see context_guardian.loopback_guard_refusal), so

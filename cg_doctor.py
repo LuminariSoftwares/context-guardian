@@ -254,6 +254,7 @@ def doctor(root: Path = PACKAGE_ROOT, env: dict | None = None, preset: Path | No
         whole = isinstance(running, int) and not isinstance(running, bool)
         shown = f" (num_ctx {running})" if whole else ""
         out.append(_f("ok", f"proxy reachable at {url}{shown}"))
+        out.extend(detected_window_findings(stats))
         if w["source"] == "env" and whole and running != w["value"]:
             out.append(_f("warn", f"proxy is running with num_ctx {running} but GUARDIAN_NUM_CTX is {w['value']}",
                           "restart the proxy so it re-reads GUARDIAN_NUM_CTX"))
@@ -283,6 +284,19 @@ def doctor(root: Path = PACKAGE_ROOT, env: dict | None = None, preset: Path | No
                 detail = (said or "").strip()[-200:] or (f"exit code {code}")
                 out.append(_f("error", f"python bridge failed: {detail}",
                               f"run: {py} modules/cg_bridge.py --selftest  and check GUARDIAN_PYTHON"))
+    return out
+
+def detected_window_findings(stats: dict) -> list:
+    """One OK line per model whose window the running proxy learned from its
+    upstream (GUARDIAN_DETECT_CONTEXT), saying where from and what is used."""
+    out = []
+    found = stats.get("context_detected") if isinstance(stats, dict) else None
+    for model, entry in sorted(found.items()) if isinstance(found, dict) else []:
+        if not isinstance(entry, dict):
+            continue
+        used = entry.get("used")
+        note = "" if used == entry.get("window") else f"; using {used} (GUARDIAN_NUM_CTX is lower)"
+        out.append(_f("ok", f"window: {entry.get('source')} reports {entry.get('window')} for {model}{note}"))
     return out
 
 def render(findings) -> tuple[str, int]:

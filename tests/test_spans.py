@@ -121,11 +121,15 @@ def test_write_span_puts_the_messages_on_disk(guardian, tmp_path):
 
 
 def test_write_span_leaves_no_partial_file(guardian):
-    """The span file is claimed with an exclusive create ("x" mode) and written
-    in place; there is no .part file any more. Nothing but the finished
-    NNNN.json may be left in the run directory."""
+    """The span file is claimed with an exclusive create ("x" mode); its content
+    is written to a temp file and renamed over the claim (0.12.0, so the seal
+    hashes final bytes). Nothing but the finished NNNN.json and the archive's
+    own sidecars (chain.jsonl, index.jsonl) may be left in the run directory:
+    no temp file, no lock file."""
     path = guardian.write_span([{"role": "user", "content": "x"}], "s", 2)
-    assert [str(p) for p in Path(guardian.SPAN_DIR).glob("*/*")] == [path]
+    left = sorted(str(p) for p in Path(guardian.SPAN_DIR).glob("*/*"))
+    run = Path(path).parent
+    assert left == sorted([path, str(run / "chain.jsonl"), str(run / "index.jsonl")])
 
 
 def test_write_span_returns_none_instead_of_raising(guardian, monkeypatch):
