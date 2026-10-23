@@ -7,11 +7,9 @@
   <a href="https://github.com/LuminariSoftwares/context-guardian/actions/workflows/node.yml"><img alt="node smoke tests on Ubuntu, Windows, macOS" src="https://github.com/LuminariSoftwares/context-guardian/actions/workflows/node.yml/badge.svg"></a>
   <a href="https://github.com/LuminariSoftwares/context-guardian/actions/workflows/privacy.yml"><img alt="privacy scan of every tracked file" src="https://github.com/LuminariSoftwares/context-guardian/actions/workflows/privacy.yml/badge.svg"></a>
   <a href="https://pypi.org/project/context-guardian/"><img alt="PyPI" src="https://img.shields.io/pypi/v/context-guardian.svg"></a>
-  <a href="https://www.npmjs.com/package/dsh-context-guardian"><img alt="npm" src="https://img.shields.io/npm/v/dsh-context-guardian.svg"></a>
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-yellow.svg">
   <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-blue.svg">
   <img alt="OpenAI-compatible proxy" src="https://img.shields.io/badge/OpenAI--compatible-proxy-2ea44f.svg">
-  <img alt="DeepSeek Harness engine" src="https://img.shields.io/badge/DSH-compaction%20engine-0969da.svg">
   <img alt="Fails open" src="https://img.shields.io/badge/fails-open-6f42c1.svg">
 </p>
 
@@ -22,11 +20,10 @@ mcp-name: io.github.LuminariSoftwares/context-guardian
   <a href="#works-with">Works with</a> &middot;
   <a href="#point-your-client-at-the-proxy">Client settings</a> &middot;
   <a href="examples/">Examples</a> &middot;
-  <a href="#install-both-deepseek-harness-about-5-minutes">Install both</a> &middot;
+  <a href="#deepseek-harness">DeepSeek Harness</a> &middot;
   <a href="#why-this-exists">Why</a> &middot;
   <a href="#two-ways-to-run-it">Two ways to run it</a> &middot;
   <a href="#install">Install the proxy</a> &middot;
-  <a href="docs/dsh-integration.md">Install in DSH</a> &middot;
   <a href="#see-it-work">See it work</a> &middot;
   <a href="#architecture">Architecture</a> &middot;
   <a href="#compatibility">Compatibility</a> &middot;
@@ -38,9 +35,31 @@ mcp-name: io.github.LuminariSoftwares/context-guardian
   <a href="CHANGELOG.md">Changelog</a>
 </p>
 
-Compaction for local models that actually fires, and never takes the conversation down with it. Two front doors, one idea: a **proxy** that sits in front of any OpenAI-compatible backend (Ollama, LiteLLM, Headroom, vLLM, LM Studio) for any CLI or agent, and a **native engine** for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). Both keep the full original on disk, and both fail **open**.
+A proxy that sits between your OpenAI-compatible client (OpenClaude, tested) and your local backend (Ollama, tested). When the conversation is about to outgrow the model's window, it summarises the older turns, keeps the recent ones verbatim, archives the originals on disk, and forwards a request that fits.
 
-**Measured:** in a 48-prompt DeepSeek Harness session on qwen3-coder:30b (Ollama, 64K window) with codenames changed mid-session, 0.1.0-alpha.9 kept 12/12 facts current with 0 stale answers and brought back 3/3 early details in every run (n = 3), where pins alone brought back 0/3 (n = 2). Details: [Measured](#measured-does-it-keep-what-matters-2026-10-01).
+One scripted session, sent straight to a backend with an 8,192-token window and then through the proxy (`python examples/demo_overflow.py`: a stub backend on 127.0.0.1 that rejects anything over its window; `tests/test_demo_overflow.py` checks this block is what it prints):
+
+<!-- demo-overflow:start -->
+```text
+stub backend on 127.0.0.1, 8192-token window, one scripted session sent twice
+turn   tokens  direct to backend  through context-guardian
+   1     1075  ok                 ok
+   2     2226  ok                 ok
+   3     3376  ok                 ok
+   4     4526  ok                 ok
+   5     5676  ok                 ok
+   6     6827  ok                 ok
+   7     7977  ok                 ok, compactions so far: 1
+   8     9127  400 overflow       ok, compactions so far: 2
+   9    10278  400 overflow       ok, compactions so far: 3
+  10    11451  400 overflow       ok, compactions so far: 4
+  11    12624  400 overflow       ok, compactions so far: 5
+  12    13798  400 overflow       ok, compactions so far: 6
+direct: rejected from turn 8 on. proxy: 12/12 turns answered, 6 originals archived.
+```
+<!-- demo-overflow:end -->
+
+**My client already compacts. Why add this?** Built-in auto-compact relies on the token counts the API reports, and local OpenAI-compatible backends often report them missing or in another shape, so it never fires ([Why this exists](#why-this-exists)). The proxy counts tokens itself, and it does not depend on what your client does. It also **fails open**: if a summary fails or comes back empty, it forwards your request unchanged rather than drop history on a guess. Everything it compacts away stays in an archive the model can search through the [MCP server](#mcp-server) and you can search with `context-guardian-recall`. This repo has no head-to-head comparison against a client's built-in compaction yet; that benchmark is planned.
 
 ## Works with
 
@@ -50,13 +69,9 @@ Compaction for local models that actually fires, and never takes the conversatio
 | **LM Studio** | proxy: `GUARDIAN_UPSTREAM_URL=http://localhost:1234/v1` | expected to work, not tested against LM Studio itself | [examples/lmstudio-proxy](examples/lmstudio-proxy/) |
 | **vLLM** | proxy: `GUARDIAN_UPSTREAM_URL=http://localhost:8000/v1` | expected to work, untested | copy the Ollama example, change the URL |
 | **LiteLLM** | proxy: `GUARDIAN_UPSTREAM_URL=<your LiteLLM proxy>/v1` | expected to work, untested | copy the Ollama example, change the URL |
-| **DeepSeek Harness** | native engine: one row in your agent preset | tested on DSH 0.1.2-alpha.2 | [examples/dsh-preset](examples/dsh-preset/) |
+| **DeepSeek Harness** | native engine: one row in your agent preset | tested on DSH 0.1.2-alpha.2 | [DeepSeek Harness](#deepseek-harness) |
 
 The proxy needs only an OpenAI-compatible `/v1/chat/completions`; your CLI points `OPENAI_BASE_URL` at it. "Expected" means not yet tested; please open an issue with what you saw. Full matrix: [Compatibility](#compatibility).
-
-**Why both packages are beta, and what that leaves open.** The PyPI package (`context-guardian`) has been **beta** since 0.4.0: the proxy's HTTP surface, its environment variables and the span format have not broken since, it is in daily use, and the test suite covers it on Ubuntu, Windows and macOS. The npm package (`dsh-context-guardian`) is **beta** from `0.1.0-beta.1`: the compaction logic was never the reason for its alpha label — the host was. What is still true is that DeepSeek Harness is pre-1.0 and its compaction plugin API has changed between its own alpha releases, so the engine is written against DSH `0.1.2-alpha.2` and a DSH update can break it until the next release here. Neither label is about how well the compaction is tested; the same engine and the same span format sit behind both.
-
-**Not the npm package called `context-guardian`.** There is an unrelated package of that name on npm by another author; this project's npm package is **`dsh-context-guardian`**, and its Python package is **`context-guardian`** on PyPI. If you installed `context-guardian` from npm, that is not this.
 
 ## Quick start
 
@@ -82,15 +97,30 @@ The proxy compacts OpenAI-style `POST /v1/chat/completions` requests. Every clie
 
 `<model>` is the name your backend serves (for Ollama, what `ollama list` shows). The proxy forwards the API key unchanged; a local backend ignores it. Then set `GUARDIAN_NUM_CTX` to that model's real window ([Configure](#configure)).
 
-![Illustration of Context Guardian inside DeepSeek Harness: the context meter climbs to the 85 % line, compaction folds the old turns into a checkpoint with the pinned facts first, and later stale recall brings back an archived line](context_guardian_dsh_demo.gif)
-
-*An illustration of what the DSH engine (0.1.0-alpha.9) does, not a DSH screen. Inside DSH you see it as DSH's own "Context compacted" row and context meter, `/context` and `/guardian` for pressure and the last compaction, and the `[context-guardian recall]` message in the conversation. What happens: at 85 % of the window it compacts, the facts you asked it to keep lead every checkpoint, the old turns stay on disk, and when a later question needs a detail that was compacted away, stale recall puts the original line back before the model answers. The results line is the benchmark in [Measured](#measured-does-it-keep-what-matters-2026-10-01). The proxy has its own monitor: see [See it work](#see-it-work).*
-
 | | Without Context Guardian | With it |
 |---|---|---|
 | Claude-Code-style CLI on a local model | auto-compact never fires; the backend hard-rejects the request and the session is over | the proxy compacts before the window fills; the session keeps going |
 | DSH on a 32K local model (measured: 314 compaction attempts) | **48 succeeded**; the rest failed on an empty summary or overflowed the window *while summarising* | every failed or impossible summary falls back to a deterministic checkpoint: ~14,012 → ~584 tokens in 23 ms, no model call |
 | The part that was compacted away | gone | archived on disk; in DSH every checkpoint line carries a `seq` pointer that `recall` reads back |
+
+## DeepSeek Harness
+
+<p>
+  <a href="https://www.npmjs.com/package/dsh-context-guardian"><img alt="npm" src="https://img.shields.io/npm/v/dsh-context-guardian.svg"></a>
+  <img alt="DeepSeek Harness engine" src="https://img.shields.io/badge/DSH-compaction%20engine-0969da.svg">
+</p>
+
+For [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) there is a **native engine** instead of the proxy: one row in your agent preset's `compaction` group, the npm package `dsh-context-guardian`. It keeps the same archive format and fails open the same way. Install it with [Install both](#install-both-deepseek-harness-about-5-minutes) below; the full guide is [docs/dsh-integration.md](docs/dsh-integration.md).
+
+**Measured:** in a 48-prompt DeepSeek Harness session on qwen3-coder:30b (Ollama, 64K window) with codenames changed mid-session, 0.1.0-alpha.9 kept 12/12 facts current with 0 stale answers and brought back 3/3 early details in every run (n = 3), where pins alone brought back 0/3 (n = 2). Details: [Measured](#measured-does-it-keep-what-matters-2026-10-01).
+
+![Illustration of Context Guardian inside DeepSeek Harness: the context meter climbs to the 85 % line, compaction folds the old turns into a checkpoint with the pinned facts first, and later stale recall brings back an archived line](context_guardian_dsh_demo.gif)
+
+*An illustration of what the DSH engine (0.1.0-alpha.9) does, not a DSH screen. Inside DSH you see it as DSH's own "Context compacted" row and context meter, `/context` and `/guardian` for pressure and the last compaction, and the `[context-guardian recall]` message in the conversation. What happens: at 85 % of the window it compacts, the facts you asked it to keep lead every checkpoint, the old turns stay on disk, and when a later question needs a detail that was compacted away, stale recall puts the original line back before the model answers. The results line is the benchmark in [Measured](#measured-does-it-keep-what-matters-2026-10-01). The proxy has its own monitor: see [See it work](#see-it-work).*
+
+**Why both packages are beta, and what that leaves open.** The PyPI package (`context-guardian`) has been **beta** since 0.4.0: the proxy's HTTP surface, its environment variables and the span format have not broken since, it is in daily use, and the test suite covers it on Ubuntu, Windows and macOS. The npm package (`dsh-context-guardian`) is **beta** from `0.1.0-beta.1`: the compaction logic was never the reason for its alpha label — the host was. What is still true is that DeepSeek Harness is pre-1.0 and its compaction plugin API has changed between its own alpha releases, so the engine is written against DSH `0.1.2-alpha.2` and a DSH update can break it until the next release here. Neither label is about how well the compaction is tested; the same engine and the same span format sit behind both.
+
+**Not the npm package called `context-guardian`.** There is an unrelated package of that name on npm by another author; this project's npm package is **`dsh-context-guardian`**, and its Python package is **`context-guardian`** on PyPI. If you installed `context-guardian` from npm, that is not this.
 
 ## Install both (DeepSeek Harness, about 5 minutes)
 
@@ -648,18 +678,18 @@ What is not covered automatically: a real model's summary quality, and the untes
 - **Proxy:** open `http://localhost:8786/guardian/health` while a session runs. The compaction monitor replays every compaction as a before → after bar, with a per-compaction dropdown and an advice box when your fixed floor (tools + system prompt) is the real problem. `GET /guardian/events` returns the same records as JSON.
 - **DSH:** type `/context` in a session for pressure, cache hits and what compacting now would save; `/recall 3-7`, `/recall result 42` or `/recall find <text>` to read originals; `logs/guardian_dsh.jsonl` for the decision trail (`idle-check` → `compaction/start` → `deterministic` or `llm` → `compaction/end`).
 
+<!-- guardian-family:start -->
 ## The guardian family
 
-Four free, MIT-licensed tools for people running local models. Each one solves a different failure of the same setup, each works alone, and none of them talk to a server you do not run:
+Four small MIT-licensed tools for people running local models. Each does one job, they share no code, and each is useful on its own.
 
-| | what it is for |
+| tool | what it answers |
 |---|---|
-| **Context Guardian** (this repo) | the session dies when the context window fills — compaction that actually fires, and a lossless archive of what it removed |
-| [**Code Guardian**](https://github.com/LuminariSoftwares/code-guardian) | a local model confidently edits code that does not compile — checks what it wrote before you do |
-| [**Tool Guardian**](https://github.com/LuminariSoftwares/tool-guardian) | MCP servers that are slow, broken or lying about their schemas — checks them and says which ones to keep |
-| [**Stack Guardian**](https://github.com/LuminariSoftwares/stack-guardian) | the stack around all of this: what is installed, what is running, what is about to run out |
-
-They share the opt-out convention (`GUARDIAN_NO_UPDATE_CHECK`, `NO_UPDATE_NOTIFIER`, `CI`) and nothing else — no shared install, no shared config, no shared process.
+| [code-guardian](https://github.com/LuminariSoftwares/code-guardian) | Before you run or merge code you did not write: is it safe, does it work, is anything missing? Three scores from a static scan, Python in depth. |
+| [context-guardian](https://github.com/LuminariSoftwares/context-guardian) | Keeps a long local-model session inside its context window: a proxy that compacts history before the window fills, with tools to search what was archived. |
+| [tool-guardian](https://github.com/LuminariSoftwares/tool-guardian) | Routes many MCP servers through a few tools, so their definitions stop filling the context window. |
+| [stack-guardian](https://github.com/LuminariSoftwares/stack-guardian) | Is my home AI stack healthy? Ollama / OpenAI-compatible nodes, NVIDIA GPUs and Tailscale peers, with a confidence grade on every finding. |
+<!-- guardian-family:end -->
 
 ## Acknowledgements
 
