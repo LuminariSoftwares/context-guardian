@@ -300,6 +300,28 @@ SEAL = os.environ.get("GUARDIAN_SEAL", "1").strip().lower() not in ("0", "false"
 # storage, another disk) and every new head is appended there too; --verify
 # then checks the chain against it.
 SEAL_ANCHOR_PATH = os.environ.get("GUARDIAN_SEAL_ANCHOR_PATH", "").strip() or None
+# SUMMARY MEMO: the proxy is invisible to its client, so the client keeps
+# resending its whole, uncompacted history. Once a conversation crossed the
+# budget, EVERY request summarised the evicted prefix from scratch -- one
+# summariser call (seconds to minutes on a local model) and one new span
+# holding mostly the same messages, every turn. Measured on b053b7e: three
+# requests, each the last plus one turn, made three full summaries and three
+# overlapping spans, on both routes.
+# The memo remembers, per compaction, the identity hashes of the evicted range
+# (cg_archive.message_hash, the journal's), its summary, span and pointer. An
+# equal range is reused (no summariser call, no span); a range that extends a
+# remembered one is summarised as (previous summary + the new messages) and
+# archived as a span of the new messages only, pointing at the span it
+# continues; anything else is summarised in full, as before. In memory only,
+# at most this many entries (LRU); 0 turns it off. Any memo error means "no
+# memo".
+try:
+    SUMMARY_MEMO = max(0, int(os.environ.get("GUARDIAN_SUMMARY_MEMO", "32")))
+except ValueError:
+    SUMMARY_MEMO = 32
+# The label an extension gives the previous summary inside the fence, so the
+# summariser reads it as what came before rather than as one more message.
+EARLIER_SUMMARY_ROLE = "earlier summary"
 # INDEX: one digest line per span in <run>/index.jsonl -- the first sentence of
 # the summary already made here, top keywords, sizes -- so a model can skim the
 # whole archive in a few hundred tokens (MCP list_digests) instead of opening
@@ -547,7 +569,20 @@ _state = {
     # Seals that could not be written (see seal_file). Non-zero means some
     # spans of this run will verify as unsealed.
     "seal_failures": 0,
+    # Where each applied compaction's summary came from (GUARDIAN_SUMMARY_MEMO):
+    # a full summariser call, a remembered summary reused as is, or a remembered
+    # summary extended with only the newly evicted messages.
+    "summaries_generated": 0,
+    "summaries_reused": 0,
+    "summaries_extended": 0,
+    # Span files actually written this run; the archive pointer counts these.
+    "spans_written": 0,
 }
+
+# GUARDIAN_SUMMARY_MEMO: tuple of evicted-message hashes -> {"hashes", "summary",
+# "span", "pointer", "chained"}, oldest first. Per process (= per run), never
+# written to disk.
+_summary_memo: "collections.OrderedDict[tuple, Dict[str, Any]]" = collections.OrderedDict()
 
 # The capture journal, created on first use when GUARDIAN_CAPTURE=journal.
 _journal: Optional[cg_archive.Journal] = None
@@ -1253,7 +1288,7 @@ def partition_messages(messages: List[Dict[str, Any]],
 
 
 def write_span(messages: List[Dict[str, Any]], summary: str,
-               index: int) -> Optional[str]:
+               index: int, continues: Optional[str] = None) -> Optional[str]:
     """Persist the messages about to be folded away, BEFORE folding them.
 
     Called on the request path, so it must never raise. A failed span write
@@ -1286,7 +1321,7 @@ def write_span(messages: List[Dict[str, Any]], summary: str,
         _private_mkdir(d)
 
         def payload(claimed: int) -> Dict[str, Any]:
-            return {
+            body = {
                 "run_id": RUN_ID,
                 "index": claimed,
                 "at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1295,6 +1330,11 @@ def write_span(messages: List[Dict[str, Any]], summary: str,
                 "summary": summary,
                 "messages": messages,
             }
+            if continues:
+                # An extended summary's span holds only the newly evicted
+                # messages; the earlier ones are in the span it continues.
+                body["continues"] = continues
+            return body
 
         written = cg_archive.write_span_file(d, index, payload, probe=MAX_SPAN_INDEX_PROBE)
         if written is None:
@@ -1303,6 +1343,7 @@ def write_span(messages: List[Dict[str, Any]], summary: str,
                         index, MAX_SPAN_INDEX_PROBE)
             return None
         path, index, body = written
+        _state["spans_written"] += 1
         seal_file(path)
         index_span(path, body)
         prune_spans()
@@ -1396,15 +1437,17 @@ def flush_journal() -> None:
 
 
 def note_compaction_receipt(archived: List[Dict[str, Any]], pointer: str,
-                            tokens_saved: int) -> None:
-    """Count one applied compaction for the receipts. Never raises."""
+                            tokens_saved: int, source: str = "generated") -> None:
+    """Count one applied compaction for the receipts. `archived` is what this
+    compaction wrote to disk (nothing, for a reused summary). Never raises."""
     try:
-        chars = _json_chars(archived)
+        chars = _json_chars(archived) if archived else 0
         _receipts["chars_archived"] += chars
         if pointer:
             _receipts["compactions_with_pointer"] += 1
         cg_archive.record_receipt("proxy.compaction", path=RECEIPTS_PATH, chars_archived=chars,
-                                  pointer=bool(pointer), tokens_saved=int(tokens_saved))
+                                  pointer=bool(pointer), tokens_saved=int(tokens_saved),
+                                  reused=source == "reused", extended=source == "extended")
     except Exception as exc:                               # noqa: BLE001
         log.debug("receipt not recorded, request unaffected: %s", exc)
 
@@ -1782,7 +1825,89 @@ async def summarize_older_messages(
         return None
 
 
-def _span_pointer(to_summarize: List[Dict[str, Any]], span_path: Optional[str]) -> str:
+def _message_hashes(messages: List[Dict[str, Any]]) -> tuple:
+    return tuple(cg_archive.message_hash(m) if isinstance(m, dict)
+                 else cg_archive.message_hash({"content": str(m)}) for m in messages)
+
+
+def memo_lookup(hashes: tuple):
+    """("reuse" | "extend" | "full", the remembered entry or None). The longest
+    remembered range that is a prefix of `hashes` wins; a range that is not a
+    prefix (the client edited or reordered its history) matches nothing."""
+    best = None
+    for entry in _summary_memo.values():
+        h = entry["hashes"]
+        if len(h) <= len(hashes) and hashes[:len(h)] == h and (best is None or len(h) > len(best["hashes"])):
+            best = entry
+    if best is None:
+        return "full", None
+    return ("reuse" if len(best["hashes"]) == len(hashes) else "extend"), best
+
+
+def memo_store(hashes: tuple, summary: str, span: Optional[str], pointer: str, chained: bool) -> None:
+    _summary_memo[hashes] = {"hashes": hashes, "summary": summary, "span": span,
+                             "pointer": pointer, "chained": chained}
+    _summary_memo.move_to_end(hashes)
+    while len(_summary_memo) > SUMMARY_MEMO:
+        _summary_memo.popitem(last=False)
+
+
+async def _memo_summary(to_summarize: List[Dict[str, Any]], summarise) -> Dict[str, Any]:
+    """The summary for this evicted range, through the memo when it can help.
+
+    Returns {"summary", "source": generated|reused|extended, "entry", "hashes",
+    "new": the messages this compaction has to archive}. `summarise` is the
+    route's own summariser (fence, headers and endpoint unchanged). A memo
+    that fails for any reason is treated as empty: the full summary is what
+    0.11.0 did, so it is always a safe answer.
+    """
+    plan, entry, hashes = "full", None, None
+    if SUMMARY_MEMO > 0 and not DRY_RUN:
+        try:
+            hashes = _message_hashes(to_summarize)
+            plan, entry = memo_lookup(hashes)
+        except Exception as exc:                           # noqa: BLE001
+            log.debug("summary memo unavailable, summarising in full: %s", exc)
+            plan, entry, hashes = "full", None, None
+    if plan == "reuse":
+        return {"summary": entry["summary"], "source": "reused", "entry": entry,
+                "hashes": hashes, "new": []}
+    if plan == "extend":
+        new = to_summarize[len(entry["hashes"]):]
+        earlier = {"role": EARLIER_SUMMARY_ROLE, "content": entry["summary"]}
+        summary = await summarise([earlier] + new)
+        return {"summary": summary, "source": "extended", "entry": entry, "hashes": hashes, "new": new}
+    summary = await summarise(to_summarize)
+    return {"summary": summary, "source": "generated", "entry": None, "hashes": hashes,
+            "new": to_summarize}
+
+
+def _apply_memo(result: Dict[str, Any], to_summarize: List[Dict[str, Any]]):
+    """Archive and point for a summary from _memo_summary, then remember it.
+    Returns (span_path, pointer). Never raises past the span write, which
+    already fails open by itself."""
+    source, entry, summary = result["source"], result["entry"], result["summary"]
+    if source == "reused":
+        span_path, pointer = entry["span"], entry["pointer"]
+    elif source == "extended":
+        prev = Path(entry["span"]).name if entry.get("span") else None
+        span_path = write_span(result["new"], summary, _state["spans_written"] + 1, continues=prev)
+        pointer = _span_pointer(to_summarize, span_path, chained=True)
+    else:
+        span_path = write_span(to_summarize, summary, _state["spans_written"] + 1)
+        pointer = _span_pointer(to_summarize, span_path)
+    _state["summaries_" + source] += 1
+    if result["hashes"] is not None:
+        try:
+            memo_store(result["hashes"], summary, span_path, pointer,
+                       chained=source == "extended" or bool(entry and entry.get("chained")))
+        except Exception as exc:                           # noqa: BLE001
+            log.debug("summary memo not updated: %s", exc)
+    return span_path, pointer
+
+
+def _span_pointer(to_summarize: List[Dict[str, Any]], span_path: Optional[str],
+                  chained: bool = False) -> str:
     # Name the span file IN the summary the model receives. This is the whole
     # difference between an archive and a recovery path: Guardian is a proxy and
     # cannot hand the model a tool, but every agentic client it fronts already
@@ -1801,12 +1926,14 @@ def _span_pointer(to_summarize: List[Dict[str, Any]], span_path: Optional[str]) 
     # The size figure is what lets it decide; the search hint is what keeps
     # it cheap.
     span_tokens = estimate_tokens(to_summarize)
-    n_spans = _state["compactions_performed"] + 1
+    n_spans = _state["spans_written"]
+    where = (f"saved across spans ending at {span_path} (each names the span it "
+             f"continues)" if chained else f"saved at {span_path}")
     # Name the DIRECTORY, not just this file. Older summaries are retired
     # from the window now, so their individual pointers go with them -- one
     # pointer at the whole archive is what keeps the earlier spans findable.
     return (f"\n\n[Full text of those {len(to_summarize)} messages "
-            f"(~{span_tokens} tokens) saved at {span_path}. "
+            f"(~{span_tokens} tokens) {where}. "
             f"{n_spans} span(s) so far this session, all under "
             f"{SPAN_DIR / RUN_ID}. They are LARGER than the room that "
             f"was freed -- do not read them whole. Search instead: "
@@ -1833,7 +1960,8 @@ def _compaction_event(name: str, index: int, messages: List[Dict[str, Any]],
                       new_messages: List[Dict[str, Any]],
                       to_keep: List[Dict[str, Any]], estimated: int,
                       message_tokens: int, tool_tokens: int,
-                      span_path: Optional[str], summary: str) -> Dict[str, Any]:
+                      span_path: Optional[str], summary: str,
+                      summary_source: str = "generated") -> Dict[str, Any]:
     """The log record of one compaction. A dry run writes the same record
     under its own event name, so the two can be compared field for field."""
     # Compute the "after" figures once and reuse -- estimate_tokens walks every
@@ -1864,6 +1992,8 @@ def _compaction_event(name: str, index: int, messages: List[Dict[str, Any]],
         "span_file": span_path,
         "span_written": span_path is not None,
         "summary_preview": summary[:500],
+        # generated | reused | extended (GUARDIAN_SUMMARY_MEMO).
+        "summary_source": summary_source,
     }
 
 
@@ -1977,8 +2107,9 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any],
                  "(keeping %d in-window).", len(part["retired_summaries"]),
                  len(part["kept_summaries"]))
 
-    summary = await summarize_older_messages(client, payload.get("model", ""),
-                                             to_summarize, headers)
+    memo = await _memo_summary(
+        to_summarize, lambda msgs: summarize_older_messages(client, payload.get("model", ""), msgs, headers))
+    summary = memo["summary"]
     span_path = None
     if summary is None or len(summary.strip()) < MIN_SUMMARY_CHARS:
         # Fail open: forward the original request untouched rather than
@@ -2016,10 +2147,9 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any],
         return payload
 
     # Evict to disk BEFORE the messages are replaced. If this ran after, a crash
-    # between the two would lose the span with nothing to show it existed.
-    span_path = write_span(to_summarize, summary, _state["compactions_performed"] + 1)
-
-    pointer = _span_pointer(to_summarize, span_path)
+    # between the two would lose the span with nothing to show it existed. A
+    # reused summary writes nothing: its messages are already archived.
+    span_path, pointer = _apply_memo(memo, to_summarize)
 
     new_messages = system_msgs + [_summary_message(to_summarize, summary, pointer)] + to_keep
     new_payload = dict(payload)
@@ -2028,12 +2158,12 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any],
     _state["compactions_performed"] += 1
     event = _compaction_event("compaction", _state["compactions_performed"],
                               messages, new_messages, to_keep, estimated,
-                              message_tokens, tool_tokens, span_path, summary)
+                              message_tokens, tool_tokens, span_path, summary, memo["source"])
     tokens_after = event["estimated_tokens_after"]
     tokens_saved = event["tokens_saved"]
     _state["tokens_saved_total"] += tokens_saved
     log_event(event)
-    note_compaction_receipt(to_summarize, pointer, tokens_saved)
+    note_compaction_receipt(memo["new"], pointer, tokens_saved, memo["source"])
 
     if VERBOSE:
         # A visible banner, not a line that scrolls past in a busy log. This is
@@ -2693,7 +2823,9 @@ async def maybe_compact_anthropic(client: httpx.AsyncClient, payload: Dict[str, 
     log.info("Anthropic request ~%d tokens >= threshold %d -- compacting %d "
              "message(s).", estimated, threshold_tokens, len(to_summarize))
 
-    summary = await _summarize_anthropic(client, model, to_summarize, headers)
+    memo = await _memo_summary(
+        to_summarize, lambda msgs: _summarize_anthropic(client, model, msgs, headers))
+    summary = memo["summary"]
     if summary is None or len(summary.strip()) < MIN_SUMMARY_CHARS:
         _state["summaries_rejected_empty"] += 1
         log_event({"event": "compaction_refused", "reason": "empty_or_short_summary",
@@ -2709,8 +2841,7 @@ async def maybe_compact_anthropic(client: httpx.AsyncClient, payload: Dict[str, 
                      estimated, message_tokens, tool_tokens)
         return payload
 
-    span_path = write_span(to_summarize, summary, _state["compactions_performed"] + 1)
-    pointer = _span_pointer(to_summarize, span_path)
+    span_path, pointer = _apply_memo(memo, to_summarize)
     note = _summary_message(to_summarize, summary, pointer)["content"]
     out = dict(payload)
     if isinstance(system, list):
@@ -2723,11 +2854,11 @@ async def maybe_compact_anthropic(client: httpx.AsyncClient, payload: Dict[str, 
     event = _compaction_event("compaction", _state["compactions_performed"], messages,
                               system_msgs + [{"role": "system", "content": note}] + to_keep,
                               to_keep, estimated, message_tokens, tool_tokens,
-                              span_path, summary)
+                              span_path, summary, memo["source"])
     event["route"] = "messages"
     _state["tokens_saved_total"] += event["tokens_saved"]
     log_event(event)
-    note_compaction_receipt(to_summarize, pointer, event["tokens_saved"])
+    note_compaction_receipt(memo["new"], pointer, event["tokens_saved"], memo["source"])
     log.info("Compacted Anthropic request %d -> %d messages, ~%d -> ~%d tokens.",
              len(messages), len(to_keep), estimated, event["estimated_tokens_after"])
     return out

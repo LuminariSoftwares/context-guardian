@@ -920,6 +920,11 @@ def receipts_summary(events: List[Dict[str, Any]], span_dir: Path,
         "compactions_with_pointer": sum(1 for e in compactions if e.get("pointer") is True),
         "chars_archived": sum(_count(e, "chars_archived") for e in compactions),
         "tokens_saved": sum(_count(e, "tokens_saved") for e in compactions),
+        # GUARDIAN_SUMMARY_MEMO: where each compaction's summary came from.
+        "summaries_reused": sum(1 for e in compactions if e.get("reused") is True),
+        "summaries_extended": sum(1 for e in compactions if e.get("extended") is True),
+        "summaries_generated": sum(1 for e in compactions
+                                   if e.get("reused") is not True and e.get("extended") is not True),
         "recall_calls_seen_by_proxy": sum(_count(e, "calls") for e in events
                                           if e["tool"] == "proxy.recall_seen"),
     }
@@ -977,6 +982,8 @@ def format_receipts(s: Dict[str, Any], window: str, share: bool = False) -> str:
         "  compactions  %d recorded, %d with an archive pointer, %s chars archived, ~%s tokens saved"
         % (s["compactions"], s["compactions_with_pointer"], format(s["chars_archived"], ","),
            format(s["tokens_saved"], ",")),
+        "  summaries    %d generated, %d reused, %d extended (summariser calls saved: %d)"
+        % (s["summaries_generated"], s["summaries_reused"], s["summaries_extended"], s["summaries_reused"]),
         "  recall       %d recall call(s) (%s); %d span(s) opened, %d matched"
         % (s["recall_calls"], by_tool, s["spans_opened"], s["spans_matched"]),
         "  read back    %s of the archive (%s chars returned)" % (pct, format(s["chars_returned"], ",")),

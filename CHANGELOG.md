@@ -110,6 +110,22 @@ everything that existed answers as before.
 - Archived transcript lines are read through to the message inside them for search, roles and digests; a span whose
   user turns are all tool results takes its digest from the first message with text (`first-message`).
 
+### Summary memo (follow-up)
+
+- **The same history is no longer re-summarised on every request.** The proxy is invisible to its client, so the
+  client keeps resending its whole history; once past the budget, every request summarised the evicted prefix from
+  scratch (one summariser call and one new, mostly duplicate span per turn: 3 requests made 3 full summaries and 3
+  overlapping spans on both routes). **`GUARDIAN_SUMMARY_MEMO`** (default 32 entries, in memory, LRU; `0` off)
+  remembers each compaction by the identity hashes of the evicted messages. An equal range reuses its summary and
+  pointer (no summariser call, no span, the same bytes forwarded, so the backend's prefix cache survives); a range that
+  extends a remembered one is summarised as the earlier summary plus only the new messages, in the same fence, and
+  archived as a span of the new messages with `continues` naming the span before it; an edited or reordered history
+  gets a full summary. Measured over a 20-turn replay: summariser input 623,572 -> 69,566 characters on
+  `/v1/chat/completions` (784,734 -> 83,360 on `/v1/messages`), 494 -> 0 duplicated archived messages; a retried
+  request makes no call. `summaries_generated`, `summaries_reused` and `summaries_extended` are in `/guardian/stats`,
+  the compaction log (`summary_source`) and the receipts. The DSH engine does not have the problem: DSH replaces the
+  compacted range with the checkpoint in its own session, so a region is never presented twice.
+
 ### Release process
 
 - **Releases publish from CI by trusted publishing (OIDC), not from a stored API token.** Publishing a GitHub Release

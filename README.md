@@ -201,6 +201,8 @@ The archive is built to be read cheaply, by a person or by a model.
 | **Browse** | — | `list_spans` |
 | **Verify** | `context-guardian-recall --verify` | `get_seal_status` |
 
+**One summary per stretch of history, not per request.** Your client does not know the proxy compacted anything, so it resends its whole history on every request. The proxy remembers what it already summarised this run (`GUARDIAN_SUMMARY_MEMO`). It reuses that summary when the same messages come back, and when more have been evicted it extends it with only the new ones, archiving them in a span that points at the one it continues. On a 20-turn replay through the test stubs that cut the summariser's input from 623,572 to 69,566 characters, and the archive went from 494 duplicated messages to none. A retried request makes no summariser call at all.
+
 The digest index is written as each span is written: `<run>/index.jsonl`, no extra model call. `context-guardian-recall --reindex` builds it for older archives. **Always-on capture** (`GUARDIAN_CAPTURE=journal`, off by default) also records every message of a session, not just what compaction evicts, and search and `read_span` cover it. It is off by default because it writes every message to disk in clear text and grows with the session; that is your decision to make, not a default.
 
 ## How it works
@@ -477,6 +479,7 @@ cp .env.example .env
 | `GUARDIAN_CAPTURE_MAX_MB` | `200` | The most one run's journal may hold. Past it, capture stops for that run with one log line; requests are never affected |
 | `GUARDIAN_RECEIPTS` | `1` | Counts-only receipts: every recall (CLI and MCP tools) and every compaction appends a line of numbers to the receipts file, which `context-guardian-recall --receipts` adds up. No message text, query text, path or run id is ever written, and nothing leaves the machine. `0` records nothing |
 | `GUARDIAN_RECEIPTS_PATH` | `<data dir>/logs/receipts.jsonl` | Where receipts are appended |
+| `GUARDIAN_SUMMARY_MEMO` | `32` | How many compactions the proxy remembers this run (in memory only, never on disk). Your client keeps resending its whole history, so without this every request past the budget summarised the same evicted messages again. With it, an evicted range seen before reuses its summary (no summariser call, no new span), and a range that grew is summarised as the earlier summary plus only the new messages, archived as a span that names the one it continues. A client that edits its earlier history gets a full summary, as before. `0` turns it off |
 | `GUARDIAN_KEEP_SUMMARIES` | `1` | How many of Guardian's own previous summaries stay in the window. Retired ones are folded into the next span, not discarded |
 | `GUARDIAN_MIN_SUMMARY_CHARS` | `40` | A summary shorter than this is treated as a FAILED summarisation and nothing is evicted. See 0.4.0 in the changelog for why this exists |
 | `GUARDIAN_MIN_TRANSCRIPT_CHARS` | `80` | If the messages being evicted render to less than this, Guardian refuses to summarise rather than summarising nothing |
@@ -606,10 +609,10 @@ python scripts/bench_proxy.py --turns 40 --seed 1
 Measured against a stub upstream (not a real model; the stub summarises instantly, so `added_ms` is the proxy's own overhead, not summarisation time), 2026-10-23, Python 3.11, Linux container. The token figures are the same on any machine — the paths in the compaction note are folded to a fixed width before they are counted, and `tests/test_bench_proxy.py` asserts both the path independence and that the line below is what the script prints:
 
 ```
-turns=40 tokens_before=1130722 tokens_after=160731 compactions=27 p50_added_ms=8.65 p95_added_ms=15.22
+turns=40 tokens_before=1130722 tokens_after=161141 compactions=27 p50_added_ms=6.27 p95_added_ms=11.01
 ```
 
-27 of these 40 requests compact, so the median is a compacting request. On the same machine 0.11.0 measured `p50_added_ms` 4.5–5.4: each compaction now writes its span durably (temp file, fsync, rename, about 2.5 ms here), seals it (about 1 ms) and indexes it (about 2 ms). A request that does not compact pays none of that. Against a real model every compaction already waits seconds for the summary.
+27 of these 40 requests compact, so the median is a compacting request. On the same machine 0.11.0 measured `p50_added_ms` 4.5–5.4: each compaction now writes its span durably (temp file, fsync, rename, about 2.5 ms here), seals it and indexes it. With the summary memo a compaction archives only the newly evicted messages, which is why the figure came back down from 8.7–13 ms before the memo. A request that does not compact pays none of that. Against a real model every compaction already waits seconds for the summary, and the memo is what shrinks that call (see [Configure](#configure), `GUARDIAN_SUMMARY_MEMO`).
 
 ## What is stored, where, and how to delete it
 
