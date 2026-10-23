@@ -3,9 +3,10 @@
 ## Unreleased
 
 - **Releases publish from CI by trusted publishing (OIDC), not from a stored API token.** Publishing a GitHub Release
-  runs `.github/workflows/release.yml`: it fails unless the tag, `pyproject.toml` and `package.json` name the same
-  version (`scripts/release_versions.py`), runs the tests, then uploads to PyPI (with attestations) and npm (with
-  `--provenance`) using short-lived credentials. Owner steps and the one-time registry setup are in
+  runs `.github/workflows/release.yml`: the tag must equal `pyproject.toml`'s version (PyPI and npm are independent
+  version lines; npm publishes `package.json`'s version only when it is not already on the registry, and a release
+  with neither version new fails as "nothing to publish"; `scripts/release_versions.py`), runs the tests, then
+  uploads to PyPI (with attestations) and npm (with `--provenance`) using short-lived credentials. Owner steps and the one-time registry setup are in
   `docs/RELEASING.md`. `tests/test_release_workflow.py` fails if the workflow loses `id-token: write` or gains a
   password, token or secret input. No change to either package's contents.
 

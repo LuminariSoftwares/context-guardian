@@ -62,37 +62,43 @@ Success: the page lists the GitHub Actions publisher for `LuminariSoftwares/cont
 
 ## Every release
 
-The tag, `pyproject.toml` and `package.json` must all name the same version, or the `verify` job stops the release
-before anything is built. npm and PyPI spell prereleases differently, so:
+PyPI and npm are independent version lines (today: PyPI `0.11.0`, npm `0.1.0-beta.1`). The `verify` job stops
+the release before anything is built unless:
 
-| Tag | `package.json` `version` | `pyproject.toml` `version` |
-| --- | --- | --- |
-| `v0.12.0` | `0.12.0` | `0.12.0` |
-| `v0.12.0-beta.1` | `0.12.0-beta.1` | `0.12.0b1` |
+| What | Rule |
+| --- | --- |
+| Tag | follows **PyPI**: `vX.Y.Z` must equal `pyproject.toml`'s `version`, exactly as written there (PEP 440, e.g. `v0.12.0`, `v0.12.0b1`). `package.json` is never compared with the tag. |
+| PyPI | uploaded when `pyproject.toml`'s version is not already on PyPI; skipped with a notice if it is. |
+| npm | published **only when `package.json`'s version is new**: if `npm view dsh-context-guardian@<version> version` returns it, the npm publish is skipped with a notice. A prerelease (`0.1.0-beta.2`) is published under `beta` and then moved to `latest`; a plain version (`0.2.0`) goes straight to `latest`. |
+| Neither new | error: **nothing to publish**. |
 
-Check before you tag (exit 0 and `versions agree` means the release will pass the version check):
+So a PyPI-only patch is: bump `pyproject.toml`, leave `package.json` alone, tag `v<new PyPI version>`; npm is
+skipped. To ship npm too, bump `package.json` in the same PR.
+
+Check before you tag (exit 0 and `releasable` means the release will pass `verify`; the `publish_pypi=` and
+`publish_npm=` lines say what it will upload):
 
 ```bash
 python scripts/release_versions.py --tag v0.12.0
 ```
 
-1. **Bump-version PR.** On a branch, set the version in `pyproject.toml` and `package.json` (table above), move the
-   `## Unreleased` notes in `CHANGELOG.md` under a heading for the new version, open a PR, wait for green CI.
+1. **Bump-version PR.** On a branch, bump `pyproject.toml` (and `package.json` only if npm should get a release),
+   move the `## Unreleased` notes in `CHANGELOG.md` under a heading for the new version, open a PR, wait for green CI.
 2. **Merge** the PR into `main`.
 3. **Create the GitHub Release.** <https://github.com/LuminariSoftwares/context-guardian/releases/new>:
-   - **Choose a tag** -> type `v0.12.0` (the new version) -> **Create new tag on publish**, target `main`.
+   - **Choose a tag** -> type `v0.12.0` (the new **PyPI** version) -> **Create new tag on publish**, target `main`.
    - Title: `v0.12.0`.
    - Notes: paste that version's section from `CHANGELOG.md`.
-   - Tick **Set as a pre-release** for a `-beta.N` version.
+   - Tick **Set as a pre-release** for a PyPI prerelease (`b1`, `rc1`).
    - Click **Publish release**.
 4. **Watch the release workflow.** <https://github.com/LuminariSoftwares/context-guardian/actions/workflows/release.yml>.
-   Jobs: `verify` (version check + tests) -> `pypi-build` -> `pypi` (upload), and `npm`. All four green means both
-   packages are out. A red `verify` means nothing was published: fix the version, delete the release and its tag,
-   and start again from step 1.
+   Jobs: `verify` (version check + tests) -> `pypi-build` -> `pypi` (upload), and `npm`. All green means every new
+   version is out; a skipped publish shows a notice saying the version was already on its registry. A red `verify`
+   means nothing was published: fix the version, delete the release and its tag, and start again from step 1.
 5. **Verify on the registries.**
    ```bash
    pip index versions context-guardian        # newest version listed first
-   npm view dsh-context-guardian dist-tags    # latest (and beta for a prerelease) = the new version
+   npm view dsh-context-guardian dist-tags    # only if package.json changed: latest (and beta) = the new version
    ```
    On <https://pypi.org/project/context-guardian/> each file shows a **Verified details** / provenance badge; on
    <https://www.npmjs.com/package/dsh-context-guardian> the version shows **Provenance** linking to the workflow run.
@@ -102,8 +108,8 @@ python scripts/release_versions.py --tag v0.12.0
 Builds and checks everything, publishes nothing:
 <https://github.com/LuminariSoftwares/context-guardian/actions/workflows/release.yml> -> **Run workflow** -> leave
 **dry_run** ticked -> **Run workflow**. A pull request that edits `release.yml` or `scripts/release_versions.py` runs
-the same dry run. In a dry run the version check only warns, and its log says whether a release from that commit
-would pass.
+the same dry run. In a dry run the tag is `v` + `pyproject.toml`'s version, the check only warns, and its log says
+whether a release from that commit would pass and what it would publish.
 
 To retry a release without creating a new one (for example, after finishing the one-time setup): **Run workflow**,
 untick **dry_run**, set **tag** to the release tag (e.g. `v0.12.0`). If you limited the `pypi` environment to `v*`

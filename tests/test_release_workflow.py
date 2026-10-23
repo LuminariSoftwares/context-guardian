@@ -2,7 +2,8 @@
 
 These read .github/workflows/release.yml as text (no YAML dependency) and fail if a publishing job loses
 `id-token: write`, or if the file gains a `password:` input, a TOKEN, or a reference to a repository secret.
-They also cover scripts/release_versions.py, which decides whether a tag may be released.
+They also cover scripts/release_versions.py: the tag names the PyPI version, npm publishes only a version that
+is new on the registry, and a release with neither is an error. Registry lookups are mocked.
 """
 import re
 import subprocess
@@ -84,40 +85,71 @@ def test_guards_catch_regressions():
     assert credential_problems(text + "          x: ${{ secrets.X }}\n")
 
 
-@pytest.mark.parametrize("npm, pep", [
-    ("0.12.0", "0.12.0"),
-    ("0.12.0-beta.1", "0.12.0b1"),
-    ("1.0.0-alpha.2", "1.0.0a2"),
-    ("1.0.0-rc.3", "1.0.0rc3"),
-    ("1.0", None),
-    ("1.0.0-dev.1", None),
-])
-def test_pep440_mapping(npm, pep):
-    assert release_versions.pep440(npm) == pep
+def _lookups(on_pypi=(), on_npm=()):
+    """Mocked registries: the versions listed are already published, everything else is new."""
+    return (lambda name, v: v in on_pypi), (lambda name, v: v in on_npm)
 
 
-def test_check_tag_against_both_files():
-    assert release_versions.check("v0.12.0", "0.12.0", "0.12.0") == []
-    assert release_versions.check("v0.12.0-beta.1", "0.12.0b1", "0.12.0-beta.1") == []
-    assert release_versions.check("v0.12.0", "0.12.0", "0.1.0-beta.1")  # npm side differs
-    assert release_versions.check("v0.12.0", "0.11.0", "0.12.0")  # PyPI side differs
-    assert release_versions.check("0.12.0", "0.12.0", "0.12.0")  # no leading v
-    assert release_versions.check("v0.12.0-beta.1", "0.12.0", "0.12.0-beta.1")  # PyPI not marked pre
+def test_tag_follows_pypi_and_ignores_npm_version():
+    pypi, npm = _lookups(on_npm={"0.1.0-beta.1"})
+    problems, _, out = release_versions.plan("v0.11.0", "0.11.0", "dsh-context-guardian", "0.1.0-beta.1",
+                                             pypi_lookup=pypi, npm_lookup=npm)
+    assert problems == []
+    assert out["publish_pypi"] == "true"
 
 
-def _run(tmp_path, py, npm, *args):
-    (tmp_path / "pyproject.toml").write_text(f'[project]\nname = "x"\nversion = "{py}"\n', encoding="utf-8")
-    (tmp_path / "package.json").write_text(f'{{"name": "x", "version": "{npm}"}}', encoding="utf-8")
-    return subprocess.run([sys.executable, str(SCRIPT), "--root", str(tmp_path), *args],
-                          capture_output=True, text=True)
+def test_tag_that_is_not_the_pypi_version_fails():
+    pypi, npm = _lookups()
+    problems, _, _ = release_versions.plan("v0.12.0", "0.11.0", "dsh-context-guardian", "0.1.0-beta.1",
+                                           pypi_lookup=pypi, npm_lookup=npm)
+    assert any("must be v0.11.0" in p for p in problems), problems
 
 
-def test_cli_exit_codes(tmp_path):
-    ok = _run(tmp_path, "0.12.0b1", "0.12.0-beta.1", "--tag", "v0.12.0-beta.1")
-    assert ok.returncode == 0, ok.stdout + ok.stderr
-    assert "version=0.12.0-beta.1" in ok.stdout and "prerelease=true" in ok.stdout
-    bad = _run(tmp_path, "0.11.0", "0.1.0-beta.1", "--tag", "v0.11.0")
-    assert bad.returncode == 1 and "::error::" in bad.stdout
-    dry = _run(tmp_path, "0.11.0", "0.1.0-beta.1", "--dry-run")
-    assert dry.returncode == 0 and "::warning::" in dry.stdout and "would FAIL" in dry.stdout
-    assert _run(tmp_path, "0.12.0", "0.12.0").returncode == 2  # neither --tag nor --dry-run
+def test_npm_version_already_on_registry_skips_npm():
+    pypi, npm = _lookups(on_npm={"0.1.0-beta.1"})
+    _, notices, out = release_versions.plan("v0.12.0", "0.12.0", "dsh-context-guardian", "0.1.0-beta.1",
+                                            pypi_lookup=pypi, npm_lookup=npm)
+    assert out["publish_npm"] == "false"
+    assert any("already on npm" in n for n in notices), notices
+
+
+def test_new_npm_version_publishes_and_prerelease_is_flagged():
+    pypi, npm = _lookups(on_npm={"0.1.0-beta.1"})
+    _, _, out = release_versions.plan("v0.12.0", "0.12.0", "dsh-context-guardian", "0.1.0-beta.2",
+                                      pypi_lookup=pypi, npm_lookup=npm)
+    assert out["publish_npm"] == "true" and out["npm_prerelease"] == "true"
+    _, _, out = release_versions.plan("v0.12.0", "0.12.0", "dsh-context-guardian", "0.2.0",
+                                      pypi_lookup=pypi, npm_lookup=npm)
+    assert out["npm_prerelease"] == "false"
+
+
+def test_pypi_only_patch_passes_and_skips_npm():
+    # pyproject.toml bumped 0.11.0 -> 0.11.1, package.json unchanged (its version is already on npm).
+    pypi, npm = _lookups(on_pypi={"0.11.0"}, on_npm={"0.1.0-beta.1"})
+    problems, _, out = release_versions.plan("v0.11.1", "0.11.1", "dsh-context-guardian", "0.1.0-beta.1",
+                                             pypi_lookup=pypi, npm_lookup=npm)
+    assert problems == []
+    assert out["publish_pypi"] == "true" and out["publish_npm"] == "false"
+
+
+def test_neither_version_new_is_nothing_to_publish():
+    pypi, npm = _lookups(on_pypi={"0.11.0"}, on_npm={"0.1.0-beta.1"})
+    problems, _, out = release_versions.plan("v0.11.0", "0.11.0", "dsh-context-guardian", "0.1.0-beta.1",
+                                             pypi_lookup=pypi, npm_lookup=npm)
+    assert any("nothing to publish" in p for p in problems), problems
+    assert out["publish_pypi"] == "false" and out["publish_npm"] == "false"
+
+
+def test_cli_bad_arguments_exit_2(tmp_path):
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "x"\nversion = "0.11.0"\n', encoding="utf-8")
+    (tmp_path / "package.json").write_text('{"name": "x", "version": "0.1.0-beta.1"}', encoding="utf-8")
+    r = subprocess.run([sys.executable, str(SCRIPT), "--root", str(tmp_path)], capture_output=True, text=True)
+    assert r.returncode == 2, r.stdout + r.stderr  # neither --tag nor --dry-run; no registry is asked
+
+
+def test_npm_job_gates_publish_on_publish_npm():
+    jobs = job_blocks(WORKFLOW.read_text(encoding="utf-8"))
+    npm = "\n".join(jobs["npm"])
+    assert "needs.verify.outputs.publish_npm == 'true'" in npm
+    assert "--tag beta" in npm and "dist-tag add" in npm
+    assert "needs.verify.outputs.publish_pypi == 'true'" in "\n".join(jobs["pypi"])

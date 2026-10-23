@@ -50,8 +50,11 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.versions.outputs.version }}
-      prerelease: ${{ steps.versions.outputs.prerelease }}
+      pypi_version: ${{ steps.versions.outputs.pypi_version }}
+      npm_version: ${{ steps.versions.outputs.npm_version }}
+      npm_prerelease: ${{ steps.versions.outputs.npm_prerelease }}
+      publish_pypi: ${{ steps.versions.outputs.publish_pypi }}
+      publish_npm: ${{ steps.versions.outputs.publish_npm }}
       publish: ${{ env.PUBLISH }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -65,7 +68,9 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: "22"
-      - name: tag matches pyproject.toml and package.json
+      # The tag names the PyPI version; npm publishes package.json's version only when it is new.
+      # Neither version new on its registry is an error ("nothing to publish").
+      - name: tag matches pyproject.toml; which versions are new
         id: versions
         shell: bash
         run: |
@@ -74,7 +79,7 @@ jobs:
           else
             python scripts/release_versions.py --dry-run | tee versions.txt
           fi
-          grep -E '^(version|prerelease)=' versions.txt >> "$GITHUB_OUTPUT"
+          grep -E '^(pypi_version|npm_version|npm_prerelease|publish_pypi|publish_npm)=' versions.txt >> "$GITHUB_OUTPUT"
       - run: python -m pip install -r requirements-dev.txt
       - run: python -m pytest -q
       - run: npm install --no-package-lock --legacy-peer-deps
@@ -105,11 +110,11 @@ jobs:
 
   pypi:
     needs: [verify, pypi-build]
-    if: needs.verify.outputs.publish == 'true'
+    if: needs.verify.outputs.publish == 'true' && needs.verify.outputs.publish_pypi == 'true'
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/project/context-guardian/${{ needs.verify.outputs.version }}/
+      url: https://pypi.org/project/context-guardian/${{ needs.verify.outputs.pypi_version }}/
     permissions:
       id-token: write
       contents: read
@@ -129,8 +134,8 @@ jobs:
       id-token: write
       contents: read
     env:
-      VERSION: ${{ needs.verify.outputs.version }}
-      PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+      VERSION: ${{ needs.verify.outputs.npm_version }}
+      PRERELEASE: ${{ needs.verify.outputs.npm_prerelease }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -145,8 +150,11 @@ jobs:
       - run: npm --version
       - name: pack (what would be published)
         run: npm pack --dry-run
+      - name: skip (version already on npm)
+        if: needs.verify.outputs.publish_npm != 'true'
+        run: echo "::notice::dsh-context-guardian@$VERSION is already on npm; not publishing"
       - name: publish
-        if: needs.verify.outputs.publish == 'true'
+        if: needs.verify.outputs.publish == 'true' && needs.verify.outputs.publish_npm == 'true'
         shell: bash
         run: |
           if [ "$PRERELEASE" = "true" ]; then
