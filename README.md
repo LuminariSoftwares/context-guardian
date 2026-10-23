@@ -409,6 +409,8 @@ cp .env.example .env
 | `GUARDIAN_RESERVE_OUTPUT` | `8192` | Tokens held back for the model's *output*. The window has to hold the reply and (for reasoning models) the thinking too, so compaction triggers against what is LEFT. If this is ever ≥ `GUARDIAN_NUM_CTX` it is clamped to half the window and logged — fix the config |
 | `GUARDIAN_SPAN_DIR` | `<data dir>/logs/guardian_spans` | Where evicted messages are archived before folding. This is what makes compaction lossless on disk |
 | `GUARDIAN_KEEP_SPANS` | `500` | How many span files to keep. `0` keeps none |
+| `GUARDIAN_SEAL` | `1` | Seal the archive: every span file is hashed as it is on disk and chained into `<run>/chain.jsonl`, so `context-guardian-recall --verify` can show nothing was changed, removed or reordered since. A pruned span is recorded as pruned, not reported as missing. `0` writes no chain |
+| `GUARDIAN_SEAL_ANCHOR_PATH` | unset | A file **outside** the data directory (synced storage, another disk). Every new chain head is appended to it, and `--verify` checks the chain against it, which catches a chain someone rewrote and rehashed |
 | `GUARDIAN_KEEP_SUMMARIES` | `1` | How many of Guardian's own previous summaries stay in the window. Retired ones are folded into the next span, not discarded |
 | `GUARDIAN_MIN_SUMMARY_CHARS` | `40` | A summary shorter than this is treated as a FAILED summarisation and nothing is evicted. See 0.4.0 in the changelog for why this exists |
 | `GUARDIAN_MIN_TRANSCRIPT_CHARS` | `80` | If the messages being evicted render to less than this, Guardian refuses to summarise rather than summarising nothing |

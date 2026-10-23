@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### Sealed archive
+
+- **The span archive is sealed, so "lossless on disk" can be checked.** Every span file is hashed as it sits on disk
+  (written to a temp file, fsynced, renamed into place, then read back) and chained into `<run>/chain.jsonl`: one
+  line per file with its SHA-256, the previous line's hash and its own. Nothing could check the README's promise
+  before; an edited, truncated or deleted span looked exactly like an untouched one. On by default;
+  **`GUARDIAN_SEAL=0`** writes no chain. A seal that fails is logged and counted (`seal.failures` in
+  `/guardian/stats`), and the request proceeds unchanged.
+- **`context-guardian-recall --verify [--run RUN_ID | --all]`** walks each chain and prints `OK` or the first break
+  per run: `content-changed`, `file-missing` (deleted with no prune record), `entry-edited`, `entry-reordered`,
+  `chain-forked`, `unsealed-file` or `anchor-mismatch`. Exit 0 only when every checked run is OK. Without `--run` or
+  `--all` it checks the most recent run.
+- **Retention no longer looks like tampering.** When `GUARDIAN_KEEP_SPANS` prunes a span, a chained `pruned` line is
+  written first, and the verifier reports the file as pruned, as expected.
+- **Tamper-evident, not tamper-proof, and anchoring for the difference.** Anyone who can write the directory can
+  rehash a whole chain. **`GUARDIAN_SEAL_ANCHOR_PATH`** appends every new head to a file meant to live outside the
+  data directory, and `--verify` checks the chain against it when it exists. Each run's head is in
+  `/guardian/stats` (`seal.head`) and `--verify --heads`.
+- **`--verify --seal-existing`** seals spans written before 0.12.0 into a chain whose lines say `"backfilled": true`:
+  verifiable from now on, and labelled honestly as sealed late.
+- **The DeepSeek Harness engine writes the same chain** (`cg_seal.js`), so its spans verify with the Python verifier;
+  one golden hash pins the canonical form in both test suites. The engine reads the same `GUARDIAN_SEAL` and
+  `GUARDIAN_SEAL_ANCHOR_PATH`.
+- **`docs/ARCHIVE_FORMAT.md`** specifies the span file, the chain, the lock and the anchor precisely enough to write an
+  independent verifier.
+
+### Earlier unreleased
+
 - **Releases publish from CI by trusted publishing (OIDC), not from a stored API token.** Publishing a GitHub Release
   runs `.github/workflows/release.yml`: the tag must equal `pyproject.toml`'s version (PyPI and npm are independent
   version lines; npm publishes `package.json`'s version only when it is not already on the registry, and a release

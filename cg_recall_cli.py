@@ -2,6 +2,7 @@
 """cg_recall_cli.py -- search the span archive context_guardian.py writes on every compaction.
 
     context-guardian-recall <term> [--run RUN_ID]
+    context-guardian-recall --verify [--run RUN_ID | --all] [--heads] [--seal-existing]
 
 A compaction folds older messages into a summary and archives the full text as
 <GUARDIAN_SPAN_DIR>/<run_id>/<NNNN>.json. The summary the model receives names
@@ -11,7 +12,14 @@ this command so the model can find a detail again without reading a span whole
 Case-insensitive substring match over each archived message (text, content
 blocks, tool calls) and the span's own summary. One line per hit:
 `<span file> msg <i> [<role>]: ...snippet...`. Exit 0 with hits, 1 without,
-2 when the span directory does not exist. Stdlib only, Python 3.10+. MIT.
+2 when the span directory does not exist.
+
+--verify walks each run's chain.jsonl (cg_archive.py) and prints OK or the
+first break per run; exit 0 only when every checked run is OK. Without --run
+or --all it checks the most recently written run. --heads prints each run's
+chain head; --seal-existing seals spans written before sealing existed, marked
+backfilled. GUARDIAN_SEAL_ANCHOR_PATH, when that file exists, is checked too.
+Stdlib only, Python 3.10+. MIT.
 """
 from __future__ import annotations
 
@@ -21,6 +29,7 @@ import os
 import sys
 from pathlib import Path
 
+import cg_archive
 import cg_paths
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
@@ -98,18 +107,73 @@ def search(root: Path, term: str, run_id: str | None = None):
                 yield path, "summary", "summary", snippet(summary, at, len(term))
 
 
+def anchor_path():
+    """GUARDIAN_SEAL_ANCHOR_PATH when it names a file that exists, else None.
+    Read after span_dir() so a value from .env counts."""
+    value = (os.environ.get("GUARDIAN_SEAL_ANCHOR_PATH") or "").strip()
+    return Path(value) if value and Path(value).is_file() else None
+
+
+def cmd_verify(ns, root: Path) -> int:
+    if not root.is_dir():
+        print(f"no span archive at {root} (set GUARDIAN_SPAN_DIR)", file=sys.stderr)
+        return 2
+    anchor = anchor_path()
+    if ns.seal_existing:
+        for run, count in cg_archive.seal_existing(root, ns.run, anchor).items():
+            if count:
+                print(f"{run}  sealed {count} file(s) as backfilled")
+        ns.all = ns.run is None
+    if ns.heads:
+        found = cg_archive.heads(root)
+        for run, (seq, head) in found.items():
+            if ns.run is None or ns.run == run:
+                print(f"{run}  seq {seq}  head {head}")
+        if not found:
+            print("no sealed runs yet")
+        if anchor:
+            recorded = sum(len(v) for v in cg_archive.read_anchor(anchor).values())
+            print(f"anchor {anchor}: {recorded} head(s) recorded")
+        return 0
+    reports = cg_archive.verify(root, run=ns.run, all_runs=ns.all, anchor_path=anchor)
+    if not reports:
+        print(f"nothing archived under {root} yet")
+        return 0 if ns.run is None else 1
+    for report in reports:
+        print(cg_archive.format_report(report))
+    counts = cg_archive.summarise(reports)
+    bad = counts["breaks"] + counts["unsealed"]
+    print(f"{counts['runs']} run(s) checked: {counts['runs'] - bad} OK, "
+          f"{counts['breaks']} broken, {counts['unsealed']} unsealed"
+          + ("" if anchor else " (no anchor file; set GUARDIAN_SEAL_ANCHOR_PATH to pin heads)"))
+    return 0 if bad == 0 else 1
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="context-guardian-recall",
-        description="Search the spans Context Guardian archived when it compacted a conversation.")
-    parser.add_argument("term", help="text to find (case-insensitive)")
+        description="Search, and verify, the spans Context Guardian archived when it compacted a conversation.")
+    parser.add_argument("term", nargs="?", help="text to find (case-insensitive)")
     parser.add_argument("--run", metavar="RUN_ID", default=None,
                         help="only this proxy run (the directory name under the span dir)")
     parser.add_argument("--max", type=int, default=DEFAULT_MAX_HITS, metavar="N",
                         help="stop after N hits (default %(default)s)")
+    group = parser.add_argument_group("verify the sealed archive")
+    group.add_argument("--verify", action="store_true",
+                       help="check each run's chain.jsonl against the files on disk")
+    group.add_argument("--all", action="store_true",
+                       help="with --verify: every run (default: the most recent run)")
+    group.add_argument("--heads", action="store_true",
+                       help="with --verify: print each run's chain head")
+    group.add_argument("--seal-existing", action="store_true",
+                       help="with --verify: seal files written before sealing existed (marked backfilled)")
     ns = parser.parse_args(sys.argv[1:] if argv is None else argv)
 
     root = span_dir()
+    if ns.verify or ns.heads or ns.seal_existing:
+        return cmd_verify(ns, root)
+    if not ns.term:
+        parser.error("give a search term, or --verify")
     if not root.is_dir():
         print(f"no span archive at {root} (set GUARDIAN_SPAN_DIR)", file=sys.stderr)
         return 2

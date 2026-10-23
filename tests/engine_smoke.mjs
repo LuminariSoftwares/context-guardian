@@ -2,6 +2,7 @@
 // usage: node tests/engine_smoke.mjs      (exit 0 iff "0 failed")
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
+import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { emptyMemory, loadMemory, mergeMemory, saveMemory } from '../cg_memory.js'
 import { RECALL_GUIDE } from '../vendor/compiler.js'
@@ -206,6 +207,16 @@ check('span_archived_in_write_span_format', async () => {
   const run = readdirSync(config.spanDir)[0]
   const span = JSON.parse(readFileSync(join(config.spanDir, run, '0001.json'), 'utf8'))
   return ['run_id', 'index', 'at', 'num_ctx', 'message_count', 'summary', 'messages'].every(key => key in span) && span.index === 1 && span.message_count === 30 && span.messages.length === 30
+})
+check('engine_span_is_sealed_in_the_python_chain_format', async () => {
+  // cg_seal.js: the engine's spans carry the same chain.jsonl the Python verifier walks (tests/test_seal_js.py).
+  const h = makeCtx({ llm: 'throw' }); const config = baseConfig({ spanDir: join(tmp, 'spans-sealed') }); engine.apply(h.ctx, config)
+  const session = makeSession()
+  await h.compaction.summarize(smallInput(session), { session })
+  const run = readdirSync(config.spanDir)[0]
+  const entries = readFileSync(join(config.spanDir, run, 'chain.jsonl'), 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line))
+  const digest = createHash('sha256').update(readFileSync(join(config.spanDir, run, '0001.json'))).digest('hex')
+  return entries.length === 1 && entries[0].file === '0001.json' && entries[0].sha256 === digest && entries[0].prev === `genesis:${run}`
 })
 check('span_write_failure_leaves_no_file', async () => {
   // The span file is claimed with openSync('wx') before the JSON is written. A message that cannot be

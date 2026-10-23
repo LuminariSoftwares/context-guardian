@@ -115,6 +115,7 @@ REPO_DIR = Path(__file__).resolve().parent
 # on Windows), and an existing archive in the old place keeps being used with a
 # notice. See cg_paths.py.
 import cg_paths
+import cg_archive
 
 _DATA_DIR_NOTICE: Optional[str] = None
 
@@ -286,6 +287,19 @@ SUMMARY_TIMEOUT_SECONDS = float(os.environ.get(
 SPAN_DIR = Path(os.environ.get(
     "GUARDIAN_SPAN_DIR", str(DATA_DIR / cg_paths.SPANS_SUBDIR)))
 KEEP_SPANS = int(os.environ.get("GUARDIAN_KEEP_SPANS", "500"))
+# SEAL: every span written is hashed AS IT IS ON DISK and chained into
+# <run>/chain.jsonl, so `context-guardian-recall --verify` can prove the
+# archive still holds what compaction removed. Before this, "lossless on disk"
+# was a promise nothing could check: an edited, truncated or deleted span
+# looked exactly like an untouched one. Default ON; GUARDIAN_SEAL=0 writes no
+# chain (and leaves the run reported as unsealed by --verify). A seal that
+# fails is logged and the request proceeds unchanged -- see cg_archive.py.
+SEAL = os.environ.get("GUARDIAN_SEAL", "1").strip().lower() not in ("0", "false", "no", "off")
+# Tamper-EVIDENT is not tamper-PROOF: whoever can write the span directory can
+# rehash a whole chain. Set this to a file outside the data directory (synced
+# storage, another disk) and every new head is appended there too; --verify
+# then checks the chain against it.
+SEAL_ANCHOR_PATH = os.environ.get("GUARDIAN_SEAL_ANCHOR_PATH", "").strip() or None
 # How far write_span will walk forward to find a free index when two
 # concurrent compactions compute the same one. Bounded so a directory full of
 # spans cannot turn into an unbounded loop on the request path.
@@ -495,6 +509,9 @@ _state = {
     # Differs from num_ctx when Ollama's /api/show reported the model's own.
     "last_num_ctx": NUM_CTX,
     "last_input_budget": 0,
+    # Seals that could not be written (see seal_file). Non-zero means some
+    # spans of this run will verify as unsealed.
+    "seal_failures": 0,
 }
 
 # When this process started, for the health view's uptime line.
@@ -1200,7 +1217,7 @@ def write_span(messages: List[Dict[str, Any]], summary: str,
     is recorded in the compaction log so a missing span is visible rather than
     silently assumed to exist.
     """
-    path = None
+    path, tmp = None, None
     try:
         d = SPAN_DIR / RUN_ID
         _private_mkdir(d)
@@ -1220,11 +1237,11 @@ def write_span(messages: List[Dict[str, Any]], summary: str,
         # disk". Under concurrency it was lossy on disk too. `x` mode makes the
         # create atomic at the filesystem level, so the loser of a race steps
         # to the next free index rather than clobbering.
-        path, fh = None, None
         for candidate in range(index, index + MAX_SPAN_INDEX_PROBE):
             attempt = d / f"{candidate:04d}.json"
             try:
-                fh = open(attempt, "x", encoding="utf-8")
+                with open(attempt, "x", encoding="utf-8"):
+                    pass
             except FileExistsError:
                 continue
             # Before a byte is written: the file must never exist, even for an
@@ -1232,7 +1249,7 @@ def write_span(messages: List[Dict[str, Any]], summary: str,
             _make_private(attempt)
             path, index = attempt, candidate
             break
-        if fh is None:
+        if path is None:
             log.warning("could not claim a span index near %d after %d "
                         "attempts -- this span is LOST, not deferred.",
                         index, MAX_SPAN_INDEX_PROBE)
@@ -1247,24 +1264,64 @@ def write_span(messages: List[Dict[str, Any]], summary: str,
             "summary": summary,
             "messages": messages,
         }
-        # The file is already created and held open, so the atomic-rename
-        # dance is gone: the exclusive create IS the claim. A torn write is
-        # handled below: the claimed file is removed and the caller sees None.
-        with fh:
+        # The claim is an empty placeholder; the content goes to a temp file,
+        # is fsynced, and replaces the placeholder in one rename. Written in
+        # place (as before 0.12.0) a crash mid-write left a torn span under
+        # the final name, and there was no point at which "the bytes on disk"
+        # were final -- which is the moment the seal has to hash them.
+        tmp = d / (".%s.%d.%d.tmp" % (path.name, os.getpid(), threading.get_ident()))
+        with open(tmp, "x", encoding="utf-8") as fh:
+            _make_private(tmp)
             json.dump(payload, fh, ensure_ascii=False, indent=1)
+            fh.flush()
+            os.fsync(fh.fileno())
+        cg_archive.replace_file(tmp, path)
+        tmp = None
+        cg_archive.fsync_dir(d)
         written, path = path, None
+        seal_file(written)
         prune_spans()
         return str(written)
     except Exception as exc:                               # noqa: BLE001
         # The claimed file is empty or half-written. Left in place it would
         # read as an archived span to recall, prune and the DSH bridge.
-        if path is not None:
-            try:
-                path.unlink()
-            except OSError:
-                pass
+        for leftover in (tmp, path):
+            if leftover is not None:
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass
         log.warning("could not write span %d: %s. The compaction still "
                     "proceeds; this span is LOST, not deferred.", index, exc)
+        return None
+
+
+def seal_file(path: Path, kind: str = "span") -> Optional[Dict[str, Any]]:
+    """Hash a file as it is on disk now and chain it into its run's
+    chain.jsonl. Returns the entry, or None when sealing is off or failed.
+
+    Never raises: a seal is evidence ABOUT the archive, and failing to write
+    evidence must not cost the archive or the request. A failure is logged
+    once per occurrence and counted in /guardian/stats; --verify will then
+    report the file as unsealed, which is the honest outcome.
+    """
+    if not SEAL:
+        return None
+    try:
+        path = Path(path)
+        entry = cg_archive.append_entry(
+            path.parent, path.parent.name,
+            {"type": kind, "file": path.name, "sha256": cg_archive.sha256_file(path)},
+            anchor_path=SEAL_ANCHOR_PATH)
+        if entry.pop("_anchor_failed", False):
+            log.warning("sealed %s but could not append its head to the anchor "
+                        "file %s.", path.name, SEAL_ANCHOR_PATH)
+        return entry
+    except Exception as exc:                               # noqa: BLE001
+        _state["seal_failures"] += 1
+        log.warning("could not seal %s (%s: %s). The file is written and the "
+                    "request proceeds; --verify will report it as unsealed.",
+                    getattr(path, "name", path), type(exc).__name__, exc)
         return None
 
 
@@ -1278,6 +1335,22 @@ def prune_spans() -> None:
         # few functions up; it was missed here.
         doomed = files[:len(files) - KEEP_SPANS] if len(files) > KEEP_SPANS else []
         for old_file in doomed:
+            # In a sealed run, a deletion with no record is exactly what
+            # tampering looks like. The prune is recorded FIRST: if that fails
+            # the file stays (housekeeping can wait), rather than leaving a
+            # gap the verifier must report as missing.
+            if ((old_file.parent / cg_archive.CHAIN_FILE).exists()
+                    and cg_archive.SPAN_NAME_RE.match(old_file.name)):
+                try:
+                    cg_archive.append_entry(
+                        old_file.parent, old_file.parent.name,
+                        {"type": "pruned", "file": old_file.name,
+                         "sha256": cg_archive.sha256_file(old_file)},
+                        anchor_path=SEAL_ANCHOR_PATH)
+                except Exception as exc:                   # noqa: BLE001
+                    log.warning("could not record the prune of %s (%s); keeping "
+                                "the file.", old_file, exc)
+                    continue
             old_file.unlink(missing_ok=True)
     except Exception:                                      # noqa: BLE001
         pass
@@ -2014,6 +2087,7 @@ async def stats():
         "run_id": RUN_ID,
         "span_dir": str(SPAN_DIR),
         "upstream": UPSTREAM_URL,
+        "seal": seal_status(),
         **_state,
         # What the proxy has learned about its own estimate error, per model.
         # `last_raw_estimate` above is the pre-correction figure; this is what
@@ -2024,6 +2098,19 @@ async def stats():
         "note": ("last_known_total_tokens now INCLUDES the tools array. "
                  "last_tool_tokens is the part compaction cannot touch."),
     })
+
+
+def seal_status() -> Dict[str, Any]:
+    """This run's chain head, for /guardian/stats. Copy the head somewhere the
+    data directory's writers cannot reach and it pins the archive as it is
+    now; GUARDIAN_SEAL_ANCHOR_PATH does that automatically. Never raises."""
+    last = cg_archive.head(SPAN_DIR / RUN_ID) if SEAL else None
+    return {"enabled": SEAL,
+            "run_id": RUN_ID,
+            "head": last["entry_hash"] if last else None,
+            "seq": last["seq"] if last else 0,
+            "anchor_path_set": SEAL_ANCHOR_PATH is not None,
+            "failures": _state["seal_failures"]}
 
 
 @app.get("/guardian/events")
