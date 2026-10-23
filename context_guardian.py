@@ -615,6 +615,11 @@ _state = {
 # "span", "pointer", "chained"}, oldest first. Per process (= per run), never
 # written to disk.
 _summary_memo: "collections.OrderedDict[tuple, Dict[str, Any]]" = collections.OrderedDict()
+# Evicted-range hashes -> the future of the summary being made for them right
+# now. A concurrent request with the same range waits for it instead of making
+# its own summariser call and span. Bounded; entries leave when they settle.
+_summary_inflight: Dict[tuple, "asyncio.Future"] = {}
+SUMMARY_INFLIGHT_MAX = 64
 
 # The capture journal, created on first use when GUARDIAN_CAPTURE=journal.
 _journal: Optional[cg_archive.Journal] = None
@@ -2162,14 +2167,76 @@ async def _memo_summary(to_summarize: List[Dict[str, Any]], summarise) -> Dict[s
     if plan == "reuse":
         return {"summary": entry["summary"], "source": "reused", "entry": entry,
                 "hashes": hashes, "new": []}
-    if plan == "extend":
-        new = to_summarize[len(entry["hashes"]):]
-        earlier = {"role": EARLIER_SUMMARY_ROLE, "content": entry["summary"]}
-        summary = await summarise([earlier] + new)
-        return {"summary": summary, "source": "extended", "entry": entry, "hashes": hashes, "new": new}
-    summary = await summarise(to_summarize)
-    return {"summary": summary, "source": "generated", "entry": None, "hashes": hashes,
-            "new": to_summarize}
+    mine = None
+    if hashes is not None:
+        waited = await _await_inflight(hashes)
+        if waited is not None:
+            return waited
+        mine = _claim_inflight(hashes)
+    try:
+        if plan == "extend":
+            new = to_summarize[len(entry["hashes"]):]
+            earlier = {"role": EARLIER_SUMMARY_ROLE, "content": entry["summary"]}
+            summary = await summarise([earlier] + new)
+            return {"summary": summary, "source": "extended", "entry": entry, "hashes": hashes, "new": new}
+        summary = await summarise(to_summarize)
+        return {"summary": summary, "source": "generated", "entry": None, "hashes": hashes,
+                "new": to_summarize}
+    finally:
+        if mine is not None:
+            # Settled on the loop's next turn, not now: the caller stores the
+            # memo (_apply_memo) without awaiting in between, so by then a
+            # good summary is in the memo and a failed one is not.
+            _settle_later(hashes, mine)
+
+
+async def _await_inflight(hashes: tuple) -> Optional[Dict[str, Any]]:
+    """When the same range is being summarised for another request, wait for
+    it: its summary, through the memo (reused), or "no summary" when it failed,
+    so this request fails open as that one did. None means summarise alone,
+    which is also the answer to any error in here."""
+    try:
+        pending = _summary_inflight.get(hashes)
+        if pending is None:
+            return None
+        await asyncio.shield(pending)
+        plan, entry = memo_lookup(hashes)
+        if plan == "reuse":
+            return {"summary": entry["summary"], "source": "reused", "entry": entry,
+                    "hashes": hashes, "new": []}
+        return {"summary": None, "source": "generated", "entry": None, "hashes": hashes, "new": []}
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:                               # noqa: BLE001
+        log.debug("summary de-dup unavailable, summarising alone: %s", exc)
+        return None
+
+
+def _claim_inflight(hashes: tuple) -> Optional["asyncio.Future"]:
+    try:
+        if len(_summary_inflight) >= SUMMARY_INFLIGHT_MAX:
+            return None
+        fut = asyncio.get_running_loop().create_future()
+        _summary_inflight[hashes] = fut
+        return fut
+    except Exception as exc:                               # noqa: BLE001
+        log.debug("summary de-dup unavailable, summarising alone: %s", exc)
+        return None
+
+
+def _settle_later(hashes: tuple, fut: "asyncio.Future") -> None:
+    def settle():
+        try:
+            if _summary_inflight.get(hashes) is fut:
+                del _summary_inflight[hashes]
+        except Exception as exc:                           # noqa: BLE001
+            log.debug("summary de-dup cleanup failed: %s", exc)
+        if not fut.done():
+            fut.set_result(None)
+    try:
+        asyncio.get_running_loop().call_soon(settle)
+    except Exception:                                      # noqa: BLE001
+        settle()
 
 
 def _apply_memo(result: Dict[str, Any], to_summarize: List[Dict[str, Any]]):
@@ -2439,6 +2506,7 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any],
     # Evict to disk BEFORE the messages are replaced. If this ran after, a crash
     # between the two would lose the span with nothing to show it existed. A
     # reused summary writes nothing: its messages are already archived.
+    # No await between _memo_summary and here: a concurrent waiter reads the memo this stores (_settle_later).
     span_path, pointer = _apply_memo(memo, to_summarize)
 
     new_messages = system_msgs + [_summary_message(to_summarize, summary, pointer)] + to_keep
@@ -3142,6 +3210,7 @@ async def maybe_compact_anthropic(client: httpx.AsyncClient, payload: Dict[str, 
                      estimated, message_tokens, tool_tokens)
         return payload
 
+    # No await between _memo_summary and here: a concurrent waiter reads the memo this stores (_settle_later).
     span_path, pointer = _apply_memo(memo, to_summarize)
     note = _summary_message(to_summarize, summary, pointer)["content"]
     out = dict(payload)

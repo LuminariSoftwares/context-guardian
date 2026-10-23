@@ -13,6 +13,7 @@ that extends a remembered one summarises only the new messages on top of the
 old summary; anything else falls back to a full summary. Written before the
 code; every test here fails on b053b7e.
 """
+import asyncio
 import json
 from pathlib import Path
 
@@ -34,16 +35,21 @@ def _probe_env(**extra):
     return env
 
 
-def stub(g):
+def stub(g, delay=0.0, fail=False):
     """A recording upstream for both routes. Summary calls are told apart by
-    the fence marker and counted, with the transcript they were given."""
+    the fence marker and counted, with the transcript they were given.
+    `delay` holds each summary call open that long; `fail` answers it 500."""
     seen = {"summaries": [], "chat": [], "messages": []}
 
-    def handler(request):
+    async def handler(request):
         body = json.loads(request.content)
         prompt = json.dumps(body)
         if "BEGIN_TRANSCRIPT" in prompt:
             seen["summaries"].append(body)
+            if delay:
+                await asyncio.sleep(delay)
+            if fail:
+                return httpx.Response(500, json={"error": "summariser down"})
             if request.url.path.endswith("/messages"):
                 return httpx.Response(200, json={"content": [{"type": "text", "text": SUMMARY}]})
             return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": SUMMARY},
@@ -257,3 +263,77 @@ def test_a_memo_error_means_no_memo(monkeypatch, tmp_path):
     post_chat(g, chat_history(6))
     assert len(seen["summaries"]) == 2                   # fell back to a full summary
     assert g._state["summaries_generated"] == 2
+
+
+# --- follow-up 2, item 4: concurrent identical compactions --------------------------
+# _memo_summary looked the memo up, awaited the summariser and only then stored,
+# so two requests with the same evicted range in flight together each made a
+# summariser call and wrote a duplicate span. Written before the code.
+async def _concurrently(g, route, n=2):
+    path, body = (("/v1/chat/completions", {"model": "m", "messages": chat_history(6)}) if route == "chat" else
+                  ("/v1/messages", {"model": "m", "max_tokens": 10, "system": "be brief",
+                                    "messages": messages_history(5)}))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=g.app), base_url=LOOPBACK) as c:
+        return await asyncio.gather(*[c.post(path, json=body) for _ in range(n)])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["chat", "messages"])
+async def test_two_concurrent_identical_compactions_make_one_summary_and_one_span(monkeypatch, tmp_path, route):
+    g = load(monkeypatch, tmp_path, **_probe_env())
+    seen = stub(g, delay=0.2)
+    replies = await _concurrently(g, route)
+    assert [r.status_code for r in replies] == [200, 200]
+    assert len(seen["summaries"]) == 1
+    assert len(spans(g)) == 1
+    forwarded = [f for f in seen[route] if "messages" in f]            # not the /api/show probe
+    assert len(forwarded) == 2 and forwarded[0] == forwarded[1]
+    assert all(SUMMARY in json.dumps(f) for f in forwarded)            # both compacted
+    assert (g._state["summaries_generated"], g._state["summaries_reused"]) == (1, 1)
+    assert g._summary_inflight == {}                                    # cleaned up
+
+
+@pytest.mark.asyncio
+async def test_a_failed_shared_summary_forwards_both_unchanged(monkeypatch, tmp_path):
+    g = load(monkeypatch, tmp_path, **_probe_env())
+    seen = stub(g, delay=0.2, fail=True)
+    replies = await _concurrently(g, "chat", n=3)
+    assert [r.status_code for r in replies] == [200] * 3
+    assert len(seen["summaries"]) == 1
+    assert spans(g) == []
+    forwarded = [f for f in seen["chat"] if "messages" in f]
+    assert len(forwarded) == 3 and all(f["messages"] == chat_history(6) for f in forwarded)  # all unchanged
+    assert g._state["summaries_rejected_empty"] == 3
+    assert g._summary_inflight == {}
+
+
+@pytest.mark.asyncio
+async def test_a_de_dup_error_means_summarise_alone(monkeypatch, tmp_path):
+    g = load(monkeypatch, tmp_path, **_probe_env())
+    seen = stub(g, delay=0.1)
+
+    class Broken(dict):
+        def get(self, *a, **k):
+            raise RuntimeError("de-dup broke")
+    monkeypatch.setattr(g, "_summary_inflight", Broken())
+    replies = await _concurrently(g, "chat")
+    assert [r.status_code for r in replies] == [200, 200]
+    assert len(seen["summaries"]) == 2                                  # as before the de-dup
+    assert all(SUMMARY in json.dumps(f) for f in seen["chat"] if "messages" in f)
+
+
+@pytest.mark.asyncio
+async def test_the_in_flight_table_is_bounded(monkeypatch, tmp_path):
+    g = load(monkeypatch, tmp_path, **_probe_env())
+    stub(g, delay=0.1)
+    monkeypatch.setattr(g, "SUMMARY_INFLIGHT_MAX", 0)
+    seen_sizes = []
+    real = g._memo_summary
+
+    async def spy(*a, **k):
+        out = await real(*a, **k)
+        seen_sizes.append(len(g._summary_inflight))
+        return out
+    monkeypatch.setattr(g, "_memo_summary", spy)
+    await _concurrently(g, "chat")
+    assert seen_sizes and max(seen_sizes) == 0

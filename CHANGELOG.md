@@ -183,6 +183,15 @@ everything that existed answers as before.
   `/v1/models` lists exactly one model. Otherwise the proxy falls back to `GUARDIAN_NUM_CTX` and logs why once per
   model. Checked against llama.cpp master (`get_res_props`, `get_res_model_info`, `get_router_props`, `is_autoload`).
 
+### Concurrent identical compactions (follow-up 2)
+
+- **Two requests compacting the same history at once make one summary.** The memo was looked up before the
+  summariser call and stored after it, so two concurrent requests with the same evicted range each made a summariser
+  call and wrote a duplicate span. The first request now registers the range (by its message hashes) as in flight;
+  a concurrent one waits for it and takes its summary and span through the memo. A failed or short summary resolves
+  to "no summary" for every waiter, so each fails open exactly as before. The table is bounded (64) and cleared as
+  each summary settles; any error in it means "summarise alone".
+
 ### Release process
 
 - **Releases publish from CI by trusted publishing (OIDC), not from a stored API token.** Publishing a GitHub Release
