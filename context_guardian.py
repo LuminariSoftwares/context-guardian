@@ -1081,6 +1081,52 @@ def _llama_window(data: Any) -> Optional[int]:
     return n if isinstance(n, int) and not isinstance(n, bool) and n > 0 else None
 
 
+def _props_names(props: Any, models: Any) -> set:
+    """The names llama-server's GET /props gives the model it describes:
+    model_alias (meta.model_name: the first --alias, else the model's name,
+    else the file name), model_path with its file name and stem, and the
+    aliases its /v1/models card lists. Empty when it names none."""
+    names = set()
+    alias = props.get("model_alias")
+    if isinstance(alias, str) and alias:
+        names.add(alias)
+    path = props.get("model_path")
+    if isinstance(path, str) and path and path != "none":
+        base = path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        names.update({path, base, base[:-5] if base.lower().endswith(".gguf") else base})
+    cards = models.get("data") if isinstance(models, dict) else None
+    for card in cards if isinstance(cards, list) else []:
+        if isinstance(card, dict) and card.get("id") in names:
+            names.update(a for a in card.get("aliases") or [] if isinstance(a, str))
+    names.discard("")
+    return names
+
+
+_props_distrust_logged: set = set()
+
+
+def _props_trusted(props: Any, model: str, models: Any) -> bool:
+    """Behind a model switcher or in llama-server's router mode, /props can
+    describe whichever model is loaded, not the one asked for. Trust it only
+    when it names `model`, or when it names none and /v1/models lists exactly
+    one model; otherwise say why, once per model."""
+    names = _props_names(props, models)
+    if names:
+        if model in names:
+            return True
+        why = "it describes %s" % sorted(names)[0]
+    else:
+        cards = (models or {}).get("data") if isinstance(models, dict) else None
+        if isinstance(cards, list) and len(cards) == 1:
+            return True
+        why = "it names no model and /v1/models does not list exactly one"
+    if model not in _props_distrust_logged:
+        _props_distrust_logged.add(model)
+        log.info("llama.cpp /props window not used for %s: %s; using GUARDIAN_NUM_CTX=%d",
+                 model, why, NUM_CTX)
+    return False
+
+
 async def _ask_json(client: httpx.AsyncClient, method: str, url: str,
                     headers: Optional[Dict[str, str]], **kw) -> Any:
     resp = await client.request(method, url, headers=_summary_headers(headers),
@@ -1223,19 +1269,32 @@ async def _detect_window(client, model, headers) -> Optional[Dict[str, Any]]:
                     "used": min(NUM_CTX, found) if NUM_CTX_EXPLICIT else found}
     if off:
         return None
-    for source, method, url, parse in (
-            ("vLLM", "GET", f"{root}/models", lambda d: _vllm_window(d, model)),
-            ("llama.cpp", "GET", f"{bare}/props", _llama_window)):
+    models = None
+    found = None
+    source = "vLLM"
+    try:
+        models = await _ask_json(client, "GET", f"{root}/models", headers)
+        found = _vllm_window(models, model)
+    except Exception as exc:                               # noqa: BLE001
+        log.debug("vLLM window probe for %s: %s", model, exc)
+    if not found:
+        source = "llama.cpp"
         try:
-            found = parse(await _ask_json(client, method, url, headers))
+            # ?model= selects the model's instance in router mode (a single
+            # llama-server ignores it); autoload=false: a probe loads nothing.
+            props = await _ask_json(client, "GET", f"{bare}/props", headers,
+                                    params={"model": model, "autoload": "false"})
+            found = _llama_window(props)
+            if found and not _props_trusted(props, model, models):
+                found = None
         except Exception as exc:                           # noqa: BLE001
-            log.debug("%s window probe for %s: %s", source, model, exc)
-            continue
-        if found:
-            used = min(NUM_CTX, found) if NUM_CTX_EXPLICIT else found
-            log.info("%s reports %d for %s", source, found, model)
-            return {"window": found, "source": source, "used": used}
-    return None
+            log.debug("llama.cpp window probe for %s: %s", model, exc)
+            found = None
+    if not found:
+        return None
+    log.info("%s reports %d for %s", source, found, model)
+    return {"window": found, "source": source,
+            "used": min(NUM_CTX, found) if NUM_CTX_EXPLICIT else found}
 
 
 def estimate_tool_tokens(payload: Dict[str, Any]) -> int:

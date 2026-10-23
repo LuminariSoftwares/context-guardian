@@ -168,3 +168,96 @@ def test_the_doctor_shows_the_detected_window():
     stats = {"num_ctx": 1000, "context_detected": {"small": {"window": 800, "source": "vLLM", "used": 800}}}
     lines = [f["what"] for f in cg_doctor.detected_window_findings(stats)]
     assert any("vLLM reports 800 for small" in ln for ln in lines), lines
+
+
+# --- follow-up 2, item 3: /props may describe a different model --------------------
+# Behind a model switcher, or in llama-server's router mode, /props can describe
+# whichever model is loaded, not the one asked for. get_res_props
+# (tools/server/server-context.cpp) names it in model_alias (meta.model_name: the
+# first --alias, else the model's name, else the file name) and model_path. In
+# router mode GET /props without ?model= answers a dummy (model_alias
+# "llama-server", n_ctx 0) and GET /props?model=<name> is proxied to that
+# model's instance (get_router_props, tools/server/server-models.cpp);
+# ?autoload=false keeps the probe from loading a model (is_autoload).
+TWO_MODELS = {"object": "list", "data": [{"id": "devstral", "object": "model"},
+                                         {"id": "qwen-coder", "object": "model"}]}
+ONE_MODEL = {"object": "list", "data": [{"id": "devstral", "object": "model"}]}
+
+
+def test_props_naming_another_model_is_not_used(monkeypatch, tmp_path, caplog):
+    g = load(monkeypatch, tmp_path, GUARDIAN_UPSTREAM_URL=LLAMA, GUARDIAN_NUM_CTX="")
+    wire(g, models=TWO_MODELS, props={"default_generation_settings": {"n_ctx": 4096},
+                                      "model_alias": "qwen-coder", "model_path": "/models/qwen-coder.gguf"})
+    with caplog.at_level("INFO", logger="context_guardian"):
+        chat(g, "devstral")
+        chat(g, "devstral")
+    assert g._state["last_num_ctx"] == 32768
+    assert g._detected["devstral"] is None
+    why = [r.getMessage() for r in caplog.records if "/props" in r.getMessage()]
+    assert len(why) == 1 and "qwen-coder" in why[0] and "devstral" in why[0], why
+
+
+@pytest.mark.parametrize("props", [
+    {"model_alias": "devstral", "model_path": "/models/Devstral-Small-Q4_K_M.gguf"},
+    {"model_alias": "something-else", "model_path": "/models/devstral.gguf"},
+    {"model_alias": "something-else", "model_path": "C:\\models\\devstral"},
+    {"model_path": "/models/devstral.gguf"},
+])
+def test_props_naming_the_requested_model_is_used(monkeypatch, tmp_path, props):
+    g = load(monkeypatch, tmp_path, GUARDIAN_UPSTREAM_URL=LLAMA, GUARDIAN_NUM_CTX="")
+    wire(g, models=TWO_MODELS, props=dict(props, default_generation_settings={"n_ctx": 4096}))
+    chat(g, "devstral")
+    assert g._state["last_num_ctx"] == 4096
+
+
+def test_an_alias_from_the_models_card_counts_as_the_model(monkeypatch, tmp_path):
+    g = load(monkeypatch, tmp_path, GUARDIAN_UPSTREAM_URL=LLAMA, GUARDIAN_NUM_CTX="")
+    wire(g, models={"data": [{"id": "devstral", "aliases": ["dev"], "object": "model"},
+                             {"id": "qwen-coder", "object": "model"}]},
+         props={"default_generation_settings": {"n_ctx": 4096}, "model_alias": "devstral"})
+    chat(g, "dev")
+    assert g._state["last_num_ctx"] == 4096
+
+
+def test_a_single_model_server_with_no_identification_is_used(monkeypatch, tmp_path):
+    g = load(monkeypatch, tmp_path, GUARDIAN_UPSTREAM_URL=LLAMA, GUARDIAN_NUM_CTX="")
+    wire(g, models=ONE_MODEL, props={"default_generation_settings": {"n_ctx": 4096}})
+    chat(g, "anything")
+    assert g._state["last_num_ctx"] == 4096
+
+
+@pytest.mark.parametrize("models", [TWO_MODELS, None, 500])
+def test_no_identification_and_not_exactly_one_model_is_not_used(monkeypatch, tmp_path, models):
+    g = load(monkeypatch, tmp_path, GUARDIAN_UPSTREAM_URL=LLAMA, GUARDIAN_NUM_CTX="")
+    wire(g, models=models, props={"default_generation_settings": {"n_ctx": 4096}})
+    chat(g, "devstral")
+    assert g._state["last_num_ctx"] == 32768
+
+
+def test_the_props_probe_names_the_model_and_does_not_load_it(monkeypatch, tmp_path):
+    g = load(monkeypatch, tmp_path, GUARDIAN_UPSTREAM_URL=LLAMA, GUARDIAN_NUM_CTX="")
+    asked = []
+
+    def handler(request):
+        if request.url.path.endswith("/props"):
+            asked.append(dict(request.url.params))
+            return httpx.Response(200, json={"default_generation_settings": {"n_ctx": 4096},
+                                             "model_alias": "dev stral/q4"})
+        if request.url.path.endswith("/v1/models"):
+            return httpx.Response(404)
+
+        async def _stream():
+            yield b'{"choices":[]}'
+        return httpx.Response(200, content=_stream())
+    g._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    chat(g, "dev stral/q4")
+    assert asked == [{"model": "dev stral/q4", "autoload": "false"}]
+    assert g._state["last_num_ctx"] == 4096
+
+
+def test_the_router_dummy_answer_is_not_used(monkeypatch, tmp_path):
+    g = load(monkeypatch, tmp_path, GUARDIAN_UPSTREAM_URL=LLAMA, GUARDIAN_NUM_CTX="")
+    wire(g, models=ONE_MODEL, props={"role": "router", "model_alias": "llama-server", "model_path": "none",
+                                     "default_generation_settings": {"params": {}, "n_ctx": 0}})
+    chat(g, "devstral")
+    assert g._state["last_num_ctx"] == 32768

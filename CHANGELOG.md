@@ -172,6 +172,17 @@ everything that existed answers as before.
   retries the rejected request; the client does, and its retry gets the fresh window. `detect_ttl` is in
   `/guardian/stats`.
 
+### llama.cpp `/props` must name the model (follow-up 2)
+
+- **A `/props` window is used only for the model it describes.** Behind a model switcher, or in llama-server's router
+  mode, `/props` can describe whichever model is loaded rather than the one requested; vLLM's check matched the model
+  id and llama.cpp's did not. The probe is now `GET /props?model=<model>&autoload=false` (router mode proxies it to
+  that model's instance, `get_router_props`, and `autoload=false` keeps a probe from loading a model; a single
+  llama-server ignores both), and its window is trusted only when `model_alias` (`meta.model_name`), `model_path`, its
+  file name or stem, or an alias on the matching `/v1/models` card is the requested model, or when it names none and
+  `/v1/models` lists exactly one model. Otherwise the proxy falls back to `GUARDIAN_NUM_CTX` and logs why once per
+  model. Checked against llama.cpp master (`get_res_props`, `get_res_model_info`, `get_router_props`, `is_autoload`).
+
 ### Release process
 
 - **Releases publish from CI by trusted publishing (OIDC), not from a stored API token.** Publishing a GitHub Release
