@@ -1064,11 +1064,10 @@ async def context_window(client: httpx.AsyncClient, model: str,
     """The window to budget this model against. Never raises.
 
     GUARDIAN_NUM_CTX unless the upstream reports one, asked once per model
-    (see DETECT_CONTEXT). Ollama keeps its 0.11.0 rule: its num_ctx is the
-    window it runs at and is used as is; a trained context_length only lowers.
-    For vLLM and llama.cpp the safety rule is the same direction: an explicit
-    GUARDIAN_NUM_CTX is lowered by a smaller reported window and never raised
-    by a larger one; with no explicit setting the reported window is used.
+    (see DETECT_CONTEXT). One safety rule for Ollama, vLLM and llama.cpp: an
+    explicit GUARDIAN_NUM_CTX is lowered by a smaller reported window and never
+    raised by a larger one; with no explicit setting the reported window is
+    used. Ollama's trained context_length only ever lowers (window_from_show).
     The credential headers of the client's request go along, for a keyed server.
     """
     if not model:
@@ -1100,9 +1099,13 @@ async def _detect_window(client, model, headers) -> Optional[Dict[str, Any]]:
                         "GUARDIAN_NUM_CTX=%d for this model.", model,
                         type(exc).__name__, exc, NUM_CTX)
         _ollama_windows[model] = found
-        # An Ollama upstream is answered by Ollama alone, as in 0.11.0.
+        # An Ollama upstream is answered by Ollama alone, as in 0.11.0, and
+        # its num_ctx follows the same min() rule as vLLM and llama.cpp.
         if found or upstream_is_ollama():
-            return {"window": found, "source": "Ollama", "used": found} if found else None
+            if not found:
+                return None
+            return {"window": found, "source": "Ollama",
+                    "used": min(NUM_CTX, found) if NUM_CTX_EXPLICIT else found}
     if off:
         return None
     for source, method, url, parse in (

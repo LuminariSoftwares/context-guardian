@@ -153,6 +153,13 @@ everything that existed answers as before.
   vLLM main (`ModelCard.max_model_len`, `show_available_models`) and llama.cpp master (`get_res_props`,
   `n_ctx_slot`).
 
+### Changed (follow-up 2)
+
+- **Ollama follows the `min()` rule too.** With `GUARDIAN_NUM_CTX` set, the `num_ctx` Ollama reports can lower it
+  but no longer raise it, the same rule as vLLM and llama.cpp; with it unset, Ollama's `num_ctx` is used as before.
+  If you set `GUARDIAN_NUM_CTX` below your Ollama window, the proxy now compacts at your setting, not at Ollama's
+  larger window.
+
 ### Release process
 
 - **Releases publish from CI by trusted publishing (OIDC), not from a stored API token.** Publishing a GitHub Release

@@ -30,12 +30,30 @@ def _chat(g, model="qwen"):
 
 
 def test_num_ctx_from_api_show_is_the_budget_base(monkeypatch, tmp_path):
-    g = load(monkeypatch, tmp_path, GUARDIAN_UPSTREAM_URL=OLLAMA)
+    """With GUARDIAN_NUM_CTX unset, the window Ollama runs the model at is the
+    budget, as in 0.11.0."""
+    g = load(monkeypatch, tmp_path, GUARDIAN_UPSTREAM_URL=OLLAMA, GUARDIAN_NUM_CTX="")
     seen = wire(g, show=_show(parameters="stop \"<|im_end|>\"\nnum_ctx                        2048"))
     assert _chat(g).status_code == 200
     assert seen["show"] == [{"model": "qwen"}]
     assert g._state["last_num_ctx"] == 2048
     assert g._state["last_input_budget"] == g.effective_threshold(num_ctx=2048)
+
+
+def test_an_explicit_num_ctx_is_lowered_by_ollama_never_raised(monkeypatch, tmp_path):
+    """Changed in 0.12.0 (until then this test pinned 2048 against an explicit
+    1000): Ollama follows the same min() rule as vLLM and llama.cpp. An
+    explicit GUARDIAN_NUM_CTX below the reported num_ctx is the budget."""
+    g = load(monkeypatch, tmp_path, GUARDIAN_UPSTREAM_URL=OLLAMA, GUARDIAN_NUM_CTX="1000")
+    wire(g, show=_show(parameters="num_ctx 2048"))
+    _chat(g)
+    assert g._state["last_num_ctx"] == 1000
+    assert g._detected["qwen"] == {"window": 2048, "source": "Ollama", "used": 1000}
+
+    g = load(monkeypatch, tmp_path, GUARDIAN_UPSTREAM_URL=OLLAMA, GUARDIAN_NUM_CTX="4096")
+    wire(g, show=_show(parameters="num_ctx 2048"))
+    _chat(g)
+    assert g._state["last_num_ctx"] == 2048
 
 
 def test_api_show_is_called_once_per_model(monkeypatch, tmp_path):
@@ -110,7 +128,7 @@ def test_the_switch_overrides_the_guess(monkeypatch, tmp_path, setting, url, ask
 def test_stats_show_what_ollama_reported(monkeypatch, tmp_path):
     from fastapi.testclient import TestClient
 
-    g = load(monkeypatch, tmp_path, GUARDIAN_UPSTREAM_URL=OLLAMA)
+    g = load(monkeypatch, tmp_path, GUARDIAN_UPSTREAM_URL=OLLAMA, GUARDIAN_NUM_CTX="")
     wire(g, show=_show(parameters="num_ctx 2048"))
     _chat(g)
     stats = TestClient(g.app, base_url=LOOPBACK).get("/guardian/stats").json()

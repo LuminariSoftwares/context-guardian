@@ -146,7 +146,7 @@ def test_detect_off_asks_nothing(monkeypatch, tmp_path):
 
 
 def test_ollama_is_still_asked_first_and_alone_when_it_answers(monkeypatch, tmp_path):
-    g = load(monkeypatch, tmp_path, GUARDIAN_UPSTREAM_URL=OLLAMA)
+    g = load(monkeypatch, tmp_path, GUARDIAN_UPSTREAM_URL=OLLAMA, GUARDIAN_NUM_CTX="")
     seen = wire(g, show={"parameters": "num_ctx 2048"}, models=VLLM_MODELS, props=LLAMA_PROPS)
     chat(g, "qwen")
     assert seen["show"] == 1 and seen["models"] == 0 and seen["props"] == 0
