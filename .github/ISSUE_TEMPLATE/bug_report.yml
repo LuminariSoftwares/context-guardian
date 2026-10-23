@@ -1,19 +1,20 @@
 name: Bug Report
 description: Report an issue with context-guardian
 title: "[Bug] "
-labels: ["bug"]
+labels: ["bug", "needs-info"]
 
 body:
   - type: markdown
     attributes:
-      value: "Thank you for reporting a bug. Please include specific details to help us reproduce and fix the issue."
+      value: |
+        Thank you for reporting a bug. context-guardian is maintained by one person on a best-effort basis; see [SUPPORT.md](https://github.com/LuminariSoftwares/context-guardian/blob/main/SUPPORT.md). You will get an acknowledgement within a day. The exact command and the full output are what make a bug reproducible.
 
   - type: input
     id: version
     attributes:
       label: "Version"
-      description: "npm and/or PyPI version"
-      placeholder: "0.1.0-alpha.6 (npm) / 0.6.0 (PyPI)"
+      description: "Output of `context-guardian --version`. DSH plugin users: the npm version of dsh-context-guardian."
+      placeholder: "context-guardian 0.6.0"
     validations:
       required: true
 
@@ -23,77 +24,69 @@ body:
       label: "Installation Method"
       description: "How did you install context-guardian?"
       options:
-        - "DSH plugin (npm - dsh-context-guardian)"
         - "Python proxy (PyPI - context-guardian)"
+        - "DSH plugin (npm - dsh-context-guardian)"
         - "Other"
     validations:
       required: true
 
-  - type: dropdown
+  - type: input
     id: os
     attributes:
       label: "Operating System"
-      options:
-        - "Windows"
-        - "macOS"
-        - "Linux"
-        - "Other"
+      description: "Name and version."
+      placeholder: "Windows 11 / macOS 14.5 / Ubuntu 24.04"
+    validations:
+      required: true
 
   - type: input
-    id: versions
+    id: python_version
     attributes:
-      label: "Python and Node Versions"
-      description: "Output of 'python --version' and 'node --version'"
-      placeholder: "Python 3.10.5, Node 22.19.0"
+      label: "Python Version"
+      description: "Output of `python --version`"
+      placeholder: "Python 3.11.9"
+    validations:
+      required: true
 
   - type: input
     id: model_backend
     attributes:
-      label: "Model and Backend"
-      description: "Model name, context window size, and LLM backend"
-      placeholder: "qwen3-coder 30B on Ollama 0.5.0, num_ctx 32768"
+      label: "Model and Backend (optional)"
+      description: "Model name, context window size, and LLM backend, if the bug involves a model."
+      placeholder: "qwen3-coder 30B on Ollama, num_ctx 32768"
+
+  - type: textarea
+    id: command
+    attributes:
+      label: "The Exact Command"
+      description: "The exact command you ran, copied as typed, including any environment variables."
+      render: "shell"
+      placeholder: "GUARDIAN_UPSTREAM_URL=http://localhost:11434/v1 context-guardian"
     validations:
       required: true
 
   - type: textarea
-    id: what_happened
+    id: output
     attributes:
-      label: "What Happened"
-      description: "What did you observe? Include error messages or unexpected behavior."
-      placeholder: "Context was truncated incorrectly..."
+      label: "Full Output"
+      description: "The full output, not a summary. For an install or setup problem, include the output of `context-guardian-doctor`. Remove tokens, API keys and sensitive conversation content first."
+      render: "text"
+      placeholder: "Paste the complete output or traceback here"
     validations:
       required: true
 
   - type: textarea
     id: expected
     attributes:
-      label: "Expected Behavior"
-      description: "What did you expect to happen?"
-      placeholder: "The conversation should have been compacted to 75% of the original..."
+      label: "What You Expected"
+      description: "What did you expect to happen instead?"
     validations:
       required: true
 
-  - type: textarea
-    id: steps
+  - type: checkboxes
+    id: quick_start
     attributes:
-      label: "Steps to Reproduce"
-      description: "How can we reproduce the issue?"
-      placeholder: |
-        1. Start a session with context size 16000
-        2. Send messages totaling 15000 tokens
-        3. Notice that...
-
-  - type: textarea
-    id: logs
-    attributes:
-      label: "Logs and Output"
-      description: "Error messages or diagnostic output. Please remove tokens, API keys, and sensitive conversation content."
-      render: "text"
-      placeholder: "Paste error messages, tracebacks, or log output here"
-
-  - type: textarea
-    id: diagnostics
-    attributes:
-      label: "Diagnostic Output"
-      description: "Output of '/guardian' in DSH or 'python cg_doctor.py'"
-      placeholder: "Paste the output here"
+      label: "Before you submit"
+      options:
+        - label: "I ran the quick start as written"
+          required: true

@@ -6,36 +6,36 @@ labels: ["enhancement"]
 body:
   - type: markdown
     attributes:
-      value: "Tell us about a feature that would improve context-guardian."
+      value: |
+        Feature requests are welcome. They may be answered "later" or "not here", with the reason. Filing one is not a promise of a timeline. Requests that add runtime dependencies are out of scope; see [SUPPORT.md](https://github.com/LuminariSoftwares/context-guardian/blob/main/SUPPORT.md).
 
   - type: textarea
-    id: problem
+    id: goal
     attributes:
-      label: "Problem or Limitation"
-      description: "What is the current limitation or pain point?"
-      placeholder: "The guardian compacts history but doesn't consider semantic importance of messages..."
+      label: "What You Are Trying to Do"
+      description: "The task or workflow, not the feature you have in mind."
+      placeholder: "I keep long sessions going with a 16k-token model and..."
     validations:
       required: true
 
   - type: textarea
-    id: solution
+    id: tried
     attributes:
-      label: "Proposed Solution"
-      description: "How would you solve this? What would the feature do?"
-      placeholder: "Add a scoring system to identify and preserve high-value turns in the conversation..."
+      label: "What You Tried"
+      description: "Settings, workarounds or other tools you tried, and what happened."
+    validations:
+      required: true
+
+  - type: textarea
+    id: change
+    attributes:
+      label: "What Would Change"
+      description: "What would be different for you if this existed? Include numbers if you have them."
     validations:
       required: true
 
   - type: input
     id: context
     attributes:
-      label: "Context: Model, Backend, and Window Size"
-      description: "Where did you encounter this limitation?"
-      placeholder: "llama2 70B on vLLM, context window 4096"
-
-  - type: textarea
-    id: impact
-    attributes:
-      label: "Expected Impact"
-      description: "What would improve? Token savings? Reliability? Include numbers if available."
-      placeholder: "Could save 20-30% of tokens while preserving conversation flow"
+      label: "Model, Backend and Window Size (optional)"
+      placeholder: "llama3 70B on vLLM, context window 4096"

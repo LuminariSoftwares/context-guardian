@@ -1,5 +1,7 @@
 # Contributing to context-guardian
 
+Need help? See [SUPPORT.md](SUPPORT.md).
+
 ## Welcome
 
 This project exists to make local models usable in long coding sessions by compacting conversation history before the context window fills. The most valuable contributions are bug reports with real numbers—your model name, backend, context size, and token counts before and after context compaction.
