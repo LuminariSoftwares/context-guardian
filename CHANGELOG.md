@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## PyPI context-guardian 0.12.0 (not yet released)
+
+The archive becomes something you can check. Every span is sealed in a hash chain `--verify` walks, every recall
+leaves a counts-only receipt, a model can skim the archive before opening it, a whole session can be journaled
+(opt-in), and Claude Code sessions can be archived through its hooks. The version moves to 0.12.0 in
+`pyproject.toml`, `__version__`, the MCP server and `server.json` together; the npm package (`dsh-context-guardian`)
+keeps its own version line, and its engine changes here ship with its next release. No breaking changes: every new behaviour has an off switch, and
+everything that existed answers as before.
+
 ### Sealed archive
 
 - **The span archive is sealed, so "lossless on disk" can be checked.** Every span file is hashed as it sits on disk
@@ -83,9 +92,9 @@
 
 ### Claude Code adapter
 
-- **`context-guardian-claude-code`: archive, seal and recall Claude Code sessions.** Claude Code calls Anthropic's API
-  directly, so the proxy cannot sit in front of it, but its hooks hand a command the session id and the transcript
-  path. **`capture`** (the hook entry point) copies the transcript lines it has not copied before into sealed,
+- **`context-guardian-claude-code`: archive, seal and recall Claude Code sessions.** Claude Code compacts its own
+  window and by default talks to Anthropic's API directly; routing it through the proxy (`ANTHROPIC_BASE_URL`) stays
+  possible, but its hooks hand a command the session id and the transcript path, which needs no routing change. **`capture`** (the hook entry point) copies the transcript lines it has not copied before into sealed,
   indexed spans under a `cc-<session_id>` run; `context-guardian-recall`, `--verify` and the MCP tools read them like
   any other run. It tracks a byte offset per session (and recovers it from the spans themselves if a capture was cut
   off), copies only complete lines, splits a long first capture into 2 MB spans, always exits 0, logs instead of
@@ -101,7 +110,7 @@
 - Archived transcript lines are read through to the message inside them for search, roles and digests; a span whose
   user turns are all tool results takes its digest from the first message with text (`first-message`).
 
-### Earlier unreleased
+### Release process
 
 - **Releases publish from CI by trusted publishing (OIDC), not from a stored API token.** Publishing a GitHub Release
   runs `.github/workflows/release.yml`: the tag must equal `pyproject.toml`'s version (PyPI and npm are independent

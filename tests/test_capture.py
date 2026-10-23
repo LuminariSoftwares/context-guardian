@@ -180,3 +180,31 @@ def test_stats_show_the_capture(capture):
     _send(g, _conversation(2))
     cap = TestClient(g.app, base_url=LOOPBACK).get("/guardian/stats").json()["capture"]
     assert cap["mode"] == "journal" and cap["messages"] == 5 and cap["stopped"] is False
+
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX modes")
+def test_everything_the_archive_writes_is_private(capture, tmp_path, monkeypatch):
+    """0700 directories, 0600 files: the chain, the index, the journal, the
+    lock-free leftovers, the anchor and the receipts hold conversation text or
+    point at it, so nothing may be created with the umask's mode."""
+    import os
+    anchor = tmp_path / "elsewhere" / "anchor.jsonl"
+    g, _ = capture(GUARDIAN_NUM_CTX="2000", GUARDIAN_COMPACT_THRESHOLD="0.5", GUARDIAN_RESERVE_OUTPUT="100",
+                   GUARDIAN_KEEP_RECENT_MESSAGES="2", GUARDIAN_SEAL_ANCHOR_PATH=str(anchor),
+                   GUARDIAN_RECEIPTS_PATH=str(tmp_path / "rcpt" / "receipts.jsonl"))
+    old = os.umask(0o022)
+    try:
+        for turn in range(1, 6):
+            _send(g, _conversation(turn, filler=400))
+        g.flush_journal()
+    finally:
+        os.umask(old)
+    assert g._state["compactions_performed"] >= 1
+    roots = [Path(g.SPAN_DIR), anchor.parent, tmp_path / "rcpt"]
+    seen = 0
+    for root in roots:
+        for path in [root, *root.rglob("*")]:
+            mode = path.stat().st_mode & 0o777
+            assert mode == (0o700 if path.is_dir() else 0o600), (path, oct(mode))
+            seen += 1
+    assert seen >= 8

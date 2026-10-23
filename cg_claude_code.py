@@ -7,8 +7,11 @@
     context-guardian-claude-code uninstall    the reverse (--apply to edit)
     context-guardian-claude-code status       hooks installed? sessions captured, last capture, seal
 
-Claude Code talks to Anthropic's API directly, so the proxy cannot sit in front
-of it. But Claude Code runs hook commands at documented moments and hands them
+Claude Code compacts its own window and by default talks to Anthropic's API
+directly. It can be routed through the proxy (ANTHROPIC_BASE_URL, the
+/v1/messages route), but most sessions are not, and an archive should not
+depend on how the client connects. Claude Code runs hook commands at
+documented moments and hands them
 the session id and the path of the session's transcript, a JSONL file it keeps
 appending to (https://code.claude.com/docs/en/hooks,
 https://code.claude.com/docs/en/sessions). `capture` copies the transcript
@@ -86,7 +89,11 @@ def log(message: str) -> None:
     try:
         path = log_path()
         path.parent.mkdir(parents=True, exist_ok=True)
+        new_file = not path.exists()
         with open(path, "a", encoding="utf-8") as fh:
+            if new_file:
+                # It names transcript files and run ids: private, like the archive.
+                cg_archive._make_private(path, cg_archive.PRIVATE_FILE_MODE)
             fh.write("%s %s\n" % (cg_archive.now_iso(), line))
     except Exception:                                       # noqa: BLE001
         pass

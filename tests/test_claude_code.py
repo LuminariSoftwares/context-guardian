@@ -1,8 +1,8 @@
 """Phase 5 acceptance: the Claude Code adapter (`context-guardian-claude-code`).
 
-Claude Code talks to Anthropic's API directly, so the proxy cannot sit in
-front of it -- but its hooks hand a command the session id and the transcript
-path (https://code.claude.com/docs/en/hooks), and the transcript is a JSONL
+Claude Code compacts its own window and usually talks to Anthropic's API
+directly, so the archive should not depend on routing it through the proxy.
+Its hooks hand a command the session id and the transcript path (https://code.claude.com/docs/en/hooks), and the transcript is a JSONL
 file it keeps appending to (https://code.claude.com/docs/en/sessions). The
 adapter copies the NEW lines into the archive as sealed spans under a
 "cc-<session_id>" run. Driven as Claude Code drives it: a subprocess with the
@@ -95,6 +95,8 @@ def test_malformed_stdin_exits_0_with_a_log_line(env, tmp_path):
         assert "context-guardian" in res.stderr, (bad, res.stderr)
     log = tmp_path / "logs" / "claude_code_capture.log"
     assert log.exists() and len(log.read_text(encoding="utf-8").splitlines()) >= 5
+    if os.name != "nt":
+        assert (log.stat().st_mode & 0o777) == 0o600
     assert not (tmp_path / "etc").exists() and not list((tmp_path).glob("spans/cc-*"))
 
 
