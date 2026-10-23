@@ -462,7 +462,7 @@ cp .env.example .env
 | `GUARDIAN_KEEP_RECENT_FRACTION` | `0.20` | Share of the usable window kept verbatim when `GUARDIAN_KEEP_RECENT_MESSAGES` is unset |
 | `GUARDIAN_CHARS_PER_TOKEN` | `3.5` | Characters-per-token used for the estimate |
 | `GUARDIAN_COUNT_TOOLS` | `1` | Count the `tools` array against the budget. Set `0` for pre-0.2.0 messages-only behaviour |
-| `GUARDIAN_CALIBRATE` | `1` | Learn each model's real tokens-per-character from the usage figures the backend returns, and correct the estimate with it. Read per request; set `0` to use the raw estimate |
+| `GUARDIAN_CALIBRATE` | `1` | Learn each model's real tokens-per-character from the usage figures the backend returns, and correct the estimate with it, on `/v1/chat/completions` and `/v1/messages` alike (the Messages prompt total is `input_tokens` plus both cache fields; streamed, it is read from `message_start`). Read per request; set `0` to use the raw estimate |
 | `GUARDIAN_UPSTREAM_TIMEOUT` | `600` | Seconds to wait for the upstream backend to respond |
 | `GUARDIAN_UPSTREAM_CONNECT_TIMEOUT` | `10` | Seconds to wait for the upstream connection itself |
 | `GUARDIAN_SUMMARY_TIMEOUT` | `GUARDIAN_UPSTREAM_TIMEOUT` | Seconds to wait for the summarisation call specifically. It sends the largest prompt Guardian ever builds, so it inherits the long upstream read timeout; set this to give it a different ceiling. The connection itself always uses `GUARDIAN_UPSTREAM_CONNECT_TIMEOUT` |

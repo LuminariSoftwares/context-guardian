@@ -126,6 +126,18 @@ everything that existed answers as before.
   the compaction log (`summary_source`) and the receipts. The DSH engine does not have the problem: DSH replaces the
   compacted range with the checkpoint in its own session, so a region is never presented twice.
 
+### Messages calibration (follow-up)
+
+- **`/v1/messages` now calibrates.** `usage_prompt_tokens()` returned `None` for the Messages usage block, and the
+  route had no calibration tap, so its per-model estimate never corrected itself. The prompt total is now
+  `input_tokens + cache_read_input_tokens + cache_creation_input_tokens` (whichever are present: `input_tokens` alone
+  is only the uncached part), read from the body or, when streaming, from `message_start`'s `message.usage`; a
+  `message_delta` that carries only `output_tokens` is skipped rather than taken as the answer. The route has the same
+  pass-through tap as chat/completions under the same `GUARDIAN_CALIBRATE` switch, and its estimate now applies the
+  learned factor. With no compaction the response bytes are unchanged. Checked against vLLM (`AnthropicUsage`,
+  `_build_anthropic_usage`, `message_stream_converter`) and llama.cpp's server (`to_json_anthropic`,
+  `to_json_anthropic_stream`).
+
 ### Release process
 
 - **Releases publish from CI by trusted publishing (OIDC), not from a stored API token.** Publishing a GitHub Release

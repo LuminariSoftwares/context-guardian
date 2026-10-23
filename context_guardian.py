@@ -666,10 +666,31 @@ def _prompt_tokens_from(obj: Any) -> Optional[int]:
     """
     try:
         usage = obj.get("usage")
+        # A Messages-API stream reports its input usage in the FIRST event,
+        # message_start, inside the message: {"type": "message_start",
+        # "message": {"usage": {...}}}.
+        if not isinstance(usage, dict) and isinstance(obj.get("message"), dict):
+            usage = obj["message"].get("usage")
         if isinstance(usage, dict):
             n = usage.get("prompt_tokens")
             if isinstance(n, int) and not isinstance(n, bool) and n > 0:
                 return n
+            # The Messages shape. The prompt the model read is everything the
+            # three input fields count: fresh input, input read from the
+            # prompt cache, and input written to it. input_tokens alone is
+            # only the uncached part -- believing it would teach the
+            # calibrator that a cached prompt is tiny, and the estimate would
+            # shrink until compaction fired late. A usage block with no
+            # input_tokens (message_delta carries output_tokens only) is not a
+            # prompt figure at all.
+            if isinstance(usage.get("input_tokens"), int) and not isinstance(usage.get("input_tokens"), bool):
+                total = 0
+                for key in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
+                    v = usage.get(key)
+                    if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+                        total += v
+                if total > 0:
+                    return total
 
         n = obj.get("prompt_eval_count")
         if isinstance(n, int) and not isinstance(n, bool) and n > 0:
@@ -2806,6 +2827,12 @@ async def maybe_compact_anthropic(client: httpx.AsyncClient, payload: Dict[str, 
     tool_tokens = estimate_tool_tokens(payload)
     estimated = message_tokens + tool_tokens
     model = str(payload.get("model") or "")
+    # Same rule as chat/completions: the raw figure is what the response tap
+    # divides the backend's report by, the corrected one is what is compared
+    # with the budget.
+    _state["last_raw_estimate"] = estimated
+    if calibration_enabled():
+        estimated = int(estimated * CALIBRATOR.factor(model))
     num_ctx = await context_window(client, model)
     threshold_tokens = effective_threshold(num_ctx=num_ctx)
     _state["last_known_total_tokens"] = estimated
@@ -2933,8 +2960,9 @@ async def proxy(path: str, request: Request):
                                   + estimate_tool_tokens(payload))
 
     elif path == "messages" and request.method == "POST" and body_bytes:
-        # Anthropic Messages API: same fail-open contract. The response is
-        # never touched (no calibration tap), so with no compaction the
+        # Anthropic Messages API: same fail-open contract. The response goes
+        # through the same pass-through calibration tap as chat/completions,
+        # which copies bytes and never alters them, so with no compaction the
         # stream is byte-identical both ways.
         try:
             payload = json.loads(body_bytes)
@@ -2943,6 +2971,15 @@ async def proxy(path: str, request: Request):
                 rewritten = await maybe_compact_anthropic(client, payload, headers)
                 if rewritten is not payload:
                     body_bytes = json.dumps(rewritten).encode("utf-8")
+                # The calibration tap, as on chat/completions: before 0.12.0
+                # this route had none, so its estimate never learned from the
+                # usage the backend reports. The raw size of what is actually
+                # forwarded, compacted or not.
+                if calibration_enabled() and isinstance(rewritten.get("messages"), list):
+                    calib_model = str(rewritten.get("model") or "")
+                    calib_estimate = (estimate_tokens(rewritten["messages"])
+                                      + int(len(_anthropic_text(rewritten.get("system"))) / CHARS_PER_TOKEN_ESTIMATE)
+                                      + estimate_tool_tokens(rewritten))
         except Exception as exc:                           # noqa: BLE001
             log.error("Rewriting the /v1/messages request failed (%s: %s). "
                       "Forwarding it unchanged.", type(exc).__name__, exc)
