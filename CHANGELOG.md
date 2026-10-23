@@ -44,6 +44,27 @@
   paths, no text and no run ids. A corrupt receipts line is skipped.
 - `/guardian/stats` gains a `receipts` block and `/guardian/health` a receipts line with this run's seal head.
 
+### Skim, then open
+
+- **A digest line per span in `<run>/index.jsonl`**: the first sentence of the summary Guardian already made (no
+  extra model call), the top eight keywords, message count and size. **`GUARDIAN_INDEX=0`** writes none.
+  **`context-guardian-recall --reindex`** builds it for archives written before it existed (digest from the stored
+  summary, or the first user message's opening, labelled `first-user-message`), and produces exactly what live
+  indexing writes. The DSH engine writes the same lines.
+- **MCP `list_digests`: skim the archive in a few hundred tokens.** Newest first, one line per span, hard-capped by
+  `max_tokens` (default 400) measured with the proxy's own estimator on the finished text, ending with an
+  `N more spans` line.
+- **MCP `search_spans` ranks its hits**: the whole phrase first, then by how many of the query's words a message
+  carries, then the newer span first. A single term matches exactly as before.
+- **MCP `read_span` opens a message range** (`start`, `end`) and returns each message's content exactly as archived:
+  a plain text message verbatim, anything else as its JSON. A read past the 20,000-character cap ends with the
+  `start=`/`end=` that reads the rest.
+- **MCP `get_seal_status`** runs the archive verifier from inside the client.
+- **The compaction summary's archive pointer names the tools** (`list_digests`, `search_spans`, `read_span`), so a
+  model with the MCP server connected knows the archive is reachable.
+- `tools/list` grows from ~1,086 to ~1,591 estimated tokens for the two new tools and two parameters (each tool's
+  fixed structure costs ~150 before its description); the CI ceiling moves from 1,100 to 1,600.
+
 ### Earlier unreleased
 
 - **Releases publish from CI by trusted publishing (OIDC), not from a stored API token.** Publishing a GitHub Release

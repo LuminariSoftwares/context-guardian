@@ -10,6 +10,12 @@ token estimate the proxy itself uses.
 get_proxy_status took it to about 2,116, nearly five times the payload on every
 request, to describe four read-only tools. The budget below is the ceiling;
 descriptions are not allowed to grow into it to raise a directory score.
+
+0.12.0 raised it once, for capability rather than prose: list_digests (skim)
+and get_seal_status (verify) are two new tools, and read_span gained start/end.
+Measured ~1,086 -> ~1,591. A tool's fixed structure (title, four annotation
+hints, schema) costs ~150 tokens before its description says a word, which is
+why the descriptions were cut to the bone first and the ceiling moved second.
 """
 import json
 import subprocess
@@ -19,7 +25,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 #: Hard ceiling on the serialised tools array, in estimated tokens.
-BUDGET = 1100
+BUDGET = 1600
 CHARS_PER_TOKEN = 3.5
 PROTOCOL_VERSION = "2025-06-18"
 
@@ -63,7 +69,8 @@ def test_the_budget_covers_the_whole_surface():
     """A budget that measured only some of the tools would not be a budget."""
     tools = tools_over_stdio()
     assert sorted(t["name"] for t in tools) == [
-        "get_proxy_status", "list_spans", "read_span", "search_spans"]
+        "get_proxy_status", "get_seal_status", "list_digests", "list_spans", "read_span",
+        "search_spans"]
 
 
 def test_the_console_script_entry_point_measures_the_same():

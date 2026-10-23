@@ -105,6 +105,31 @@ it, append, and delete it. A lock file older than 30 seconds is treated as left 
 that cannot get the lock within 2 seconds skips the seal and logs a warning; the archived file is still written and
 will verify as **unsealed**.
 
+## index.jsonl
+
+One JSON object per line, one line per span, appended when the span is written; not sealed and not fsynced, because
+`context-guardian-recall --reindex` rebuilds it from the span files. Each line is a pure function of the span file's
+parsed content, so a rebuild produces exactly what live indexing wrote, and the DSH engine computes the same lines.
+
+| field | type | meaning |
+|---|---|---|
+| `span` | string | the file name without `.json`, e.g. `0003` |
+| `ts` | string | the span's `at` field verbatim (`""` if absent) |
+| `messages` | integer | number of messages in the span |
+| `chars` | integer | Unicode code points of the span's *plain text*: each message's string `content`, or the `text` of its text blocks, joined with `\n` (tool-call JSON is not counted) |
+| `est_tokens` | integer | `floor(chars / 3.5)` |
+| `digest` | string | the first sentence of `summary` (or, when the span has no summary, of the first user message with text), at most 160 code points; longer ones are cut to 157 plus `...` |
+| `digest_from` | string | `summary` or `first-user-message` |
+| `terms` | array of strings | up to 8 keywords |
+
+**First sentence:** collapse every run of whitespace (Python's `str.split()` set) to one space, then take the
+shortest prefix that ends in `.`, `!` or `?` and is followed by a space or the end; if there is none, the whole
+collapsed text.
+
+**Keywords:** lowercase the first 50,000 code points of the plain text; take every non-overlapping match of
+`[a-z0-9_]{3,40}`, left to right; drop all-digit words and the stopwords listed in `cg_archive.STOPWORDS` (the same
+list is in `cg_seal.js`); count; sort by count descending, then word ascending; keep the first 8.
+
 ## Verifying a run
 
 A run with archive content and no `chain.jsonl` is **unsealed** (written before 0.12.0, or with `GUARDIAN_SEAL=0`).

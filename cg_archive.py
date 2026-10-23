@@ -31,9 +31,11 @@ Python 3.10+, Windows and POSIX. MIT licensed.
 """
 from __future__ import annotations
 
+import collections
 import datetime
 import hashlib
 import json
+import math
 import os
 import re
 import threading
@@ -279,7 +281,7 @@ def _last_entry(chain_path: Path) -> Optional[Dict[str, Any]]:
     return last
 
 
-def _append_line(path: Path, data: bytes) -> None:
+def _append_line(path: Path, data: bytes, durable: bool = True) -> None:
     new_file = not path.exists()
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0),
                  PRIVATE_FILE_MODE)
@@ -287,7 +289,8 @@ def _append_line(path: Path, data: bytes) -> None:
         if new_file:
             _make_private(path, PRIVATE_FILE_MODE)
         os.write(fd, data)
-        os.fsync(fd)
+        if durable:
+            os.fsync(fd)
     finally:
         os.close(fd)
 
@@ -909,3 +912,218 @@ def format_receipts(s: Dict[str, Any], window: str, share: bool = False) -> str:
         % s["recall_calls_seen_by_proxy"],
         "  seal         %s" % _seal_line(s.get("seal")),
     ])
+
+
+# --- the skim index ----------------------------------------------------------------
+#
+# A model should be able to skim the whole archive in a few hundred tokens and
+# open only what it needs. Reading spans to find out what is in them costs
+# exactly what compaction saved -- a span is, by construction, bigger than the
+# room it freed. So every span write appends one digest line to
+# <run>/index.jsonl: the first sentence of the summary Guardian already made
+# (no extra model call), the top keywords, and the sizes.
+#
+# The line is a pure function of the span file's content, so --reindex rebuilds
+# exactly what live indexing wrote, and the DSH engine (cg_seal.js) computes the
+# same lines with the same rules. Not sealed: anything in it can be rebuilt
+# from the sealed spans.
+
+INDEX_FILE = "index.jsonl"
+CHARS_PER_TOKEN = 3.5
+DIGEST_MAX_CHARS = 160
+INDEX_TERMS = 8
+# Keywords come from the first this-many characters of a span. The digest is a
+# skim, not a concordance, and scanning a 400 KB tool-heavy span word by word
+# put milliseconds on every compaction for terms the first 50,000 characters
+# already show. The DSH engine applies the same cap.
+TERMS_SCAN_CHARS = 50_000
+_WORD_RE = re.compile(r"[a-z0-9_]{3,40}")
+_SENTENCE_RE = re.compile(r"^(.+?[.!?])(?: |$)")
+# Common English and conversational filler. Frequency over what is left is a
+# crude keyword score, and crude is the point: it is deterministic, free, and
+# the same in Python and JavaScript.
+STOPWORDS = frozenset("""
+about above after again against all also and any are aren because been before being below between both but can
+cannot could did didn does doesn doing don done down during each even every few for from further get going got
+had has have having her here hers him his how into isn its itself just know let lets like look looks made make
+many may more most much must need never new not now off okay once one ones only other our ours out over own
+per please same see she should since some still such sure than that the their theirs them then there these
+they thing things think this those though through too two under until upon use used using very via want was
+wasn way well were weren what when where which while who whom why will with within without won would yes yet
+you your yours yourself
+""".split())
+
+
+def est_tokens(text: str) -> int:
+    """The estimate every cap in the recall tools is measured with:
+    ceil(characters / 3.5), the proxy's own characters-per-token."""
+    return math.ceil(len(text) / CHARS_PER_TOKEN)
+
+
+def message_text(m: Any) -> str:
+    """Everything searchable in one archived message, as one string."""
+    if not isinstance(m, dict):
+        return str(m)
+    parts = []
+    content = m.get("content")
+    if isinstance(content, str):
+        parts.append(content)
+    elif isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+            else:
+                parts.append(json.dumps(block, ensure_ascii=False))
+    for key in ("tool_calls", "function_call"):
+        if m.get(key):
+            parts.append(json.dumps(m[key], ensure_ascii=False))
+    return "\n".join(parts)
+
+
+def plain_text(m: Any) -> str:
+    """A message's prose only: string content, or the text of its text blocks.
+    What the index sizes and keywords are computed over -- tool-call JSON is
+    serialised differently by every language, and the index must come out the
+    same from the proxy and from the engine."""
+    if not isinstance(m, dict):
+        return ""
+    content = m.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(b["text"] for b in content
+                         if isinstance(b, dict) and isinstance(b.get("text"), str))
+    return ""
+
+
+def first_sentence(text: str, limit: int = DIGEST_MAX_CHARS) -> str:
+    """The first sentence, whitespace collapsed, at most `limit` characters."""
+    flat = " ".join(str(text).split())
+    m = _SENTENCE_RE.match(flat)
+    out = m.group(1) if m else flat
+    return out if len(out) <= limit else out[:limit - 3] + "..."
+
+
+def top_terms(text: str, n: int = INDEX_TERMS) -> List[str]:
+    # Counter, not a dict loop: counting runs in C, and on a 100 KB span the
+    # loop was the single largest cost of a compaction (13 ms of a 22 ms
+    # write_span in scripts/bench_proxy.py). Stopwords are dropped after
+    # counting, which touches each distinct word once instead of every word.
+    counts = collections.Counter(_WORD_RE.findall(text[:TERMS_SCAN_CHARS].lower()))
+    ranked = sorted(((-c, w) for w, c in counts.items()
+                     if w not in STOPWORDS and not w.isdigit()))
+    return [w for _, w in ranked[:n]]
+
+
+def index_entry(span: Dict[str, Any], name: str) -> Dict[str, Any]:
+    """The index line for one span file's parsed content."""
+    messages = span.get("messages") if isinstance(span.get("messages"), list) else []
+    text = "\n".join(plain_text(m) for m in messages)
+    chars = len(text)
+    summary = span.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        digest, source = first_sentence(summary), "summary"
+    else:
+        first_user = next((plain_text(m) for m in messages
+                           if isinstance(m, dict) and m.get("role") == "user" and plain_text(m).strip()), "")
+        digest, source = first_sentence(first_user), "first-user-message"
+    at = span.get("at")
+    return {"span": name[:-len(".json")] if name.endswith(".json") else name,
+            "ts": at if isinstance(at, str) else "",
+            "messages": len(messages), "chars": chars, "est_tokens": int(chars / CHARS_PER_TOKEN),
+            "digest": digest, "digest_from": source, "terms": top_terms(text)}
+
+
+def index_line(entry: Dict[str, Any]) -> bytes:
+    return (json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def append_index(run_dir: Path, entry: Dict[str, Any]) -> None:
+    """Append one digest line under the run's lock. Raises on failure; the
+    proxy's caller logs and carries on."""
+    # Not fsynced: the index is rebuildable from the spans, and a line lost to
+    # a power cut costs a skim, while an fsync costs every compaction.
+    with ChainLock(run_dir):
+        _append_line(Path(run_dir) / INDEX_FILE, index_line(entry), durable=False)
+
+
+def read_index(run_dir: Path) -> List[Dict[str, Any]]:
+    """The run's index lines; a line that does not parse is skipped."""
+    out = []
+    try:
+        fh = open(Path(run_dir) / INDEX_FILE, "rb")
+    except OSError:
+        return out
+    with fh:
+        for raw in fh:
+            try:
+                obj = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if isinstance(obj, dict) and isinstance(obj.get("span"), str):
+                out.append(obj)
+    return out
+
+
+def load_span(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def reindex(span_dir: Path, run: Optional[str] = None) -> Dict[str, int]:
+    """Rebuild index.jsonl from the span files on disk, for archives written
+    before the index existed. Replaces the file atomically."""
+    out = {}
+    targets = [Path(span_dir) / run] if run else run_dirs(span_dir)
+    for d in targets:
+        names = [n for n in archived_files(d) if SPAN_NAME_RE.match(n)]
+        if not names:
+            continue
+        lines = []
+        for name in names:
+            span = load_span(d / name)
+            if span is not None:
+                lines.append(index_line(index_entry(span, name)))
+        with ChainLock(d):
+            atomic_write_bytes(d / INDEX_FILE, b"".join(lines))
+        out[d.name] = len(lines)
+    return out
+
+
+def digests(span_dir: Path, run: Optional[str] = None) -> List[Tuple[float, str, Dict[str, Any]]]:
+    """(mtime, run, index entry) for every span still on disk, newest first.
+    A span with no index line (written before the index) is indexed on the
+    fly, without writing anything."""
+    out = []
+    targets = [Path(span_dir) / run] if run else run_dirs(span_dir)
+    for d in targets:
+        if not d.is_dir():
+            continue
+        names = {n for n in archived_files(d) if SPAN_NAME_RE.match(n)}
+        indexed = {}
+        for e in read_index(d):
+            indexed[e["span"] + ".json"] = e
+        for name in names:
+            entry = indexed.get(name)
+            if entry is None:
+                span = load_span(d / name)
+                if span is None:
+                    continue
+                entry = index_entry(span, name)
+            try:
+                mtime = (d / name).stat().st_mtime
+            except OSError:
+                continue
+            out.append((mtime, d.name, entry))
+    out.sort(key=lambda t: (t[0], t[1], t[2]["span"]), reverse=True)
+    return out
+
+
+def digest_line(run: str, e: Dict[str, Any]) -> str:
+    terms = e.get("terms") if isinstance(e.get("terms"), list) else []
+    ts = str(e.get("ts") or "")[:16]
+    return "%s/%s %s ~%st: %s%s" % (run, e.get("span"), ts, e.get("est_tokens", "?"), e.get("digest", ""),
+                                   " [%s]" % ", ".join(str(t) for t in terms[:4]) if terms else "")

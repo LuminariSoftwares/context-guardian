@@ -4,6 +4,7 @@
     context-guardian-recall <term> [--run RUN_ID]
     context-guardian-recall --verify [--run RUN_ID | --all] [--heads] [--seal-existing]
     context-guardian-recall --receipts [--since 7d] [--share]
+    context-guardian-recall --reindex [--run RUN_ID]
 
 A compaction folds older messages into a summary and archives the full text as
 <GUARDIAN_SPAN_DIR>/<run_id>/<NNNN>.json. The summary the model receives names
@@ -24,7 +25,8 @@ backfilled. GUARDIAN_SEAL_ANCHOR_PATH, when that file exists, is checked too.
 --receipts adds up the counts-only receipts every recall path writes (see
 cg_archive.py): archive size, recall calls, spans opened, the share of the
 archive read back, tokens saved, seal status. --share prints the same as a
-short block with no paths, no text and no run ids.
+short block with no paths, no text and no run ids. --reindex rebuilds the
+skim index (index.jsonl) for spans written before it existed.
 Stdlib only, Python 3.10+. MIT.
 """
 from __future__ import annotations
@@ -61,24 +63,8 @@ def span_dir() -> Path:
                                str(data / cg_paths.SPANS_SUBDIR)))
 
 
-def message_text(m) -> str:
-    """Everything searchable in one archived message, as one string."""
-    if not isinstance(m, dict):
-        return str(m)
-    parts = []
-    content = m.get("content")
-    if isinstance(content, str):
-        parts.append(content)
-    elif isinstance(content, list):
-        for block in content:
-            if isinstance(block, dict) and isinstance(block.get("text"), str):
-                parts.append(block["text"])
-            else:
-                parts.append(json.dumps(block, ensure_ascii=False))
-    for key in ("tool_calls", "function_call"):
-        if m.get(key):
-            parts.append(json.dumps(m[key], ensure_ascii=False))
-    return "\n".join(parts)
+# One definition, shared with the index and the MCP server (cg_archive.py).
+message_text = cg_archive.message_text
 
 
 def snippet(text: str, at: int, length: int) -> str:
@@ -111,6 +97,46 @@ def search(root: Path, term: str, run_id: str | None = None):
             at = summary.lower().find(needle)
             if at >= 0:
                 yield path, "summary", "summary", snippet(summary, at, len(term))
+
+
+def ranked_search(root: Path, query: str, run: str | None = None):
+    """Hits for a query of one or more words, best first: messages carrying the
+    whole phrase, then by how many distinct words they carry, then the newer
+    span first. Each word matches as a case-insensitive substring, as the
+    single-term search always has. Yields (path, index or 'summary', role,
+    snippet, hits)."""
+    words = list(dict.fromkeys(query.lower().split()))
+    phrase = " ".join(query.lower().split())
+    if not words:
+        return []
+    pattern = f"{run}/*.json" if run else "*/*.json"
+    found = []
+    for path in root.glob(pattern):
+        if not cg_archive.SPAN_NAME_RE.match(path.name):
+            continue
+        data = cg_archive.load_span(path)
+        if data is None:
+            continue
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        texts = [(i, m.get("role", "?") if isinstance(m, dict) else "?", message_text(m))
+                 for i, m in enumerate(data.get("messages") or [])]
+        if isinstance(data.get("summary"), str):
+            texts.append(("summary", "summary", data["summary"]))
+        for idx, role, text in texts:
+            low = text.lower()
+            hits = sum(1 for w in words if w in low)
+            if not hits:
+                continue
+            whole = phrase in low
+            first = low.find(phrase) if whole else min(low.find(w) for w in words if w in low)
+            length = len(phrase) if whole else next(len(w) for w in words if low.find(w) == first)
+            rank = (whole, hits, mtime, str(path), -(idx if isinstance(idx, int) else 1 << 30))
+            found.append((rank, path, idx, role, snippet(text, first, length), hits))
+    found.sort(key=lambda t: t[0], reverse=True)
+    return [(path, idx, role, snip, hits) for _, path, idx, role, snip, hits in found]
 
 
 def anchor_path():
@@ -189,6 +215,8 @@ def main(argv=None) -> int:
                        help="with --verify: print each run's chain head")
     group.add_argument("--seal-existing", action="store_true",
                        help="with --verify: seal files written before sealing existed (marked backfilled)")
+    group.add_argument("--reindex", action="store_true",
+                       help="rebuild each run's index.jsonl (the skim digests) from its span files")
     group = parser.add_argument_group("receipts")
     group.add_argument("--receipts", action="store_true",
                        help="summarise the counts-only recall receipts")
@@ -201,6 +229,13 @@ def main(argv=None) -> int:
     root = span_dir()
     if ns.receipts or ns.share:
         return cmd_receipts(ns, root)
+    if ns.reindex:
+        if not root.is_dir():
+            print(f"no span archive at {root} (set GUARDIAN_SPAN_DIR)", file=sys.stderr)
+            return 2
+        for run, count in cg_archive.reindex(root, ns.run).items():
+            print(f"{run}  indexed {count} span(s)")
+        return 0
     if ns.verify or ns.heads or ns.seal_existing:
         return cmd_verify(ns, root)
     if not ns.term:

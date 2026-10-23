@@ -57,3 +57,21 @@ def test_tampering_with_a_js_span_is_caught(tmp_path, monkeypatch, capsys):
     code = cg_recall_cli.main(["--verify", "--all"])
     out = capsys.readouterr().out
     assert code != 0 and "content-changed" in out and "0003.json" in out, out
+
+
+def test_js_live_index_equals_python_reindex(tmp_path, monkeypatch, capsys):
+    """Phase 3: the engine writes index.jsonl with the same algorithm, so a
+    Python --reindex of its spans reproduces its live lines exactly."""
+    spans = tmp_path / "spans"
+    _write(spans)
+    run = spans / "dsh-20261023120000-1"
+    live = (run / "index.jsonl").read_text(encoding="utf-8").splitlines()
+    (run / "index.jsonl").unlink()
+    monkeypatch.setenv("GUARDIAN_SPAN_DIR", str(spans))
+    assert cg_recall_cli.main(["--reindex"]) == 0
+    capsys.readouterr()
+    rebuilt = (run / "index.jsonl").read_text(encoding="utf-8").splitlines()
+    # The live index also holds the line for the span retention pruned; a
+    # rebuild can only index what is still on disk.
+    live = [ln for ln in live if json.loads(ln)["span"] != "0001"]
+    assert [json.loads(ln) for ln in rebuilt] == [json.loads(ln) for ln in live]

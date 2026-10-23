@@ -154,7 +154,7 @@ export function appendEntry (runDir, runId, fields, anchorPath) {
  * so the index is free again); a seal that fails only warns, and `sealed` is false.
  *   -> { path, index, sealed, entry }
  */
-export function writeSealedSpan ({ spanDir, runId, startIndex, payload, anchorPath = '', seal = true, warn = () => {}, afterSeal = null }) {
+export function writeSealedSpan ({ spanDir, runId, startIndex, payload, anchorPath = '', seal = true, index: indexOn = true, warn = () => {} }) {
   const dir = join(spanDir, runId)
   privateMkdir(dir)
   let path = null; let index = startIndex
@@ -169,8 +169,10 @@ export function writeSealedSpan ({ spanDir, runId, startIndex, payload, anchorPa
   }
   if (path === null) throw new Error(`no free span index near ${startIndex} after ${MAX_PROBE} attempts`)
   const tmp = join(dir, `.${basename(path)}.${process.pid}.tmp`)
+  let body
   try {
-    const text = JSON.stringify(payload(index), null, 1)
+    body = payload(index)
+    const text = JSON.stringify(body, null, 1)
     const fd = openSync(tmp, 'wx', FILE_MODE)
     try { writeSync(fd, text); fsyncSync(fd) } finally { closeSync(fd) }
     renameSync(tmp, path)
@@ -180,18 +182,21 @@ export function writeSealedSpan ({ spanDir, runId, startIndex, payload, anchorPa
     for (const leftover of [tmp, path]) { try { unlinkSync(leftover) } catch { /* not there */ } }
     throw error
   }
-  if (!seal) return { path, index, sealed: false, entry: null }
-  try {
-    const entry = withChainLock(dir, () => {
-      const sealed = appendEntryLocked(dir, runId, { type: 'span', file: basename(path), sha256: sha256File(path) }, anchorPath)
-      if (typeof afterSeal === 'function') afterSeal(dir, index)
-      return sealed
-    })
-    return { path, index, sealed: true, entry }
-  } catch (error) {
-    warn(`context-guardian engine: could not seal ${basename(path)} (${error.message}); the span is written, --verify will report it unsealed`)
-    return { path, index, sealed: false, entry: null }
+  let entry = null
+  if (seal) {
+    try {
+      entry = appendEntry(dir, runId, { type: 'span', file: basename(path), sha256: sha256File(path) }, anchorPath)
+    } catch (error) {
+      warn(`context-guardian engine: could not seal ${basename(path)} (${error.message}); the span is written, --verify will report it unsealed`)
+    }
   }
+  if (indexOn) {
+    // A pure function of what was just written, so the JSON round trip makes it equal to a --reindex of the file.
+    try { appendIndex(dir, indexEntry(JSON.parse(JSON.stringify(body)), basename(path))) } catch (error) {
+      warn(`context-guardian engine: could not index ${basename(path)} (${error.message}); context-guardian-recall --reindex rebuilds it`)
+    }
+  }
+  return { path, index, sealed: entry !== null, entry }
 }
 
 /**
@@ -221,4 +226,62 @@ export function pruneSealed ({ spanDir, keepSpans, anchorPath = '', warn = () =>
       unlinkSync(doomed)
     }
   } catch { /* housekeeping only */ }
+}
+
+// ── the skim index (cg_archive.py `index_entry`, same rules, same output) ──
+// One digest line per span in <run>/index.jsonl: the first sentence of the summary, the top keywords, the sizes. A
+// pure function of the span's content, so `context-guardian-recall --reindex` rebuilds exactly what this wrote
+// (tests/test_seal_js.py). STOPWORDS must stay equal to cg_archive.STOPWORDS; tests/test_skim.py compares them.
+export const INDEX_FILE = 'index.jsonl'
+const DIGEST_MAX_CHARS = 160
+const INDEX_TERMS = 8
+const TERMS_SCAN_CHARS = 50000 // cg_archive.TERMS_SCAN_CHARS, in code points
+export const STOPWORDS = new Set(('about above after again against all also and any are aren because been before being below between both but can cannot could did didn does doesn doing don done down during each even every few for from further get going got had has have having her here hers him his how into isn its itself just know let lets like look looks made make many may more most much must need never new not now off okay once one ones only other our ours out over own per please same see she should since some still such sure than that the their theirs them then there these they thing things think this those though through too two under until upon use used using very via want was wasn way well were weren what when where which while who whom why will with within without won would yes yet you your yours yourself').split(' '))
+// Python's str.split() whitespace, so the digest collapses exactly the same characters.
+const PY_SPACE = /[\t\n\x0b\x0c\r\x1c-\x1f \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+/u
+const codePoints = (text) => Array.from(text)
+
+/** A message's prose only: string content, or the text of its text blocks. */
+export function plainText (m) {
+  if (!m || typeof m !== 'object') return ''
+  if (typeof m.content === 'string') return m.content
+  if (Array.isArray(m.content)) return m.content.filter(b => b && typeof b === 'object' && typeof b.text === 'string').map(b => b.text).join('\n')
+  return ''
+}
+
+export function firstSentence (text, limit = DIGEST_MAX_CHARS) {
+  const flat = String(text).split(PY_SPACE).filter(Boolean).join(' ')
+  const m = flat.match(/^(.+?[.!?])(?: |$)/u)
+  const out = codePoints(m ? m[1] : flat)
+  return out.length <= limit ? out.join('') : out.slice(0, limit - 3).join('') + '...'
+}
+
+export function topTerms (text, n = INDEX_TERMS) {
+  const counts = new Map()
+  const scanned = text.length <= TERMS_SCAN_CHARS ? text : codePoints(text).slice(0, TERMS_SCAN_CHARS).join('')
+  for (const [word] of scanned.toLowerCase().matchAll(/[a-z0-9_]{3,40}/g)) {
+    if (STOPWORDS.has(word) || /^[0-9]+$/.test(word)) continue
+    counts.set(word, (counts.get(word) ?? 0) + 1)
+  }
+  return [...counts.entries()].sort((a, b) => (b[1] - a[1]) || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)).slice(0, n).map(([word]) => word)
+}
+
+export function indexEntry (span, name) {
+  const messages = Array.isArray(span?.messages) ? span.messages : []
+  const text = messages.map(plainText).join('\n')
+  const chars = codePoints(text).length
+  let digest; let source
+  if (typeof span?.summary === 'string' && span.summary.trim() !== '') { digest = firstSentence(span.summary); source = 'summary' } else {
+    const first = messages.find(m => m && m.role === 'user' && plainText(m).trim() !== '')
+    digest = firstSentence(first ? plainText(first) : ''); source = 'first-user-message'
+  }
+  return {
+    span: name.endsWith('.json') ? name.slice(0, -5) : name, ts: typeof span?.at === 'string' ? span.at : '',
+    messages: messages.length, chars, est_tokens: Math.floor(chars / 3.5), digest, digest_from: source, terms: topTerms(text),
+  }
+}
+
+/** Append one index line under the run's lock. Throws on failure; callers warn and carry on. */
+export function appendIndex (runDir, entry) {
+  withChainLock(runDir, () => appendLine(join(runDir, INDEX_FILE), JSON.stringify(entry) + '\n'))
 }

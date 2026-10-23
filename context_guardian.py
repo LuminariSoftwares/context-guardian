@@ -300,6 +300,12 @@ SEAL = os.environ.get("GUARDIAN_SEAL", "1").strip().lower() not in ("0", "false"
 # storage, another disk) and every new head is appended there too; --verify
 # then checks the chain against it.
 SEAL_ANCHOR_PATH = os.environ.get("GUARDIAN_SEAL_ANCHOR_PATH", "").strip() or None
+# INDEX: one digest line per span in <run>/index.jsonl -- the first sentence of
+# the summary already made here, top keywords, sizes -- so a model can skim the
+# whole archive in a few hundred tokens (MCP list_digests) instead of opening
+# spans to find out what is in them. No extra model call. GUARDIAN_INDEX=0
+# writes none; list_digests then indexes on the fly, and --reindex rebuilds it.
+INDEX = os.environ.get("GUARDIAN_INDEX", "1").strip().lower() not in ("0", "false", "no", "off")
 # RECEIPTS: counts-only evidence of what the archive is worth -- characters
 # archived, compactions whose summary points at the archive, and recall tool
 # calls the model actually made, seen in the tool_calls of later requests.
@@ -309,6 +315,8 @@ SEAL_ANCHOR_PATH = os.environ.get("GUARDIAN_SEAL_ANCHOR_PATH", "").strip() or No
 # The recall tools as the model sees them. MCP clients prefix a server's tools
 # (`mcp__context-guardian__search_spans` in Claude Code), so a call is matched
 # on its last name segment; a shell call is matched on the command it runs.
+RECEIPTS_PATH = Path(os.environ.get("GUARDIAN_RECEIPTS_PATH", "").strip()
+                     or DATA_DIR / cg_paths.RECEIPTS_SUBPATH)
 RECALL_TOOL_NAMES = ("search_spans", "read_span", "list_spans", "list_digests",
                      "get_seal_status")
 RECALL_COMMAND = "context-guardian-recall"
@@ -1300,6 +1308,7 @@ def write_span(messages: List[Dict[str, Any]], summary: str,
         cg_archive.fsync_dir(d)
         written, path = path, None
         seal_file(written)
+        index_span(written, payload)
         prune_spans()
         return str(written)
     except Exception as exc:                               # noqa: BLE001
@@ -1345,6 +1354,20 @@ def seal_file(path: Path, kind: str = "span") -> Optional[Dict[str, Any]]:
         return None
 
 
+def index_span(path: Path, payload: Dict[str, Any]) -> None:
+    """Append the span's digest line to its run's index.jsonl. Never raises:
+    the index can always be rebuilt from the spans (--reindex), so losing a
+    line costs a skim, never a request."""
+    if not INDEX:
+        return
+    try:
+        cg_archive.append_index(Path(path).parent, cg_archive.index_entry(payload, Path(path).name))
+    except Exception as exc:                               # noqa: BLE001
+        log.warning("could not index %s (%s: %s); the span is written. "
+                    "context-guardian-recall --reindex rebuilds the index.",
+                    Path(path).name, type(exc).__name__, exc)
+
+
 def note_compaction_receipt(archived: List[Dict[str, Any]], pointer: str,
                             tokens_saved: int) -> None:
     """Count one applied compaction for the receipts. Never raises."""
@@ -1353,7 +1376,7 @@ def note_compaction_receipt(archived: List[Dict[str, Any]], pointer: str,
         _receipts["chars_archived"] += chars
         if pointer:
             _receipts["compactions_with_pointer"] += 1
-        cg_archive.record_receipt("proxy.compaction", chars_archived=chars,
+        cg_archive.record_receipt("proxy.compaction", path=RECEIPTS_PATH, chars_archived=chars,
                                   pointer=bool(pointer), tokens_saved=int(tokens_saved))
     except Exception as exc:                               # noqa: BLE001
         log.debug("receipt not recorded, request unaffected: %s", exc)
@@ -1401,7 +1424,7 @@ def note_recall_calls(messages: Any) -> int:
             new += 1
         if new:
             _receipts["recall_calls_seen"] += new
-            cg_archive.record_receipt("proxy.recall_seen", calls=new)
+            cg_archive.record_receipt("proxy.recall_seen", path=RECEIPTS_PATH, calls=new)
         return new
     except Exception as exc:                               # noqa: BLE001
         log.debug("recall receipt not recorded, request unaffected: %s", exc)
@@ -1762,7 +1785,9 @@ def _span_pointer(to_summarize: List[Dict[str, Any]], span_path: Optional[str]) 
             f"was freed -- do not read them whole. Search instead: "
             f"`context-guardian-recall \"<term>\" --run {RUN_ID}` "
             f"(from a source checkout: `python {RECALL_SCRIPT} "
-            f"\"<term>\" --run {RUN_ID}`).]")
+            f"\"<term>\" --run {RUN_ID}`). With the context-guardian MCP "
+            f"server: list_digests to skim, search_spans to find, read_span "
+            f"to open a message range.]")
 
 
 def _summary_message(to_summarize: List[Dict[str, Any]], summary: str,

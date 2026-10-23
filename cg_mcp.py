@@ -7,11 +7,13 @@ Lets any MCP client (Claude Desktop, Claude Code, Cursor, ...) look at what the
 proxy has done, without curl or a terminal:
 
     get_proxy_status  the running proxy's /guardian/stats (loopback HTTP)
+    list_digests      skim: one digest line per span, newest first, token-capped
     list_spans        the runs in the span archive, or the spans in one run
-    search_spans      find text in the spans compaction archived
-    read_span         one archived span: its summary and original messages
+    search_spans      find words in the spans compaction archived, best hits first
+    read_span         one archived span, or a range of its messages
+    get_seal_status   verify the sealed archive (cg_archive.verify)
 
-All four only read. `guardian_status` (the 0.10.0 name of get_proxy_status)
+All six only read. `guardian_status` (the 0.10.0 name of get_proxy_status)
 is still accepted by tools/call but no longer listed. Nothing here changes the proxy, its settings or the
 archive. Protocol: newline-delimited JSON-RPC 2.0 on stdin/stdout, as the MCP
 stdio transport specifies; logs go to stderr only. Stdlib only, Python 3.10+.
@@ -43,6 +45,9 @@ LIST_SUMMARY_CHARS = 100
 # A span is larger than the window had room for, by construction; one read
 # must not hand the whole thing back to the client's model.
 READ_SPAN_MAX_CHARS = 20_000
+DEFAULT_SKIM_TOKENS = 400
+MIN_SKIM_TOKENS = 40
+MAX_SKIM_TOKENS = 4000
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
@@ -121,6 +126,26 @@ TOOLS = [
         "annotations": _annotations("Proxy status", open_world=True),
     },
     {
+        "name": "list_digests",
+        "title": "Skim the archive",
+        "description": (
+            "Skim the archive: a line per span, newest first, within max_tokens. Use search_spans "
+            "for words, read_span to open. Local files, no network. Returns `<run>/<NNNN> <time> "
+            "~<n>t: <digest>` lines."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run": _run_param("Omit for every run."),
+                "max": _max_param(MAX_LIST_ENTRIES, DEFAULT_LIST_ENTRIES, 10),
+                "max_tokens": {"type": "integer", "minimum": MIN_SKIM_TOKENS, "maximum": MAX_SKIM_TOKENS,
+                               "default": DEFAULT_SKIM_TOKENS, "examples": [400],
+                               "description": "Token cap, e.g. 400."},
+            },
+            "additionalProperties": False,
+        },
+        "annotations": _annotations("Skim the archive", open_world=False),
+    },
+    {
         "name": "list_spans",
         "title": "List archived spans",
         "description": (
@@ -141,9 +166,9 @@ TOOLS = [
         "name": "search_spans",
         "title": "Search archived spans",
         "description": (
-            "Find a phrase in the conversation compaction archived. Use list_spans to "
-            "browse, read_span to open a hit's span. Local files, no network. Returns "
-            "`<run>/<NNNN>.json msg <i> [<role>]: <snippet>` per hit. " + ARCHIVED_DATA_NOTE),
+            "Find words in archived conversation, best match first. Use list_spans to browse, "
+            "read_span to open a hit. Local files, no network. Returns `<run>/<NNNN>.json msg <i> "
+            "[<role>]: <snippet>` per hit. " + ARCHIVED_DATA_NOTE),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -164,10 +189,9 @@ TOOLS = [
         "name": "read_span",
         "title": "Read one archived span",
         "description": (
-            "One span in full: compaction's summary, then the messages it replaced. Use "
-            "list_spans or search_spans first for a run and index. One local file, no "
-            "network. Returns `summary:` then `[<i>] <role>: <text>`, cut at %d chars. %s"
-            % (READ_SPAN_MAX_CHARS, ARCHIVED_DATA_NOTE)),
+            "One span's summary and original messages, verbatim, or messages start..end. Use "
+            "list_spans or search_spans first. One local file, no network. Returns `summary:` then "
+            "`[<i>] <role>: <text>`, cut at %d chars. %s" % (READ_SPAN_MAX_CHARS, ARCHIVED_DATA_NOTE)),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -177,11 +201,28 @@ TOOLS = [
                     "description": "Span number from 1, e.g. 3 for 0003.json. Required.",
                     "examples": [3],
                 },
+                "start": {"type": "integer", "minimum": 0, "default": 0, "examples": [5],
+                          "description": "First message, e.g. 5."},
+                "end": {"type": "integer", "minimum": 0, "examples": [9],
+                        "description": "Last, e.g. 9. Omit for all."},
             },
             "required": ["run", "index"],
             "additionalProperties": False,
         },
         "annotations": _annotations("Read one archived span", open_world=False),
+    },
+    {
+        "name": "get_seal_status",
+        "title": "Verify the archive",
+        "description": (
+            "Verify the sealed archive: hash chains against files. Use list_spans for run ids. "
+            "Local files, no network. Returns `<run> OK` or `<run> BREAK <kind>` per run."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"run": _run_param("Omit for every run.")},
+            "additionalProperties": False,
+        },
+        "annotations": _annotations("Verify the archive", open_world=False),
     },
 ]
 # Old names tools/call still accepts. Not listed: a second name for the same
@@ -307,7 +348,7 @@ def _search_spans(args: Dict[str, Any], counts: Optional[Dict[str, int]] = None)
     root = _span_root()
     lines, matched = [], set()
     counts["query_terms"] = len(term.split())
-    for path, idx, role, text in cg_recall_cli.search(root, term, run):
+    for path, idx, role, text, _hits in cg_recall_cli.ranked_search(root, term, run):
         label = "summary" if idx == "summary" else f"msg {idx} [{role}]"
         lines.append(f"{path.parent.name}/{path.name} {label}: {text}")
         matched.add(path)
@@ -322,11 +363,32 @@ def _search_spans(args: Dict[str, Any], counts: Optional[Dict[str, int]] = None)
     return body + "\n\n" + ARCHIVED_DATA_NOTE
 
 
+def _int_arg(args: Dict[str, Any], key: str, default: Optional[int]) -> Optional[int]:
+    value = args.get(key, default)
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ToolError("`%s` must be a non-negative integer." % key)
+    return value
+
+
+def render_message(i: int, m: Any) -> str:
+    """`[<i>] <role>: <content>`, with the content EXACTLY as archived: a plain
+    {role, content: str} message verbatim, anything else (tool calls, content
+    blocks, extra keys) as the whole message's JSON. A recall that paraphrases
+    the archive is not a recall."""
+    role = m.get("role", "?") if isinstance(m, dict) else "?"
+    if isinstance(m, dict) and set(m) <= {"role", "content"} and isinstance(m.get("content"), str):
+        return "[%d] %s: %s" % (i, role, m["content"])
+    return "[%d] %s: %s" % (i, role, json.dumps(m, ensure_ascii=False))
+
+
 def _read_span(args: Dict[str, Any], counts: Optional[Dict[str, int]] = None) -> str:
     counts = {} if counts is None else counts
     run, index = _run_arg(args, required=True), args.get("index")
     if not isinstance(index, int) or isinstance(index, bool) or index < 1:
         raise ToolError("`index` must be a positive integer.")
+    start, end = _int_arg(args, "start", 0), _int_arg(args, "end", None)
     path = cg_recall_cli.span_dir() / run / f"{index:04d}.json"
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -336,25 +398,86 @@ def _read_span(args: Dict[str, Any], counts: Optional[Dict[str, int]] = None) ->
         raise ToolError(f"Span {run}/{index:04d}.json is not a span.")
     counts["spans_opened"] = 1
     messages = data.get("messages") if isinstance(data.get("messages"), list) else []
-    out = [f"span {run}/{index:04d}.json, {len(messages)} messages",
+    last = len(messages) - 1 if end is None else min(end, len(messages) - 1)
+    out = [f"span {run}/{index:04d}.json, {len(messages)} messages"
+           + (f", showing {start}-{last}" if (start or end is not None) else ""),
            f"summary: {data.get('summary', '')}", ""]
-    for i, m in enumerate(messages):
-        role = m.get("role", "?") if isinstance(m, dict) else "?"
-        out.append(f"[{i}] {role}: {cg_recall_cli.message_text(m)}")
-    text = "\n".join(out)
-    if len(text) > READ_SPAN_MAX_CHARS:
-        text = (text[:READ_SPAN_MAX_CHARS]
-                + f"\n... (cut at {READ_SPAN_MAX_CHARS} chars; search_spans finds the rest)")
-    return text + "\n\n" + ARCHIVED_DATA_NOTE
+    size = sum(len(line) + 1 for line in out)
+    for i in range(start, last + 1):
+        line = render_message(i, messages[i])
+        if size + len(line) > READ_SPAN_MAX_CHARS:
+            room = READ_SPAN_MAX_CHARS - size
+            if room > 200:
+                out.append(line[:room])
+            out.append(f"... (truncated at {READ_SPAN_MAX_CHARS} chars: message {i} onward not shown "
+                       f"in full; read_span start={i} end={last} for the rest)")
+            break
+        out.append(line)
+        size += len(line) + 1
+    return "\n".join(out) + "\n\n" + ARCHIVED_DATA_NOTE
+
+
+def _list_digests(args: Dict[str, Any], counts: Optional[Dict[str, int]] = None) -> str:
+    counts = {} if counts is None else counts
+    run = _run_arg(args, required=False)
+    limit = _limit(args, DEFAULT_LIST_ENTRIES, MAX_LIST_ENTRIES)
+    cap = args.get("max_tokens", DEFAULT_SKIM_TOKENS)
+    if not isinstance(cap, int) or isinstance(cap, bool):
+        cap = DEFAULT_SKIM_TOKENS
+    cap = max(MIN_SKIM_TOKENS, min(cap, MAX_SKIM_TOKENS))
+    root = _span_root()
+    if run is not None and not (root / run).is_dir():
+        raise ToolError(f"No run {run} in the span archive; list_spans lists them.")
+    found = cg_archive.digests(root, run)
+    if not found:
+        return "No spans in the archive yet."
+
+    def render(lines, rest):
+        body = list(lines)
+        if rest:
+            body.append(f"({rest} more span{'s' if rest != 1 else ''}: raise max or max_tokens, "
+                        "or search_spans)")
+        return "\n".join(body) + "\n\n" + ARCHIVED_DATA_NOTE
+
+    # Hard cap, measured on the finished text -- footer and data note included
+    # -- with the same estimator the proxy budgets with. A skim that overruns
+    # its cap costs the window the room it exists to save.
+    lines = []
+    for _mtime, run_name, entry in found[:limit]:
+        line = cg_archive.digest_line(run_name, entry)
+        if cg_archive.est_tokens(render(lines + [line], len(found) - len(lines) - 1)) > cap:
+            break
+        lines.append(line)
+    text = render(lines, len(found) - len(lines))
+    while lines and cg_archive.est_tokens(text) > cap:
+        lines.pop()
+        text = render(lines, len(found) - len(lines))
+    counts["spans_matched"] = len(lines)
+    return text
+
+
+def _get_seal_status(args: Dict[str, Any], counts: Optional[Dict[str, int]] = None) -> str:
+    run = _run_arg(args, required=False)
+    root = _span_root()
+    anchor = cg_recall_cli.anchor_path()
+    reports = cg_archive.verify(root, run=run, all_runs=run is None, anchor_path=anchor)
+    if not reports:
+        return "Nothing archived yet."
+    lines = [cg_archive.format_report(r) for r in reports]
+    c = cg_archive.summarise(reports)
+    lines.append(f"{c['runs']} run(s): {c['ok']} OK, {c['breaks']} broken, {c['unsealed']} unsealed"
+                 + ("; anchor checked" if anchor else "; no anchor file"))
+    return "\n".join(lines)
 
 
 # A handler returns the text result, or (text, structuredContent) for a tool
 # that declares an outputSchema.
 # The tools that read the archive, and so leave a receipt. get_proxy_status
 # reads the proxy, not the archive.
-RECALL_TOOLS = ("list_spans", "search_spans", "read_span")
-HANDLERS = {"get_proxy_status": _get_proxy_status, "list_spans": _list_spans,
-            "search_spans": _search_spans, "read_span": _read_span}
+RECALL_TOOLS = ("list_digests", "list_spans", "search_spans", "read_span", "get_seal_status")
+HANDLERS = {"get_proxy_status": _get_proxy_status, "list_digests": _list_digests,
+            "list_spans": _list_spans, "search_spans": _search_spans, "read_span": _read_span,
+            "get_seal_status": _get_seal_status}
 
 
 def handle(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:

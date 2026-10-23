@@ -124,11 +124,12 @@ def test_write_span_leaves_no_partial_file(guardian):
     """The span file is claimed with an exclusive create ("x" mode); its content
     is written to a temp file and renamed over the claim (0.12.0, so the seal
     hashes final bytes). Nothing but the finished NNNN.json and the archive's
-    own sidecar (chain.jsonl) may be left in the run directory: no temp file,
-    no lock file."""
+    own sidecars (chain.jsonl, index.jsonl) may be left in the run directory:
+    no temp file, no lock file."""
     path = guardian.write_span([{"role": "user", "content": "x"}], "s", 2)
     left = sorted(str(p) for p in Path(guardian.SPAN_DIR).glob("*/*"))
-    assert left == sorted([path, str(Path(path).parent / "chain.jsonl")])
+    run = Path(path).parent
+    assert left == sorted([path, str(run / "chain.jsonl"), str(run / "index.jsonl")])
 
 
 def test_write_span_returns_none_instead_of_raising(guardian, monkeypatch):

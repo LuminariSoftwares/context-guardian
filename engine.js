@@ -213,6 +213,8 @@ export function resolveEngineOptions(config = {}, env = process.env) {
     // covers both front doors. Default ON; only the four spellings turn it off.
     seal: !['0', 'false', 'no', 'off'].includes(String(env.GUARDIAN_SEAL ?? '').trim().toLowerCase()),
     sealAnchorPath: String(env.GUARDIAN_SEAL_ANCHOR_PATH ?? '').trim(),
+    // The skim index (index.jsonl), same switch as the proxy's.
+    index: !['0', 'false', 'no', 'off'].includes(String(env.GUARDIAN_INDEX ?? '').trim().toLowerCase()),
   }
 }
 
@@ -776,7 +778,7 @@ export function apply(ctx, config) {
   const writeSpan = (session, messages, summary) => {
     try {
       const { path, index } = writeSealedSpan({
-        spanDir: options.spanDir, runId, startIndex: spanIndex + 1, anchorPath: options.sealAnchorPath, seal: options.seal,
+        spanDir: options.spanDir, runId, startIndex: spanIndex + 1, anchorPath: options.sealAnchorPath, seal: options.seal, index: options.index,
         warn: message => log.warn(message),
         payload: index => ({
           run_id: runId, index, at: new Date().toISOString().replace('T', ' ').slice(0, 19), num_ctx: options.numCtx,
