@@ -203,6 +203,12 @@ The archive is built to be read cheaply, by a person or by a model.
 
 **One summary per stretch of history, not per request.** Your client does not know the proxy compacted anything, so it resends its whole history on every request. The proxy remembers what it already summarised this run (`GUARDIAN_SUMMARY_MEMO`). It reuses that summary when the same messages come back, and when more have been evicted it extends it with only the new ones, archiving them in a span that points at the one it continues. On a 20-turn replay through the test stubs that cut the summariser's input from 623,572 to 69,566 characters, and the archive went from 494 duplicated messages to none. A retried request makes no summariser call at all.
 
+Those figures come from test stubs whose summariser returns a fixed text, so they count calls and characters; they say nothing about summary quality. An extended summary is rewritten from the earlier summary plus the new messages, so over many turns early facts could erode. `scripts/memo_drift_probe.py` measures that on your own model: it plants five facts in the first three turns of a 30-turn conversation, checks which ones each summary still carries, and compares the memo on and off (facts kept, summariser calls, summariser input characters). It talks only to the backend you name and writes only to a temporary directory:
+
+```
+python scripts/memo_drift_probe.py --upstream http://127.0.0.1:11434/v1 --model <model>
+```
+
 The digest index is written as each span is written: `<run>/index.jsonl`, no extra model call. `context-guardian-recall --reindex` builds it for older archives. **Always-on capture** (`GUARDIAN_CAPTURE=journal`, off by default) also records every message of a session, not just what compaction evicts, and search and `read_span` cover it. It is off by default because it writes every message to disk in clear text and grows with the session; that is your decision to make, not a default.
 
 ## How it works

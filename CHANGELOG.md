@@ -192,6 +192,17 @@ everything that existed answers as before.
   to "no summary" for every waiter, so each fails open exactly as before. The table is bounded (64) and cleared as
   each summary settles; any error in it means "summarise alone".
 
+### Memo drift probe (follow-up 2)
+
+- **`scripts/memo_drift_probe.py` measures whether extended summaries keep early facts.** The suite's stub summariser
+  returns a fixed text, so it cannot. The script replays a scripted conversation (default 30 turns, 5 invented facts
+  planted in the first 3) through the proxy against a real OpenAI-compatible backend (`--upstream`, `--model`), once
+  with the memo on and once with `GUARDIAN_SUMMARY_MEMO=0`, and prints one line per compaction (which facts the
+  summary still carries) and a table of facts kept, summariser calls and summariser input characters. It talks only
+  to `--upstream` (no update check, no environment proxy, detection off), reads none of your `GUARDIAN_*` settings
+  or `.env`, and writes only to a temporary directory it removes. Not run in CI and no result is claimed here;
+  `tests/test_memo_drift_probe.py` checks only its mechanics, against a stub.
+
 ### Release process
 
 - **Releases publish from CI by trusted publishing (OIDC), not from a stored API token.** Publishing a GitHub Release
