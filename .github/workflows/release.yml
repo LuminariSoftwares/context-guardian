@@ -1,0 +1,158 @@
+name: release
+
+# Publishes context-guardian to PyPI and dsh-context-guardian to npm when a
+# GitHub Release is published. No stored credential is involved: each registry
+# trusts this workflow file (trusted publishing) and accepts a short-lived OIDC
+# credential that GitHub mints for the one job, and each upload carries a signed
+# provenance attestation pointing at the commit it was built from.
+#
+# Until the one-time registry setup in docs/RELEASING.md is done, a published
+# release makes the publish jobs FAIL and nothing is uploaded.
+#
+# Dry run (builds and checks, publishes nothing):
+#   - every pull request that touches this file or the release script;
+#   - Actions -> release -> Run workflow, with dry_run ticked (the default).
+#
+# Third-party actions are pinned to a commit SHA, not a tag. The comment after
+# each SHA is the tag it was at when it was pinned.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and check only; publish nothing"
+        type: boolean
+        default: true
+      tag:
+        description: "Tag to publish when dry_run is off (e.g. v0.12.0); a re-try of a failed release"
+        type: string
+        default: ""
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "scripts/release_versions.py"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Publish only on a real release, or a manual run with dry_run off and a tag.
+  PUBLISH: ${{ github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run && inputs.tag != '') }}
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.versions.outputs.version }}
+      prerelease: ${{ steps.versions.outputs.prerelease }}
+      publish: ${{ env.PUBLISH }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The tag being released, not whatever the default branch has moved to.
+          ref: ${{ env.RELEASE_TAG || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: "22"
+      - name: tag matches pyproject.toml and package.json
+        id: versions
+        shell: bash
+        run: |
+          if [ "$PUBLISH" = "true" ]; then
+            python scripts/release_versions.py --tag "$RELEASE_TAG" | tee versions.txt
+          else
+            python scripts/release_versions.py --dry-run | tee versions.txt
+          fi
+          grep -E '^(version|prerelease)=' versions.txt >> "$GITHUB_OUTPUT"
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m pytest -q
+      - run: npm install --no-package-lock --legacy-peer-deps
+      - run: npm run check
+      - run: npm run test:node
+
+  pypi-build:
+    # Built in a job that holds no OIDC permission; the publish job only uploads.
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.11"
+      - run: python -m pip install build twine
+      - run: python -m build
+      - run: python -m twine check --strict dist/*
+      - run: ls -l dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: python-dist
+          path: dist/
+          if-no-files-found: error
+
+  pypi:
+    needs: [verify, pypi-build]
+    if: needs.verify.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/context-guardian/${{ needs.verify.outputs.version }}/
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131  # v7.0.0
+        with:
+          name: python-dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
+        with:
+          attestations: true
+
+  npm:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      # Trusted publishing needs npm 11.5.1 or later; Node 22 ships npm 10.
+      - run: npm install -g npm@11.21.1
+      - run: npm --version
+      - name: pack (what would be published)
+        run: npm pack --dry-run
+      - name: publish
+        if: needs.verify.outputs.publish == 'true'
+        shell: bash
+        run: |
+          if [ "$PRERELEASE" = "true" ]; then
+            npm publish --provenance --access public --tag beta
+            # Needs "Allow npm dist-tag" on the npm trusted publisher (docs/RELEASING.md).
+            npm dist-tag add "dsh-context-guardian@$VERSION" latest
+          else
+            npm publish --provenance --access public
+          fi

@@ -59,7 +59,8 @@ def test_readme_mcp_section_is_complete():
 
 def test_latest_changelog_entry_says_server_json_exists():
     entries = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8").split("\n## ")
-    latest = entries[1]
+    # The latest released entry; an `## Unreleased` section (CONTRIBUTING.md asks for one) is not a release.
+    latest = next(e for e in entries[1:] if not e.startswith("Unreleased"))
     assert "`server.json`" in latest and "No `server.json`" not in latest
 
 
