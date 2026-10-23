@@ -105,6 +105,33 @@ it, append, and delete it. A lock file older than 30 seconds is treated as left 
 that cannot get the lock within 2 seconds skips the seal and logs a warning; the archived file is still written and
 will verify as **unsealed**.
 
+## Journal files
+
+Written only with `GUARDIAN_CAPTURE=journal`. `journal.jsonl`, then `journal.1.jsonl`, `journal.2.jsonl`, ... in
+write order: a file is closed (sealed one last time) and the next one started before a line would take it past
+`min(32 MiB, GUARDIAN_CAPTURE_MAX_MB / 4)`. Capture stops for the run before the total would pass
+`GUARDIAN_CAPTURE_MAX_MB`. One JSON object per line, UTF-8:
+
+| field | type | meaning |
+|---|---|---|
+| `n` | integer | the message's number in the run's journal, from 0, continuous across files |
+| `request` | integer | which request of the run (from 1) first carried this message |
+| `ts` | string | ISO-8601 local time with offset, when written |
+| `hash` | string | the message's identity hash (below) |
+| `message` | object | the message exactly as the client sent it |
+
+**Identity hash:** SHA-256 over four parts, for `role`, `content`, `tool_calls` and `tool_call_id` in that order.
+Each part is `s` + the UTF-8 bytes when the value is a string, otherwise `j` + its JSON (keys sorted, no whitespace,
+non-ASCII unescaped; `null` when absent). Each part is preceded by its length as 8 bytes big-endian. A request's
+k-th copy of a hash is journaled when the journal holds fewer than k copies, so a message that genuinely repeats is
+journaled each time and a resent history adds nothing. The proxy's own summary messages are never journaled.
+
+**Sealing:** `journal` chain lines carry an extra integer field `size`, the number of bytes of the file their
+`sha256` covers. A journal is sealed in batches (every 64 lines, every 5 seconds of activity, at rotation, when
+capture stops, and at shutdown), so a verifier hashes the first `size` bytes of the file against the **last**
+`journal` line for it. Bytes past `size` were written after the last seal: report them as an uncovered tail, not as a
+break.
+
 ## index.jsonl
 
 One JSON object per line, one line per span, appended when the span is written; not sealed and not fsynced, because
@@ -142,7 +169,8 @@ Otherwise, check in this order and stop at the first failure:
    names an earlier line, `entry-edited` otherwise).
 2. **The files.** For each file, take its last `span`/`journal` line, unless a later `pruned` line names it. A pruned
    file is expected to be gone; if its pruned `sha256` differs from the sealed one, report `content-changed`. A sealed
-   file that does not exist is `file-missing`; one whose SHA-256 differs is `content-changed`.
+   file that does not exist is `file-missing`; one whose SHA-256 differs is `content-changed`. For a `journal` line
+   with `size`, hash only the first `size` bytes.
 3. **Unsealed files.** Archive content present in the directory with no chain line is `unsealed-file`.
 4. **The anchor**, when one is given: every `(seq, head)` recorded for this run must equal the chain's `entry_hash`
    at that `seq` (else `anchor-mismatch`).

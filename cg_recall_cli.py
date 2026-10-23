@@ -76,7 +76,9 @@ def snippet(text: str, at: int, length: int) -> str:
 
 def search(root: Path, term: str, run_id: str | None = None):
     """Yield (path, message index or 'summary', role, snippet) per hit, oldest
-    span first. One hit per message. Unreadable span files are skipped."""
+    span first, then the run's capture journal (GUARDIAN_CAPTURE=journal; its
+    index is the message's number in the journal). One hit per message.
+    Unreadable span files are skipped."""
     needle = term.lower()
     pattern = f"{run_id}/*.json" if run_id else "*/*.json"
     for path in sorted(root.glob(pattern)):
@@ -97,6 +99,15 @@ def search(root: Path, term: str, run_id: str | None = None):
             at = summary.lower().find(needle)
             if at >= 0:
                 yield path, "summary", "summary", snippet(summary, at, len(term))
+    runs = [root / run_id] if run_id else cg_archive.run_dirs(root)
+    for run in runs:
+        for path, entry in cg_archive.read_journal(run):
+            m = entry.get("message")
+            text = message_text(m)
+            at = text.lower().find(needle)
+            if at >= 0:
+                role = m.get("role", "?") if isinstance(m, dict) else "?"
+                yield path, entry["n"], role, snippet(text, at, len(term))
 
 
 def ranked_search(root: Path, query: str, run: str | None = None):
@@ -110,21 +121,33 @@ def ranked_search(root: Path, query: str, run: str | None = None):
     if not words:
         return []
     pattern = f"{run}/*.json" if run else "*/*.json"
-    found = []
+    sources = []
     for path in root.glob(pattern):
         if not cg_archive.SPAN_NAME_RE.match(path.name):
             continue
         data = cg_archive.load_span(path)
         if data is None:
             continue
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            continue
         texts = [(i, m.get("role", "?") if isinstance(m, dict) else "?", message_text(m))
                  for i, m in enumerate(data.get("messages") or [])]
         if isinstance(data.get("summary"), str):
             texts.append(("summary", "summary", data["summary"]))
+        sources.append((path, texts))
+    # The capture journal (GUARDIAN_CAPTURE=journal) is searched too; a hit's
+    # index is the message's number in the journal, which read_span index 0 opens.
+    for run_dir in ([root / run] if run else cg_archive.run_dirs(root)):
+        by_file: dict = {}
+        for path, entry in cg_archive.read_journal(run_dir):
+            m = entry.get("message")
+            by_file.setdefault(path, []).append(
+                (entry["n"], m.get("role", "?") if isinstance(m, dict) else "?", message_text(m)))
+        sources.extend(by_file.items())
+    found = []
+    for path, texts in sources:
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
         for idx, role, text in texts:
             low = text.lower()
             hits = sum(1 for w in words if w in low)

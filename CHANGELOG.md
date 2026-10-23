@@ -65,6 +65,22 @@
 - `tools/list` grows from ~1,086 to ~1,591 estimated tokens for the two new tools and two parameters (each tool's
   fixed structure costs ~150 before its description); the CI ceiling moves from 1,100 to 1,600.
 
+### Always-on capture (opt-in)
+
+- **`GUARDIAN_CAPTURE=journal` records the whole session**, not just what compaction evicts: every new message of a
+  run, once, in `<run>/journal.jsonl`. Clients resend the whole history and compaction rewrites it, so a message is
+  identified by a hash of its role, content, tool calls and tool call id, and counted: a resent history adds nothing,
+  and a message that genuinely repeats is journaled each time. Each line records the request that first carried it.
+- **Sealed into the same chain in batches** (every 64 lines, every 5 s of activity, at rotation, at shutdown) with a
+  running hash, so a seal costs the same however large the file; lines written after the last seal are reported as an
+  uncovered tail, not a break. Measured: ~1.0 ms median per request to capture a resent history, ~1.6 ms once it
+  reaches 241 messages / ~225 KB (Python 3.11, Linux container).
+- **`GUARDIAN_CAPTURE_MAX_MB`** (default 200) caps one run, rotating to `journal.N.jsonl`; past the cap, capture stops
+  for that run with one log line and requests are untouched.
+- `context-guardian-recall`, `search_spans` and `read_span` (`index` 0, with `start`/`end`) cover the journal.
+  `/guardian/stats` gains a `capture` block.
+- **Off by default**: it writes every message to disk in clear text and grows with the session.
+
 ### Earlier unreleased
 
 - **Releases publish from CI by trusted publishing (OIDC), not from a stored API token.** Publishing a GitHub Release

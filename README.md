@@ -412,6 +412,8 @@ cp .env.example .env
 | `GUARDIAN_SEAL` | `1` | Seal the archive: every span file is hashed as it is on disk and chained into `<run>/chain.jsonl`, so `context-guardian-recall --verify` can show nothing was changed, removed or reordered since. A pruned span is recorded as pruned, not reported as missing. `0` writes no chain |
 | `GUARDIAN_SEAL_ANCHOR_PATH` | unset | A file **outside** the data directory (synced storage, another disk). Every new chain head is appended to it, and `--verify` checks the chain against it, which catches a chain someone rewrote and rehashed |
 | `GUARDIAN_INDEX` | `1` | Append a digest line per span to `<run>/index.jsonl` (first sentence of the summary, top keywords, sizes) so the MCP tool `list_digests` can skim the archive in a few hundred tokens. `0` writes none; `list_digests` then indexes on the fly and `context-guardian-recall --reindex` rebuilds it |
+| `GUARDIAN_CAPTURE` | `off` | `journal`: record the whole session, not just what compaction evicts. Every new message of a run is appended once to `<run>/journal.jsonl` (rotating to `journal.N.jsonl`) and sealed into the same chain; `context-guardian-recall`, `search_spans` and `read_span` (`index` 0) cover it. Off by default because it writes every message to disk in clear text and grows with the session — that is your call to make, not a default |
+| `GUARDIAN_CAPTURE_MAX_MB` | `200` | The most one run's journal may hold. Past it, capture stops for that run with one log line; requests are never affected |
 | `GUARDIAN_RECEIPTS` | `1` | Counts-only receipts: every recall (CLI and MCP tools) and every compaction appends a line of numbers to the receipts file, which `context-guardian-recall --receipts` adds up. No message text, query text, path or run id is ever written, and nothing leaves the machine. `0` records nothing |
 | `GUARDIAN_RECEIPTS_PATH` | `<data dir>/logs/receipts.jsonl` | Where receipts are appended |
 | `GUARDIAN_KEEP_SUMMARIES` | `1` | How many of Guardian's own previous summaries stay in the window. Retired ones are folded into the next span, not discarded |
@@ -607,7 +609,7 @@ Annotations: `readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: tr
 | parameter | type | required | default | constraints | example | description |
 |---|---|---|---|---|---|---|
 | `run` | string | yes | — | pattern `^[A-Za-z0-9_-]+$` | `"20261015-120000"` | Span folder, e.g. 20261015-120000. Required. |
-| `index` | integer | yes | — | min 1 | `3` | Span number from 1, e.g. 3 for 0003.json. Required. |
+| `index` | integer | yes | — | min 0 | `3` | Span number, e.g. 3 for 0003.json; 0 = capture journal. Required. |
 | `start` | integer | no | 0 | min 0 | `5` | First message, e.g. 5. |
 | `end` | integer | no | — | min 0 | `9` | Last, e.g. 9. Omit for all. |
 

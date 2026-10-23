@@ -197,8 +197,8 @@ TOOLS = [
             "properties": {
                 "run": _run_param("Required."),
                 "index": {
-                    "type": "integer", "minimum": 1,
-                    "description": "Span number from 1, e.g. 3 for 0003.json. Required.",
+                    "type": "integer", "minimum": 0,
+                    "description": "Span number, e.g. 3 for 0003.json; 0 = capture journal. Required.",
                     "examples": [3],
                 },
                 "start": {"type": "integer", "minimum": 0, "default": 0, "examples": [5],
@@ -386,9 +386,11 @@ def render_message(i: int, m: Any) -> str:
 def _read_span(args: Dict[str, Any], counts: Optional[Dict[str, int]] = None) -> str:
     counts = {} if counts is None else counts
     run, index = _run_arg(args, required=True), args.get("index")
-    if not isinstance(index, int) or isinstance(index, bool) or index < 1:
-        raise ToolError("`index` must be a positive integer.")
+    if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+        raise ToolError("`index` must be a span number, or 0 for the capture journal.")
     start, end = _int_arg(args, "start", 0), _int_arg(args, "end", None)
+    if index == 0:
+        return _read_journal(run, start, end, counts)
     path = cg_recall_cli.span_dir() / run / f"{index:04d}.json"
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -414,6 +416,32 @@ def _read_span(args: Dict[str, Any], counts: Optional[Dict[str, int]] = None) ->
             break
         out.append(line)
         size += len(line) + 1
+    return "\n".join(out) + "\n\n" + ARCHIVED_DATA_NOTE
+
+
+def _read_journal(run: str, start: int, end: Optional[int], counts: Dict[str, int]) -> str:
+    """read_span index 0: messages start..end of the run's capture journal."""
+    run_dir = cg_recall_cli.span_dir() / run
+    if not cg_archive.journal_files(run_dir):
+        raise ToolError(f"Run {run} has no capture journal (GUARDIAN_CAPTURE=journal records one).")
+    counts["spans_opened"] = 1
+    out, size, total, last = [f"capture journal of run {run}"], 0, 0, None
+    cut = False
+    for _path, entry in cg_archive.read_journal(run_dir):
+        total += 1
+        n = entry["n"]
+        if n < start or (end is not None and n > end) or cut:
+            continue
+        line = render_message(n, entry.get("message"))
+        if size + len(line) > READ_SPAN_MAX_CHARS:
+            out.append(f"... (truncated at {READ_SPAN_MAX_CHARS} chars: message {n} onward not shown; "
+                       f"read_span index=0 start={n} for the rest)")
+            cut = True
+            continue
+        out.append(line)
+        size += len(line) + 1
+        last = n
+    out[0] += f", {total} messages" + (f", showing {start}-{last}" if last is not None else ", none in range")
     return "\n".join(out) + "\n\n" + ARCHIVED_DATA_NOTE
 
 

@@ -306,6 +306,18 @@ SEAL_ANCHOR_PATH = os.environ.get("GUARDIAN_SEAL_ANCHOR_PATH", "").strip() or No
 # spans to find out what is in them. No extra model call. GUARDIAN_INDEX=0
 # writes none; list_digests then indexes on the fly, and --reindex rebuilds it.
 INDEX = os.environ.get("GUARDIAN_INDEX", "1").strip().lower() not in ("0", "false", "no", "off")
+# CAPTURE: GUARDIAN_CAPTURE=journal records the whole session, not just what
+# compaction evicts -- every new message of this run, once, into
+# <run>/journal.jsonl, sealed into the same chain in batches. OFF by default:
+# it writes every message to disk in clear text, which is a privacy decision a
+# user should make, and it grows with the session. GUARDIAN_CAPTURE_MAX_MB caps
+# one run (default 200); past it capture stops for that run, once, with a log
+# line, and requests are untouched. See cg_archive.Journal.
+CAPTURE = os.environ.get("GUARDIAN_CAPTURE", "off").strip().lower()
+try:
+    CAPTURE_MAX_MB = float(os.environ.get("GUARDIAN_CAPTURE_MAX_MB", "200"))
+except ValueError:
+    CAPTURE_MAX_MB = 200.0
 # RECEIPTS: counts-only evidence of what the archive is worth -- characters
 # archived, compactions whose summary points at the archive, and recall tool
 # calls the model actually made, seen in the tool_calls of later requests.
@@ -536,6 +548,10 @@ _state = {
     # spans of this run will verify as unsealed.
     "seal_failures": 0,
 }
+
+# The capture journal, created on first use when GUARDIAN_CAPTURE=journal.
+_journal: Optional[cg_archive.Journal] = None
+_capture_failures = {"count": 0}
 
 # Receipts counters for this process: what /guardian/stats shows. The file
 # keeps the durable record across restarts; see note_compaction_receipt.
@@ -784,6 +800,7 @@ async def _lifespan(_app: FastAPI):
     try:
         yield
     finally:
+        flush_journal()
         if _http_client is not None:
             await _http_client.aclose()
 
@@ -1366,6 +1383,45 @@ def index_span(path: Path, payload: Dict[str, Any]) -> None:
         log.warning("could not index %s (%s: %s); the span is written. "
                     "context-guardian-recall --reindex rebuilds the index.",
                     Path(path).name, type(exc).__name__, exc)
+
+
+def capture_messages(messages: Any, system: Any = None) -> None:
+    """GUARDIAN_CAPTURE=journal: journal this request's new messages. Never
+    raises and never touches the request: a journal that cannot be written is
+    a missing record, not a reason to fail the user's call."""
+    global _journal
+    if CAPTURE != "journal":
+        return
+    try:
+        if _journal is None:
+            _journal = cg_archive.Journal(SPAN_DIR / RUN_ID, RUN_ID,
+                                          int(CAPTURE_MAX_MB * 1_000_000), seal=SEAL,
+                                          anchor_path=SEAL_ANCHOR_PATH, skip=is_guardian_summary)
+        if system:
+            messages = [{"role": "system", "content": system}] + list(messages or [])
+        was_stopped = _journal.stopped
+        _journal.capture(messages)
+        if _journal.stopped and not was_stopped:
+            log.warning("capture journal for run %s reached GUARDIAN_CAPTURE_MAX_MB "
+                        "(%g MB); capture stops for this run. Requests are "
+                        "unaffected and compaction still archives spans.",
+                        RUN_ID, CAPTURE_MAX_MB)
+    except Exception as exc:                               # noqa: BLE001
+        _capture_failures["count"] += 1
+        # Once loud, then quiet: a broken journal fails the same way on every
+        # request, and a warning per request would bury everything else.
+        (log.warning if _capture_failures["count"] == 1 else log.debug)(
+            "could not write the capture journal (%s: %s). The request is "
+            "unaffected.", type(exc).__name__, exc)
+
+
+def flush_journal() -> None:
+    """Seal what the journal has not sealed yet (shutdown). Never raises."""
+    try:
+        if _journal is not None:
+            _journal.flush()
+    except Exception as exc:                               # noqa: BLE001
+        log.warning("could not seal the capture journal at shutdown: %s", exc)
 
 
 def note_compaction_receipt(archived: List[Dict[str, Any]], pointer: str,
@@ -2199,6 +2255,10 @@ async def stats():
         "upstream": UPSTREAM_URL,
         "seal": seal_status(),
         "receipts": {"enabled": cg_archive.receipts_enabled(), **_receipts},
+        "capture": {"mode": CAPTURE if CAPTURE == "journal" else "off",
+                    "cap_mb": CAPTURE_MAX_MB, "failures": _capture_failures["count"],
+                    **(_journal.stats() if _journal is not None else
+                       {"messages": 0, "requests": 0, "bytes": 0, "files": 0, "stopped": False})},
         **_state,
         # What the proxy has learned about its own estimate error, per model.
         # `last_raw_estimate` above is the pre-correction figure; this is what
@@ -2744,6 +2804,7 @@ async def proxy(path: str, request: Request):
         # an object is not something this proxy understands; pass it through
         # untouched and let the backend rule on it.
         if isinstance(payload, dict):
+            capture_messages(payload.get("messages"))
             # FAIL-OPEN for the whole rewrite step. Whatever raises in here --
             # a bug in compaction, a dry run, an injected field -- costs the
             # rewrite, never the request: it goes upstream as the client sent it.
@@ -2776,6 +2837,7 @@ async def proxy(path: str, request: Request):
         try:
             payload = json.loads(body_bytes)
             if isinstance(payload, dict):
+                capture_messages(payload.get("messages"), payload.get("system"))
                 rewritten = await maybe_compact_anthropic(client, payload, headers)
                 if rewritten is not payload:
                     body_bytes = json.dumps(rewritten).encode("utf-8")

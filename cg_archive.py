@@ -109,6 +109,21 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def sha256_prefix(path: Path, size: int) -> str:
+    """Hex digest of a file's first `size` bytes; a shorter file hashes what
+    it has, so a truncated journal mismatches rather than raising."""
+    h = hashlib.sha256()
+    left = size
+    with open(path, "rb") as fh:
+        while left > 0:
+            block = fh.read(min(left, 1 << 20))
+            if not block:
+                break
+            h.update(block)
+            left -= len(block)
+    return h.hexdigest()
+
+
 def now_iso() -> str:
     """Local time with its UTC offset, e.g. 2026-10-23T12:00:00-05:00."""
     return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
@@ -362,6 +377,9 @@ class RunReport:
     backfilled: int = 0
     unsealed: List[str] = field(default_factory=list)
     anchored: bool = False
+    # (journal file, bytes written after its last seal): covered by nothing,
+    # reported, and not a break -- a journal is sealed in batches.
+    tails: List[Tuple[str, int]] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -534,12 +552,19 @@ def verify_run(run_dir: Path, anchor: Optional[Dict[str, List[Tuple[int, str]]]]
         path = run_dir / name
         if not path.exists():
             return brk("file-missing", "%s is gone and no prune record says why" % name, e)
+        size = e.get("size") if e["type"] == "journal" else None
         try:
-            digest = sha256_file(path)
+            if isinstance(size, int) and not isinstance(size, bool) and size >= 0:
+                digest = sha256_prefix(path, size)
+                extra = path.stat().st_size - size
+            else:
+                digest, extra = sha256_file(path), 0
         except OSError as exc:
             return brk("file-missing", "%s cannot be read: %s" % (name, exc), e)
         if digest != e["sha256"]:
             return brk("content-changed", "sha256 of %s on disk differs from the sealed hash" % name, e)
+        if extra > 0:
+            rep.tails.append((name, extra))
     rep.pruned = sorted(pruned)
 
     # 3. Files the chain does not mention.
@@ -671,6 +696,8 @@ def format_report(r: RunReport) -> str:
             notes.append("%d backfilled (sealed late)" % r.backfilled)
         if r.anchored:
             notes.append("anchor agrees")
+        for name, extra in r.tails:
+            notes.append("%s: %d bytes after the last seal, not covered yet" % (name, extra))
         return "%s  OK        %s; head %s" % (r.run, ", ".join(notes), (r.head or "")[:16])
     if r.status == "empty":
         return "%s  OK        nothing archived" % r.run
@@ -1127,3 +1154,208 @@ def digest_line(run: str, e: Dict[str, Any]) -> str:
     ts = str(e.get("ts") or "")[:16]
     return "%s/%s %s ~%st: %s%s" % (run, e.get("span"), ts, e.get("est_tokens", "?"), e.get("digest", ""),
                                    " [%s]" % ", ".join(str(t) for t in terms[:4]) if terms else "")
+
+
+# --- the capture journal (GUARDIAN_CAPTURE=journal) ---------------------------------
+#
+# Spans hold what compaction evicted. The journal holds the whole session: every
+# message of a run, once, in the order it was first seen, in
+# <run>/journal.jsonl (then journal.1.jsonl, journal.2.jsonl, ... as it rotates).
+#
+# "Once" is the hard part. Clients resend the whole history on every request,
+# and compaction rewrites what goes upstream, so a message is identified by a
+# hash of what it says (role, content, tool calls, tool call id) and COUNTED: it
+# is journaled when a request carries more copies of it than the journal holds.
+# A message that genuinely repeats ("yes", twice) is therefore journaled twice,
+# and a client that trims its own history (fewer copies) adds nothing.
+#
+# Sealed in batches, not per line: the running SHA-256 of the current file is
+# kept as it is written, so a seal is O(1) however large the file, and each
+# journal chain line records the byte size it covers. Bytes written after the
+# last seal are reported by the verifier as an uncovered tail, not as a break.
+
+JOURNAL_ROTATE_MAX_BYTES = 32 * 1024 * 1024
+JOURNAL_SEAL_EVERY_LINES = 64
+JOURNAL_SEAL_EVERY_SECONDS = 5.0
+
+
+def journal_name(i: int) -> str:
+    return "journal.jsonl" if i == 0 else "journal.%d.jsonl" % i
+
+
+def journal_files(run_dir: Path) -> List[Path]:
+    """The run's journal files in write order."""
+    def number(name):
+        m = re.match(r"^journal(?:\.(\d+))?\.jsonl$", name)
+        return int(m.group(1) or 0) if m else None
+    found = []
+    for name in archived_files(run_dir):
+        k = number(name)
+        if k is not None:
+            found.append((k, Path(run_dir) / name))
+    return [p for _, p in sorted(found)]
+
+
+def _hash_part(value: Any) -> bytes:
+    # Strings, the common case, are hashed as their own bytes: serialising
+    # every resent message to JSON on every request was most of the journal's
+    # per-request cost. Anything else goes through canonical-ish JSON. The
+    # leading tag keeps "null" the string apart from None.
+    if isinstance(value, str):
+        return b"s" + value.encode("utf-8", "replace")
+    return b"j" + json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+                             default=str).encode("utf-8", "replace")
+
+
+def message_hash(m: Dict[str, Any]) -> str:
+    """Identity of a message for the journal: what it says (role, content,
+    tool calls, tool call id), not where it is in the history."""
+    h = hashlib.sha256()
+    for key in ("role", "content", "tool_calls", "tool_call_id"):
+        part = _hash_part(m.get(key))
+        h.update(len(part).to_bytes(8, "big"))
+        h.update(part)
+    return h.hexdigest()
+
+
+def read_journal(run_dir: Path):
+    """Yield (path, entry) for every journal line that parses, in order."""
+    for path in journal_files(run_dir):
+        try:
+            fh = open(path, "rb")
+        except OSError:
+            continue
+        with fh:
+            for raw in fh:
+                try:
+                    obj = json.loads(raw.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                if isinstance(obj, dict) and isinstance(obj.get("n"), int):
+                    yield path, obj
+
+
+class Journal:
+    """One run's capture journal. Thread-safe; every method may raise, and the
+    proxy's callers catch everything (fail open)."""
+
+    def __init__(self, run_dir: Path, run_id: str, cap_bytes: int, seal: bool = True,
+                 anchor_path: Optional[Path] = None, skip=None):
+        self.run_dir, self.run_id = Path(run_dir), run_id
+        self.cap = max(0, int(cap_bytes))
+        self.rotate = min(JOURNAL_ROTATE_MAX_BYTES, max(1, self.cap // 4))
+        self.seal_on, self.anchor = seal, anchor_path
+        self.skip = skip or (lambda m: False)
+        self.counts: Dict[str, int] = {}
+        self.n = self.requests = self.total = 0
+        self.file_index = 0
+        self.cur_bytes = 0
+        self.hasher = hashlib.sha256()
+        self.unsealed_lines = 0
+        self.last_seal = time.monotonic()
+        self.stopped = False
+        self.stop_reported = False
+        self._opened = False
+        self._lock = threading.Lock()
+
+    @property
+    def path(self) -> Path:
+        return self.run_dir / journal_name(self.file_index)
+
+    def _open(self) -> None:
+        """First use: create the run directory, and pick up a file that already
+        exists (hashing what is in it) rather than sealing a wrong digest."""
+        if self._opened:
+            return
+        missing = [p for p in (self.run_dir, *self.run_dir.parents) if not p.exists()]
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        for made in missing:
+            _make_private(made, PRIVATE_DIR_MODE)
+        existing = journal_files(self.run_dir)
+        if existing:
+            for p in existing[:-1]:
+                self.total += p.stat().st_size
+            last = existing[-1]
+            m = re.match(r"^journal(?:\.(\d+))?\.jsonl$", last.name)
+            self.file_index = int(m.group(1) or 0)
+            with open(last, "rb") as fh:
+                for block in iter(lambda: fh.read(1 << 20), b""):
+                    self.hasher.update(block)
+                    self.cur_bytes += len(block)
+            self.total += self.cur_bytes
+            for _, entry in read_journal(self.run_dir):
+                h = entry.get("hash")
+                if isinstance(h, str):
+                    self.counts[h] = self.counts.get(h, 0) + 1
+                self.n = max(self.n, entry["n"] + 1)
+        self._opened = True
+
+    def capture(self, messages: Any) -> int:
+        """Journal the messages of one request that the journal does not hold
+        yet. Returns how many lines were written."""
+        if not isinstance(messages, list):
+            return 0
+        with self._lock:
+            if self.stopped:
+                return 0
+            self._open()
+            self.requests += 1
+            seen_now: Dict[str, int] = {}
+            pending = []
+            for m in messages:
+                if not isinstance(m, dict) or self.skip(m):
+                    continue
+                h = message_hash(m)
+                seen_now[h] = seen_now.get(h, 0) + 1
+                # The k-th copy in this request is new when the journal holds
+                # fewer than k copies (self.counts changes only once written).
+                if seen_now[h] > self.counts.get(h, 0):
+                    pending.append((h, m))
+            written = 0
+            for h, m in pending:
+                line = (json.dumps({"n": self.n, "request": self.requests, "ts": now_iso(), "hash": h,
+                                    "message": m}, ensure_ascii=False, default=str) + "\n").encode("utf-8")
+                if self.total + len(line) > self.cap:
+                    self.stopped = True
+                    break
+                if self.cur_bytes and self.cur_bytes + len(line) > self.rotate:
+                    self._seal_locked()
+                    self.file_index += 1
+                    self.cur_bytes = 0
+                    self.hasher = hashlib.sha256()
+                _append_line(self.path, line, durable=False)
+                self.hasher.update(line)
+                self.cur_bytes += len(line)
+                self.total += len(line)
+                self.counts[h] = self.counts.get(h, 0) + 1
+                self.n += 1
+                self.unsealed_lines += 1
+                written += 1
+            if self.stopped or self.unsealed_lines >= JOURNAL_SEAL_EVERY_LINES or (
+                    self.unsealed_lines and time.monotonic() - self.last_seal >= JOURNAL_SEAL_EVERY_SECONDS):
+                self._seal_locked()
+            return written
+
+    def _seal_locked(self) -> None:
+        if not self.seal_on:
+            self.unsealed_lines = 0
+            return
+        if not self.unsealed_lines or not self.cur_bytes:
+            return
+        append_entry(self.run_dir, self.run_id,
+                     {"type": "journal", "file": self.path.name,
+                      "sha256": self.hasher.copy().hexdigest(), "size": self.cur_bytes},
+                     anchor_path=self.anchor)
+        self.unsealed_lines = 0
+        self.last_seal = time.monotonic()
+
+    def flush(self) -> None:
+        """Seal whatever is unsealed (shutdown)."""
+        with self._lock:
+            if self._opened:
+                self._seal_locked()
+
+    def stats(self) -> Dict[str, Any]:
+        return {"messages": self.n, "requests": self.requests, "bytes": self.total,
+                "files": self.file_index + 1 if self._opened and self.total else 0,
+                "stopped": self.stopped}
