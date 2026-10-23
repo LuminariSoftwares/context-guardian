@@ -138,6 +138,21 @@ everything that existed answers as before.
   `_build_anthropic_usage`, `message_stream_converter`) and llama.cpp's server (`to_json_anthropic`,
   `to_json_anthropic_stream`).
 
+### Window detection on vLLM and llama.cpp (follow-up)
+
+- **The proxy asks vLLM and llama-server for each model's window, not only Ollama.** One-model-at-a-time servers get
+  switched between models whose windows differ sevenfold, and `GUARDIAN_NUM_CTX` is one number per process.
+  **`GUARDIAN_DETECT_CONTEXT`** (`auto` by default, `1`, `0`) asks once per model: an Ollama upstream through
+  `/api/show` exactly as before (`GUARDIAN_OLLAMA_CONTEXT` still works), any other upstream through vLLM's
+  `GET /v1/models` (`max_model_len`; a LoRA adapter with none takes its base model's) and then llama.cpp's
+  `GET /props` (`default_generation_settings.n_ctx`, the per-slot window one request gets, never `n_ctx_train`). Any
+  error falls back to `GUARDIAN_NUM_CTX`. **Safety rule:** an explicit `GUARDIAN_NUM_CTX` is lowered by a smaller
+  reported window and never raised by a larger one; left unset, the reported window is used. The source is logged
+  once per model (`vLLM reports 262144 for <model>`), shown in `/guardian/stats` (`context_detected`) and by
+  `context-guardian-doctor`. The probes carry the client's credential headers, for a keyed server. Checked against
+  vLLM main (`ModelCard.max_model_len`, `show_available_models`) and llama.cpp master (`get_res_props`,
+  `n_ctx_slot`).
+
 ### Release process
 
 - **Releases publish from CI by trusted publishing (OIDC), not from a stored API token.** Publishing a GitHub Release

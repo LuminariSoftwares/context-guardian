@@ -145,7 +145,12 @@ GUARDIAN_HOST = os.environ.get("GUARDIAN_HOST", "127.0.0.1")
 # documented 11434. The README was right and the code was not. Set
 # GUARDIAN_UPSTREAM_URL for any other backend.
 UPSTREAM_URL = os.environ.get("GUARDIAN_UPSTREAM_URL", "http://localhost:11434/v1")
-NUM_CTX = int(os.environ.get("GUARDIAN_NUM_CTX", "32768"))  # keep in sync with OLLAMA_CONTEXT_LENGTH
+# Whether the operator set the window, as opposed to taking the default: a
+# window a server reports may LOWER an explicit GUARDIAN_NUM_CTX, never raise
+# it (see context_window). Empty counts as unset.
+_NUM_CTX_ENV = os.environ.get("GUARDIAN_NUM_CTX", "").strip()
+NUM_CTX_EXPLICIT = _NUM_CTX_ENV != ""
+NUM_CTX = int(_NUM_CTX_ENV) if NUM_CTX_EXPLICIT else 32768  # keep in sync with OLLAMA_CONTEXT_LENGTH
 COMPACT_THRESHOLD = float(os.environ.get("GUARDIAN_COMPACT_THRESHOLD", "0.85"))
 # RESERVE_OUTPUT (added 2026-08-21) -- the defect this fixes:
 # COMPACT_THRESHOLD is a fraction of the WHOLE window, and the whole window has
@@ -188,6 +193,15 @@ COUNT_TOOLS = os.environ.get("GUARDIAN_COUNT_TOOLS", "1") not in ("0", "false", 
 # Ollama's port 11434"; "1" always asks, "0" never does. Any error falls back
 # to GUARDIAN_NUM_CTX for that model.
 OLLAMA_CONTEXT = os.environ.get("GUARDIAN_OLLAMA_CONTEXT", "auto").strip().lower()
+# DETECT_CONTEXT: the general switch. One-model-at-a-time servers (vLLM,
+# llama-server) get switched between models whose windows differ sevenfold
+# (38K to 256K), and GUARDIAN_NUM_CTX is one number per process -- wrong for
+# most of those models. "auto" (default): an Ollama upstream is asked through
+# /api/show exactly as before; any other upstream is asked once per model
+# through vLLM's GET /v1/models (max_model_len) and then llama.cpp's GET
+# /props (the per-slot n_ctx). "1" asks every upstream all three ways; "0"
+# asks nothing (GUARDIAN_OLLAMA_CONTEXT=1 still forces the Ollama question).
+DETECT_CONTEXT = os.environ.get("GUARDIAN_DETECT_CONTEXT", "auto").strip().lower()
 OLLAMA_DEFAULT_PORT = 11434
 # /api/show answers from disk in milliseconds; this only bounds a hung server.
 OLLAMA_SHOW_TIMEOUT_SECONDS = 5.0
@@ -962,6 +976,10 @@ async def _loopback_guard(request: Request, call_next):
 # model name -> window /api/show reported, or None when asking failed. Filled
 # once per model and kept for the life of the process.
 _ollama_windows: Dict[str, Optional[int]] = {}
+# model name -> {"window": what the server reported, "source": Ollama | vLLM |
+# llama.cpp, "used": the window budgeted against}, or None when nothing was
+# reported. Asked once per model, kept for the life of the process.
+_detected: Dict[str, Optional[Dict[str, Any]]] = {}
 
 
 def upstream_is_ollama() -> bool:
@@ -1002,21 +1020,78 @@ def window_from_show(data: Any) -> Optional[int]:
     return None
 
 
-async def context_window(client: httpx.AsyncClient, model: str) -> int:
-    """The window to budget this model against. GUARDIAN_NUM_CTX unless the
-    upstream is Ollama and /api/show says otherwise. Never raises."""
-    if not model or not upstream_is_ollama():
+def _vllm_window(data: Any, model: str) -> Optional[int]:
+    """max_model_len for `model` out of vLLM's GET /v1/models, or None.
+
+    vLLM fills max_model_len on its base model cards and leaves it null on
+    LoRA adapter cards (vllm/entrypoints/openai/models/serving.py); an adapter
+    runs in the base model's window, so when the asked-for id has none and
+    exactly one card has one, that is the window. May raise on junk."""
+    cards = [c for c in data.get("data") or [] if isinstance(c, dict)]
+
+    def window(card):
+        n = card.get("max_model_len")
+        return n if isinstance(n, int) and not isinstance(n, bool) and n > 0 else None
+
+    for card in cards:
+        if card.get("id") == model and window(card):
+            return window(card)
+    sized = [window(c) for c in cards if window(c)]
+    return sized[0] if len(sized) == 1 else None
+
+
+def _llama_window(data: Any) -> Optional[int]:
+    """The per-slot context out of llama-server's GET /props, or None.
+
+    default_generation_settings.n_ctx is the slot's context (slot_n_ctx in
+    tools/server/server-context.cpp): what ONE request gets, which with
+    several slots and no unified KV cache is the total divided by the slots.
+    Not n_ctx_train, which is only what the model was trained for. May raise."""
+    n = (data.get("default_generation_settings") or {}).get("n_ctx")
+    return n if isinstance(n, int) and not isinstance(n, bool) and n > 0 else None
+
+
+async def _ask_json(client: httpx.AsyncClient, method: str, url: str,
+                    headers: Optional[Dict[str, str]], **kw) -> Any:
+    resp = await client.request(method, url, headers=_summary_headers(headers),
+                                timeout=OLLAMA_SHOW_TIMEOUT_SECONDS, **kw)
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def context_window(client: httpx.AsyncClient, model: str,
+                         headers: Optional[Dict[str, str]] = None) -> int:
+    """The window to budget this model against. Never raises.
+
+    GUARDIAN_NUM_CTX unless the upstream reports one, asked once per model
+    (see DETECT_CONTEXT). Ollama keeps its 0.11.0 rule: its num_ctx is the
+    window it runs at and is used as is; a trained context_length only lowers.
+    For vLLM and llama.cpp the safety rule is the same direction: an explicit
+    GUARDIAN_NUM_CTX is lowered by a smaller reported window and never raised
+    by a larger one; with no explicit setting the reported window is used.
+    The credential headers of the client's request go along, for a keyed server.
+    """
+    if not model:
         return NUM_CTX
-    if model not in _ollama_windows:
+    if model not in _detected:
+        _detected[model] = await _detect_window(client, model, headers)
+    entry = _detected[model]
+    return entry["used"] if entry else NUM_CTX
+
+
+async def _detect_window(client, model, headers) -> Optional[Dict[str, Any]]:
+    root = UPSTREAM_URL.rstrip("/")
+    bare = root[:-3] if root.endswith("/v1") else root
+    off = DETECT_CONTEXT in ("0", "false", "no", "off")
+    ollama_forced = OLLAMA_CONTEXT in ("1", "true", "yes", "on")
+    ollama_off = OLLAMA_CONTEXT in ("0", "false", "no", "off")
+    ask_ollama = ollama_forced or (not off and not ollama_off and (
+        upstream_is_ollama() or DETECT_CONTEXT in ("1", "true", "yes", "on")))
+    if ask_ollama:
         found = None
-        root = UPSTREAM_URL.rstrip("/")
-        if root.endswith("/v1"):
-            root = root[:-3]
         try:
-            resp = await client.post(f"{root}/api/show", json={"model": model},
-                                     timeout=OLLAMA_SHOW_TIMEOUT_SECONDS)
-            resp.raise_for_status()
-            found = window_from_show(resp.json())
+            found = window_from_show(await _ask_json(client, "POST", f"{bare}/api/show", headers,
+                                                     json={"model": model}))
             log.info("Ollama reports a %s-token window for %s%s.",
                      found if found else "unstated", model,
                      "" if found else "; using GUARDIAN_NUM_CTX=%d" % NUM_CTX)
@@ -1025,7 +1100,24 @@ async def context_window(client: httpx.AsyncClient, model: str) -> int:
                         "GUARDIAN_NUM_CTX=%d for this model.", model,
                         type(exc).__name__, exc, NUM_CTX)
         _ollama_windows[model] = found
-    return _ollama_windows[model] or NUM_CTX
+        # An Ollama upstream is answered by Ollama alone, as in 0.11.0.
+        if found or upstream_is_ollama():
+            return {"window": found, "source": "Ollama", "used": found} if found else None
+    if off:
+        return None
+    for source, method, url, parse in (
+            ("vLLM", "GET", f"{root}/models", lambda d: _vllm_window(d, model)),
+            ("llama.cpp", "GET", f"{bare}/props", _llama_window)):
+        try:
+            found = parse(await _ask_json(client, method, url, headers))
+        except Exception as exc:                           # noqa: BLE001
+            log.debug("%s window probe for %s: %s", source, model, exc)
+            continue
+        if found:
+            used = min(NUM_CTX, found) if NUM_CTX_EXPLICIT else found
+            log.info("%s reports %d for %s", source, found, model)
+            return {"window": found, "source": source, "used": used}
+    return None
 
 
 def estimate_tool_tokens(payload: Dict[str, Any]) -> int:
@@ -2064,7 +2156,7 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any],
     # Compact against the budget the INPUT is actually allowed to occupy, which
     # is the window minus the space the model needs to think and answer. Take
     # whichever limit is stricter so lowering COMPACT_THRESHOLD still works.
-    num_ctx = await context_window(client, calib_model)
+    num_ctx = await context_window(client, calib_model, headers)
     threshold_tokens = effective_threshold(num_ctx=num_ctx)
     _state["last_num_ctx"] = num_ctx
     _state["last_input_budget"] = threshold_tokens
@@ -2362,6 +2454,10 @@ async def stats():
         "inject_stream_options": INJECT_STREAM_OPTIONS,
         "ollama_context_enabled": upstream_is_ollama(),
         "ollama_context": {m: n for m, n in _ollama_windows.items() if n},
+        "detect_context": DETECT_CONTEXT,
+        "num_ctx_explicit": NUM_CTX_EXPLICIT,
+        # What each model's server reported and where from, and the window used.
+        "context_detected": {m: e for m, e in _detected.items() if e},
         "uptime_seconds": round(time.time() - STARTED_AT, 1),
         "cost_per_1m_input_usd": COST_PER_1M_INPUT_USD,
         "cost_saved_usd": cost_saved_usd(),
@@ -2833,7 +2929,7 @@ async def maybe_compact_anthropic(client: httpx.AsyncClient, payload: Dict[str, 
     _state["last_raw_estimate"] = estimated
     if calibration_enabled():
         estimated = int(estimated * CALIBRATOR.factor(model))
-    num_ctx = await context_window(client, model)
+    num_ctx = await context_window(client, model, headers)
     threshold_tokens = effective_threshold(num_ctx=num_ctx)
     _state["last_known_total_tokens"] = estimated
     _state["last_num_ctx"] = num_ctx
