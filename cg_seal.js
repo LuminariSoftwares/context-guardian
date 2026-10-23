@@ -243,6 +243,8 @@ const codePoints = (text) => Array.from(text)
 
 /** A message's prose only: string content, or the text of its text blocks. */
 export function plainText (m) {
+  // A Claude Code transcript line wraps its message ({type, message: {role, content}}); read through to it.
+  if (m && typeof m === 'object' && !('content' in m) && m.message && typeof m.message === 'object' && !Array.isArray(m.message)) m = m.message
   if (!m || typeof m !== 'object') return ''
   if (typeof m.content === 'string') return m.content
   if (Array.isArray(m.content)) return m.content.filter(b => b && typeof b === 'object' && typeof b.text === 'string').map(b => b.text).join('\n')
@@ -272,8 +274,13 @@ export function indexEntry (span, name) {
   const chars = codePoints(text).length
   let digest; let source
   if (typeof span?.summary === 'string' && span.summary.trim() !== '') { digest = firstSentence(span.summary); source = 'summary' } else {
-    const first = messages.find(m => m && m.role === 'user' && plainText(m).trim() !== '')
+    const role = (m) => (m && typeof m === 'object' && !('content' in m) && m.message && typeof m.message.role === 'string') ? m.message.role : (typeof m?.role === 'string' ? m.role : m?.type)
+    const first = messages.find(m => role(m) === 'user' && plainText(m).trim() !== '')
     digest = firstSentence(first ? plainText(first) : ''); source = 'first-user-message'
+    if (digest === '') {
+      const any = messages.find(m => plainText(m).trim() !== '')
+      digest = firstSentence(any ? plainText(any) : ''); source = 'first-message'
+    }
   }
   return {
     span: name.endsWith('.json') ? name.slice(0, -5) : name, ts: typeof span?.at === 'string' ? span.at : '',

@@ -145,13 +145,16 @@ parsed content, so a rebuild produces exactly what live indexing wrote, and the 
 | `messages` | integer | number of messages in the span |
 | `chars` | integer | Unicode code points of the span's *plain text*: each message's string `content`, or the `text` of its text blocks, joined with `\n` (tool-call JSON is not counted) |
 | `est_tokens` | integer | `floor(chars / 3.5)` |
-| `digest` | string | the first sentence of `summary` (or, when the span has no summary, of the first user message with text), at most 160 code points; longer ones are cut to 157 plus `...` |
-| `digest_from` | string | `summary` or `first-user-message` |
+| `digest` | string | the first sentence of `summary`; when the span has no summary, of the first user message with text; failing that, of the first message with text. At most 160 code points; longer ones are cut to 157 plus `...` |
+| `digest_from` | string | `summary`, `first-user-message`, or `first-message` (no user message has text: the first message of any role that does) |
 | `terms` | array of strings | up to 8 keywords |
 
 **First sentence:** collapse every run of whitespace (Python's `str.split()` set) to one space, then take the
 shortest prefix that ends in `.`, `!` or `?` and is followed by a space or the end; if there is none, the whole
 collapsed text.
+
+A message's *role* and *text* are read from the message itself, or, for a Claude Code transcript line that has no
+`content` of its own but a `message` object, from that inner message (`role` falls back to the line's `type`).
 
 **Keywords:** lowercase the first 50,000 code points of the plain text; take every non-overlapping match of
 `[a-z0-9_]{3,40}`, left to right; drop all-digit words and the stopwords listed in `cg_archive.STOPWORDS` (the same

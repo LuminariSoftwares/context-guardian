@@ -81,6 +81,26 @@
   `/guardian/stats` gains a `capture` block.
 - **Off by default**: it writes every message to disk in clear text and grows with the session.
 
+### Claude Code adapter
+
+- **`context-guardian-claude-code`: archive, seal and recall Claude Code sessions.** Claude Code calls Anthropic's API
+  directly, so the proxy cannot sit in front of it, but its hooks hand a command the session id and the transcript
+  path. **`capture`** (the hook entry point) copies the transcript lines it has not copied before into sealed,
+  indexed spans under a `cc-<session_id>` run; `context-guardian-recall`, `--verify` and the MCP tools read them like
+  any other run. It tracks a byte offset per session (and recovers it from the spans themselves if a capture was cut
+  off), copies only complete lines, splits a long first capture into 2 MB spans, always exits 0, logs instead of
+  failing, and exits on a hard internal timeout (20 s, under the hook's 30 s). PreCompact treats exit 2 as "block
+  compaction"; an archiver must never do that. Replayed against a real 3.6 MB transcript: two spans in 0.22 s,
+  `--verify` OK, a second capture adds nothing.
+- **`install`** prints the hooks JSON (PreCompact and SessionEnd, `timeout` 30) and the `claude mcp add` command for
+  the recall server. **`--apply`** backs the settings file up to `settings.json.bak-<YYYYMMDD-HHMMSS>`, merges the
+  hooks next to the ones already there without touching them, and prints a diff; `uninstall --apply` is the exact
+  reverse. Nothing is edited without `--apply`, and a settings file that does not parse is refused. `--scope
+  user|project|local` or `--settings PATH`; `CLAUDE_CONFIG_DIR` is honoured.
+- **`status`**: hooks installed, sessions captured, last capture, seal status.
+- Archived transcript lines are read through to the message inside them for search, roles and digests; a span whose
+  user turns are all tool results takes its digest from the first message with text (`first-message`).
+
 ### Earlier unreleased
 
 - **Releases publish from CI by trusted publishing (OIDC), not from a stored API token.** Publishing a GitHub Release

@@ -1261,82 +1261,53 @@ def write_span(messages: List[Dict[str, Any]], summary: str,
     the request, which is worse. Returns the path written, or None -- and None
     is recorded in the compaction log so a missing span is visible rather than
     silently assumed to exist.
+
+    The file itself is written by cg_archive.write_span_file, which the Claude
+    Code adapter shares:
+
+      * It CLAIMS the index instead of assuming it is free. The caller passes
+        `_state["compactions_performed"] + 1`, and that counter is only
+        incremented AFTER this returns -- with an awaited network call (the
+        summariser) in between. In an async server that await is a yield
+        point, so two requests that both cross the threshold reliably compute
+        the SAME index. Both wrote `0004.json`; the second silently replaced
+        the first, and the surviving summary pointed the model at a file
+        containing somebody else's conversation. An exclusive create makes the
+        loser step to the next free index instead of clobbering.
+      * The content goes to a temp file, is fsynced, and replaces the claim in
+        one rename. Written in place (as before 0.12.0) a crash mid-write left
+        a torn span under the final name, and there was no moment at which
+        "the bytes on disk" were final -- which is the moment the seal hashes.
+      * A failed write removes the claim: an empty or half-written NNNN.json
+        reads as an archived span to recall, prune and the DSH bridge.
     """
-    path, tmp = None, None
     try:
         d = SPAN_DIR / RUN_ID
         _private_mkdir(d)
 
-        # CLAIM the index instead of assuming it is free.
-        #
-        # The caller passes `_state["compactions_performed"] + 1`, and that
-        # counter is only incremented AFTER this returns -- with an awaited
-        # network call (the summariser) sitting in between. In an async server
-        # that await is a yield point, so two requests that both cross the
-        # threshold reliably compute the SAME index. Both wrote `0004.json`;
-        # the second silently replaced the first, the archive lost a span with
-        # no error and no log line, and the surviving summary pointed the model
-        # at a file containing somebody else's conversation.
-        #
-        # The README's headline promise is "lossy in context, lossless on
-        # disk". Under concurrency it was lossy on disk too. `x` mode makes the
-        # create atomic at the filesystem level, so the loser of a race steps
-        # to the next free index rather than clobbering.
-        for candidate in range(index, index + MAX_SPAN_INDEX_PROBE):
-            attempt = d / f"{candidate:04d}.json"
-            try:
-                with open(attempt, "x", encoding="utf-8"):
-                    pass
-            except FileExistsError:
-                continue
-            # Before a byte is written: the file must never exist, even for an
-            # instant, with the umask's mode.
-            _make_private(attempt)
-            path, index = attempt, candidate
-            break
-        if path is None:
+        def payload(claimed: int) -> Dict[str, Any]:
+            return {
+                "run_id": RUN_ID,
+                "index": claimed,
+                "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "num_ctx": NUM_CTX,
+                "message_count": len(messages),
+                "summary": summary,
+                "messages": messages,
+            }
+
+        written = cg_archive.write_span_file(d, index, payload, probe=MAX_SPAN_INDEX_PROBE)
+        if written is None:
             log.warning("could not claim a span index near %d after %d "
                         "attempts -- this span is LOST, not deferred.",
                         index, MAX_SPAN_INDEX_PROBE)
             return None
-
-        payload = {
-            "run_id": RUN_ID,
-            "index": index,
-            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "num_ctx": NUM_CTX,
-            "message_count": len(messages),
-            "summary": summary,
-            "messages": messages,
-        }
-        # The claim is an empty placeholder; the content goes to a temp file,
-        # is fsynced, and replaces the placeholder in one rename. Written in
-        # place (as before 0.12.0) a crash mid-write left a torn span under
-        # the final name, and there was no point at which "the bytes on disk"
-        # were final -- which is the moment the seal has to hash them.
-        tmp = d / (".%s.%d.%d.tmp" % (path.name, os.getpid(), threading.get_ident()))
-        with open(tmp, "x", encoding="utf-8") as fh:
-            _make_private(tmp)
-            json.dump(payload, fh, ensure_ascii=False, indent=1)
-            fh.flush()
-            os.fsync(fh.fileno())
-        cg_archive.replace_file(tmp, path)
-        tmp = None
-        cg_archive.fsync_dir(d)
-        written, path = path, None
-        seal_file(written)
-        index_span(written, payload)
+        path, index, body = written
+        seal_file(path)
+        index_span(path, body)
         prune_spans()
-        return str(written)
+        return str(path)
     except Exception as exc:                               # noqa: BLE001
-        # The claimed file is empty or half-written. Left in place it would
-        # read as an archived span to recall, prune and the DSH bridge.
-        for leftover in (tmp, path):
-            if leftover is not None:
-                try:
-                    leftover.unlink()
-                except OSError:
-                    pass
         log.warning("could not write span %d: %s. The compaction still "
                     "proceeds; this span is LOST, not deferred.", index, exc)
         return None

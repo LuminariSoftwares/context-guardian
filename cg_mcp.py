@@ -377,7 +377,7 @@ def render_message(i: int, m: Any) -> str:
     {role, content: str} message verbatim, anything else (tool calls, content
     blocks, extra keys) as the whole message's JSON. A recall that paraphrases
     the archive is not a recall."""
-    role = m.get("role", "?") if isinstance(m, dict) else "?"
+    role = cg_archive.message_role(m)
     if isinstance(m, dict) and set(m) <= {"role", "content"} and isinstance(m.get("content"), str):
         return "[%d] %s: %s" % (i, role, m["content"])
     return "[%d] %s: %s" % (i, role, json.dumps(m, ensure_ascii=False))

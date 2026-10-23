@@ -199,6 +199,51 @@ def replace_file(src: Path, dst: Path) -> None:
             time.sleep(0.02)
 
 
+def write_span_file(run_dir: Path, start_index: int, payload, probe: int = 50) -> Optional[Tuple[Path, int, Dict[str, Any]]]:
+    """Write one span file: claim the first free NNNN.json at or after
+    start_index with an exclusive create, write payload(index) to a temp file,
+    fsync it and rename it over the claim. Returns (path, index, payload), or
+    None when no index within `probe` is free. Raises when the write fails,
+    after removing the claim and the temp file, so the index is free again.
+
+    The claim is what stops two concurrent writers computing the same index
+    from clobbering each other; the temp file and rename are what make the
+    bytes on disk final before they are sealed.
+    """
+    run_dir = Path(run_dir)
+    path = None
+    for candidate in range(start_index, start_index + probe):
+        attempt = run_dir / ("%04d.json" % candidate)
+        try:
+            with open(attempt, "x", encoding="utf-8"):
+                pass
+        except FileExistsError:
+            continue
+        _make_private(attempt, PRIVATE_FILE_MODE)
+        path, index = attempt, candidate
+        break
+    if path is None:
+        return None
+    tmp = run_dir / (".%s.%d.%d.tmp" % (path.name, os.getpid(), threading.get_ident()))
+    try:
+        body = payload(index)
+        with open(tmp, "x", encoding="utf-8") as fh:
+            _make_private(tmp, PRIVATE_FILE_MODE)
+            json.dump(body, fh, ensure_ascii=False, indent=1)
+            fh.flush()
+            os.fsync(fh.fileno())
+        replace_file(tmp, path)
+        fsync_dir(run_dir)
+    except BaseException:
+        for leftover in (tmp, path):
+            try:
+                leftover.unlink()
+            except OSError:
+                pass
+        raise
+    return path, index, body
+
+
 # --- the lock ------------------------------------------------------------------
 
 class ChainLock:
@@ -212,8 +257,8 @@ class ChainLock:
     cannot get the lock is skipped and logged, never allowed to stall a request.
     """
 
-    def __init__(self, run_dir: Path, timeout: float = LOCK_TIMEOUT_SECONDS):
-        self.path = Path(run_dir) / LOCK_FILE
+    def __init__(self, run_dir: Path, timeout: float = LOCK_TIMEOUT_SECONDS, name: str = LOCK_FILE):
+        self.path = Path(run_dir) / name
         self.timeout = timeout
         key = os.path.abspath(str(self.path))
         with _thread_locks_guard:
@@ -987,8 +1032,28 @@ def est_tokens(text: str) -> int:
     return math.ceil(len(text) / CHARS_PER_TOKEN)
 
 
+def _inner(m: Any) -> Any:
+    """A Claude Code transcript line wraps its message: {"type": "user",
+    "message": {"role": ..., "content": ...}, ...}. Archived verbatim, it is
+    read through to the message inside. Anything with its own content is
+    itself."""
+    if isinstance(m, dict) and "content" not in m and isinstance(m.get("message"), dict):
+        return m["message"]
+    return m
+
+
+def message_role(m: Any) -> str:
+    inner = _inner(m)
+    if isinstance(inner, dict) and isinstance(inner.get("role"), str):
+        return inner["role"]
+    if isinstance(m, dict) and isinstance(m.get("type"), str):
+        return m["type"]
+    return "?"
+
+
 def message_text(m: Any) -> str:
     """Everything searchable in one archived message, as one string."""
+    m = _inner(m)
     if not isinstance(m, dict):
         return str(m)
     parts = []
@@ -1012,6 +1077,7 @@ def plain_text(m: Any) -> str:
     What the index sizes and keywords are computed over -- tool-call JSON is
     serialised differently by every language, and the index must come out the
     same from the proxy and from the engine."""
+    m = _inner(m)
     if not isinstance(m, dict):
         return ""
     content = m.get("content")
@@ -1052,8 +1118,14 @@ def index_entry(span: Dict[str, Any], name: str) -> Dict[str, Any]:
         digest, source = first_sentence(summary), "summary"
     else:
         first_user = next((plain_text(m) for m in messages
-                           if isinstance(m, dict) and m.get("role") == "user" and plain_text(m).strip()), "")
+                           if message_role(m) == "user" and plain_text(m).strip()), "")
         digest, source = first_sentence(first_user), "first-user-message"
+        if not digest:
+            # A span whose user turns are all tool results (common in a Claude
+            # Code transcript) has no user prose; the first message that has
+            # any says more than an empty digest does.
+            first_any = next((plain_text(m) for m in messages if plain_text(m).strip()), "")
+            digest, source = first_sentence(first_any), "first-message"
     at = span.get("at")
     return {"span": name[:-len(".json")] if name.endswith(".json") else name,
             "ts": at if isinstance(at, str) else "",

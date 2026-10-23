@@ -92,7 +92,7 @@ def search(root: Path, term: str, run_id: str | None = None):
             text = message_text(m)
             at = text.lower().find(needle)
             if at >= 0:
-                role = m.get("role", "?") if isinstance(m, dict) else "?"
+                role = cg_archive.message_role(m)
                 yield path, i, role, snippet(text, at, len(term))
         summary = data.get("summary")
         if isinstance(summary, str):
@@ -106,7 +106,7 @@ def search(root: Path, term: str, run_id: str | None = None):
             text = message_text(m)
             at = text.lower().find(needle)
             if at >= 0:
-                role = m.get("role", "?") if isinstance(m, dict) else "?"
+                role = cg_archive.message_role(m)
                 yield path, entry["n"], role, snippet(text, at, len(term))
 
 
@@ -128,7 +128,7 @@ def ranked_search(root: Path, query: str, run: str | None = None):
         data = cg_archive.load_span(path)
         if data is None:
             continue
-        texts = [(i, m.get("role", "?") if isinstance(m, dict) else "?", message_text(m))
+        texts = [(i, cg_archive.message_role(m), message_text(m))
                  for i, m in enumerate(data.get("messages") or [])]
         if isinstance(data.get("summary"), str):
             texts.append(("summary", "summary", data["summary"]))
@@ -140,7 +140,7 @@ def ranked_search(root: Path, query: str, run: str | None = None):
         for path, entry in cg_archive.read_journal(run_dir):
             m = entry.get("message")
             by_file.setdefault(path, []).append(
-                (entry["n"], m.get("role", "?") if isinstance(m, dict) else "?", message_text(m)))
+                (entry["n"], cg_archive.message_role(m), message_text(m)))
         sources.extend(by_file.items())
     found = []
     for path, texts in sources:
