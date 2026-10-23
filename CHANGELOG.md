@@ -160,6 +160,18 @@ everything that existed answers as before.
   If you set `GUARDIAN_NUM_CTX` below your Ollama window, the proxy now compacts at your setting, not at Ollama's
   larger window.
 
+### Detected windows go stale (follow-up 2)
+
+- **A detected window is asked for again.** It was filled once per model for the life of the process, so restarting
+  vLLM or llama-server with a smaller window under the same model name left the proxy budgeting against the old,
+  larger one. The window is now asked again on the request after the upstream rejects one for its context length (a
+  400 or 413 whose body says so: vLLM's `Input length (N) exceeds model's maximum context length (M).`, llama.cpp's
+  `exceed_context_size_error`, Ollama's `the prompt is longer than the context length ...`), and once it is
+  **`GUARDIAN_DETECT_TTL`** seconds old (default 600, `0` never). At most once per model per TTL window; one request
+  waits on the probe while concurrent ones keep the last good window, and a failed probe keeps it too. The proxy never
+  retries the rejected request; the client does, and its retry gets the fresh window. `detect_ttl` is in
+  `/guardian/stats`.
+
 ### Release process
 
 - **Releases publish from CI by trusted publishing (OIDC), not from a stored API token.** Publishing a GitHub Release

@@ -70,11 +70,13 @@ Configuration is environment variables (or a .env beside this file, written
 by `context-guardian-configure`); see the README for the full list.
 """
 
+import asyncio
 import collections
 import contextlib
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -202,6 +204,22 @@ OLLAMA_CONTEXT = os.environ.get("GUARDIAN_OLLAMA_CONTEXT", "auto").strip().lower
 # /props (the per-slot n_ctx). "1" asks every upstream all three ways; "0"
 # asks nothing (GUARDIAN_OLLAMA_CONTEXT=1 still forces the Ollama question).
 DETECT_CONTEXT = os.environ.get("GUARDIAN_DETECT_CONTEXT", "auto").strip().lower()
+
+
+def _detect_ttl(raw: str) -> int:
+    try:
+        n = int(raw.strip())
+    except ValueError:
+        return 600
+    return n if n >= 0 else 600
+
+
+# DETECT_TTL: a detected window goes stale when the server is restarted with a
+# smaller one under the same model name. The window is asked again once it is
+# this many seconds old, and on the request after the upstream rejected one
+# for context length -- either at most once per model per TTL window. "0"
+# never asks again.
+DETECT_TTL = _detect_ttl(os.environ.get("GUARDIAN_DETECT_TTL", "600"))
 OLLAMA_DEFAULT_PORT = 11434
 # /api/show answers from disk in milliseconds; this only bounds a hung server.
 OLLAMA_SHOW_TIMEOUT_SECONDS = 5.0
@@ -974,12 +992,24 @@ async def _loopback_guard(request: Request, call_next):
 
 
 # model name -> window /api/show reported, or None when asking failed. Filled
-# once per model and kept for the life of the process.
+# when a model is first asked, and refreshed as _detected is (below).
 _ollama_windows: Dict[str, Optional[int]] = {}
 # model name -> {"window": what the server reported, "source": Ollama | vLLM |
 # llama.cpp, "used": the window budgeted against}, or None when nothing was
-# reported. Asked once per model, kept for the life of the process.
+# reported. Asked once per model, then again per DETECT_TTL (see
+# context_window); a failed re-probe keeps the last good entry.
 _detected: Dict[str, Optional[Dict[str, Any]]] = {}
+_detected_at: Dict[str, float] = {}       # when each model was last asked
+_last_reprobe: Dict[str, float] = {}      # when each model was last asked AGAIN
+_reprobe_due: set = set()                 # rejected for context length since
+_probing: Dict[str, "asyncio.Future"] = {}
+_clock = time.monotonic
+
+# What vLLM, llama.cpp and Ollama say when a request is over the window, in
+# the body of a 400 (or Ollama's 413). See tests/test_detect_refresh.py for
+# each server's exact text and where it is in their source.
+CONTEXT_REJECTION = re.compile(r"context[ _](length|size|window)|maximum context|max_model_len")
+CONTEXT_REJECTION_MAX_BYTES = 65536
 
 
 def upstream_is_ollama() -> bool:
@@ -1072,10 +1102,94 @@ async def context_window(client: httpx.AsyncClient, model: str,
     """
     if not model:
         return NUM_CTX
-    if model not in _detected:
-        _detected[model] = await _detect_window(client, model, headers)
-    entry = _detected[model]
+    try:
+        if model not in _detected:
+            await _probe(client, model, headers, first=True)
+        elif _reprobe_wanted(model):
+            await _probe(client, model, headers, first=False)
+    except Exception as exc:                               # noqa: BLE001
+        log.debug("window probe for %s failed: %s", model, exc)
+    entry = _detected.get(model)
     return entry["used"] if entry else NUM_CTX
+
+
+def _reprobe_wanted(model: str) -> bool:
+    if DETECT_TTL <= 0:
+        return False
+    return model in _reprobe_due or _clock() - _detected_at.get(model, 0.0) >= DETECT_TTL
+
+
+async def _probe(client, model, headers, first: bool) -> None:
+    """Ask the upstream for `model`'s window, one request at a time.
+
+    A first probe is shared: a concurrent request for the same new model waits
+    for its answer rather than asking too. A re-probe runs on the path of the
+    request that started it only; a concurrent request goes on with the last
+    good window. A re-probe that finds nothing keeps the last good window."""
+    pending = _probing.get(model)
+    if pending is not None:
+        if first:
+            await asyncio.shield(pending)
+        return
+    done = asyncio.get_running_loop().create_future()
+    _probing[model] = done
+    try:
+        _reprobe_due.discard(model)
+        if not first:
+            _last_reprobe[model] = _clock()
+        found = await _detect_window(client, model, headers)
+        if first or found is not None:
+            old = _detected.get(model)
+            _detected[model] = found
+            if not first and old and found and old["used"] != found["used"]:
+                log.warning("the window for %s changed from %d to %d", model, old["used"], found["used"])
+        else:
+            log.info("asking again for the window of %s found nothing; keeping the last good one", model)
+        _detected_at[model] = _clock()
+    finally:
+        _probing.pop(model, None)
+        done.set_result(None)
+
+
+def note_rejection(model: str, status: int, body: bytes, encoding: Optional[str] = None) -> None:
+    """Called with the body of an upstream 400/413. A context-length rejection
+    means the window this proxy budgets against may be stale (the server was
+    restarted with a smaller one): ask again on the next request, at most
+    once per model per DETECT_TTL. The rejected request is not retried; the
+    client does that. Never raises."""
+    try:
+        if status not in (400, 413) or not model or DETECT_TTL <= 0 or model not in _detected:
+            return
+        if encoding:
+            if encoding.strip().lower() not in ("gzip", "deflate"):
+                return
+            import zlib
+            body = zlib.decompressobj(47).decompress(body, CONTEXT_REJECTION_MAX_BYTES)
+        if not CONTEXT_REJECTION.search(body.decode("utf-8", "replace").lower()):
+            return
+        last = _last_reprobe.get(model)
+        if last is not None and _clock() - last < DETECT_TTL:
+            return
+        if model not in _reprobe_due:
+            log.info("the upstream rejected a request for %s for its context length; "
+                     "asking for its window again on the next request", model)
+        _reprobe_due.add(model)
+    except Exception as exc:                               # noqa: BLE001
+        log.debug("context rejection check failed: %s", exc)
+
+
+async def _rejection_tap(chunks, upstream_resp: httpx.Response, model: str):
+    """Pass an error response through untouched, keeping a capped copy for
+    note_rejection once it has been delivered."""
+    buffer = bytearray()
+    try:
+        async for chunk in chunks:
+            if len(buffer) < CONTEXT_REJECTION_MAX_BYTES:
+                buffer += chunk[:CONTEXT_REJECTION_MAX_BYTES - len(buffer)]
+            yield chunk
+    finally:
+        note_rejection(model, upstream_resp.status_code, bytes(buffer),
+                       upstream_resp.headers.get("content-encoding"))
 
 
 async def _detect_window(client, model, headers) -> Optional[Dict[str, Any]]:
@@ -1098,7 +1212,8 @@ async def _detect_window(client, model, headers) -> Optional[Dict[str, Any]]:
             log.warning("Ollama /api/show for %s failed (%s: %s); using "
                         "GUARDIAN_NUM_CTX=%d for this model.", model,
                         type(exc).__name__, exc, NUM_CTX)
-        _ollama_windows[model] = found
+        if found or model not in _ollama_windows:      # a failed re-probe keeps the last good one
+            _ollama_windows[model] = found
         # An Ollama upstream is answered by Ollama alone, as in 0.11.0, and
         # its num_ctx follows the same min() rule as vLLM and llama.cpp.
         if found or upstream_is_ollama():
@@ -2458,6 +2573,7 @@ async def stats():
         "ollama_context_enabled": upstream_is_ollama(),
         "ollama_context": {m: n for m, n in _ollama_windows.items() if n},
         "detect_context": DETECT_CONTEXT,
+        "detect_ttl": DETECT_TTL,
         "num_ctx_explicit": NUM_CTX_EXPLICIT,
         # What each model's server reported and where from, and the window used.
         "context_detected": {m: e for m, e in _detected.items() if e},
@@ -3019,6 +3135,8 @@ async def proxy(path: str, request: Request):
     # calibration switched on; `None` is the "stream it untouched" signal.
     calib_model = None
     calib_estimate = None
+    # The model a chat or messages request names, for note_rejection.
+    window_model = ""
     if path == "chat/completions" and request.method == "POST" and body_bytes:
         try:
             payload = json.loads(body_bytes)
@@ -3032,6 +3150,7 @@ async def proxy(path: str, request: Request):
         # an object is not something this proxy understands; pass it through
         # untouched and let the backend rule on it.
         if isinstance(payload, dict):
+            window_model = str(payload.get("model") or "")
             capture_messages(payload.get("messages"))
             # FAIL-OPEN for the whole rewrite step. Whatever raises in here --
             # a bug in compaction, a dry run, an injected field -- costs the
@@ -3066,6 +3185,7 @@ async def proxy(path: str, request: Request):
         try:
             payload = json.loads(body_bytes)
             if isinstance(payload, dict):
+                window_model = str(payload.get("model") or "")
                 capture_messages(payload.get("messages"), payload.get("system"))
                 rewritten = await maybe_compact_anthropic(client, payload, headers)
                 if rewritten is not payload:
@@ -3122,6 +3242,8 @@ async def proxy(path: str, request: Request):
                                      calib_model, calib_estimate)
     else:
         body_stream = upstream_resp.aiter_raw()
+    if window_model and upstream_resp.status_code in (400, 413):
+        body_stream = _rejection_tap(body_stream, upstream_resp, window_model)
     return StreamingResponse(
         body_stream,
         status_code=upstream_resp.status_code,
