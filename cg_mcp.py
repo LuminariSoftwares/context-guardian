@@ -27,6 +27,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, Optional
 
+import cg_archive
 import cg_paths
 import cg_recall_cli
 
@@ -239,7 +240,7 @@ def _span_root():
     return root
 
 
-def _get_proxy_status(_args: Dict[str, Any]):
+def _get_proxy_status(_args: Dict[str, Any], _counts: Optional[Dict[str, int]] = None):
     host = os.environ.get("GUARDIAN_HOST", "127.0.0.1")
     if host in ("0.0.0.0", "::", ""):
         host = "127.0.0.1"
@@ -256,7 +257,8 @@ def _get_proxy_status(_args: Dict[str, Any]):
     return json.dumps(stats, indent=1, sort_keys=True), stats
 
 
-def _list_spans(args: Dict[str, Any]) -> str:
+def _list_spans(args: Dict[str, Any], counts: Optional[Dict[str, int]] = None) -> str:
+    counts = {} if counts is None else counts
     run = _run_arg(args, required=False)
     limit = _limit(args, DEFAULT_LIST_ENTRIES, MAX_LIST_ENTRIES)
     root = _span_root()
@@ -287,6 +289,7 @@ def _list_spans(args: Dict[str, Any]) -> str:
                 summary = summary[:LIST_SUMMARY_CHARS] + "..."
             lines.append(f"{run}/{path.name}, {count} messages: {summary}")
         total, what = len(spans), "spans"
+        counts["spans_matched"] = min(limit, len(spans))
     if not lines:
         return f"No {what} in the span archive yet."
     if total > limit:
@@ -294,17 +297,21 @@ def _list_spans(args: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _search_spans(args: Dict[str, Any]) -> str:
+def _search_spans(args: Dict[str, Any], counts: Optional[Dict[str, int]] = None) -> str:
+    counts = {} if counts is None else counts
     term = args.get("term")
     if not isinstance(term, str) or not term.strip():
         raise ToolError("search_spans needs a non-empty `term`.")
     run = _run_arg(args, required=False)
     limit = _limit(args, MAX_SEARCH_HITS, MAX_SEARCH_HITS)
     root = _span_root()
-    lines = []
+    lines, matched = [], set()
+    counts["query_terms"] = len(term.split())
     for path, idx, role, text in cg_recall_cli.search(root, term, run):
         label = "summary" if idx == "summary" else f"msg {idx} [{role}]"
         lines.append(f"{path.parent.name}/{path.name} {label}: {text}")
+        matched.add(path)
+        counts["spans_matched"] = len(matched)
         if len(lines) >= limit:
             lines.append(f"(stopped at {limit} hits; narrow the term or pass run)")
             break
@@ -315,7 +322,8 @@ def _search_spans(args: Dict[str, Any]) -> str:
     return body + "\n\n" + ARCHIVED_DATA_NOTE
 
 
-def _read_span(args: Dict[str, Any]) -> str:
+def _read_span(args: Dict[str, Any], counts: Optional[Dict[str, int]] = None) -> str:
+    counts = {} if counts is None else counts
     run, index = _run_arg(args, required=True), args.get("index")
     if not isinstance(index, int) or isinstance(index, bool) or index < 1:
         raise ToolError("`index` must be a positive integer.")
@@ -326,6 +334,7 @@ def _read_span(args: Dict[str, Any]) -> str:
         raise ToolError(f"No readable span {run}/{index:04d}.json.") from exc
     if not isinstance(data, dict):
         raise ToolError(f"Span {run}/{index:04d}.json is not a span.")
+    counts["spans_opened"] = 1
     messages = data.get("messages") if isinstance(data.get("messages"), list) else []
     out = [f"span {run}/{index:04d}.json, {len(messages)} messages",
            f"summary: {data.get('summary', '')}", ""]
@@ -341,6 +350,9 @@ def _read_span(args: Dict[str, Any]) -> str:
 
 # A handler returns the text result, or (text, structuredContent) for a tool
 # that declares an outputSchema.
+# The tools that read the archive, and so leave a receipt. get_proxy_status
+# reads the proxy, not the archive.
+RECALL_TOOLS = ("list_spans", "search_spans", "read_span")
 HANDLERS = {"get_proxy_status": _get_proxy_status, "list_spans": _list_spans,
             "search_spans": _search_spans, "read_span": _read_span}
 
@@ -374,9 +386,14 @@ def handle(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if handler is None:
             return err(-32602, f"Unknown tool: {name}")
         args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+        canonical_name = DEPRECATED_ALIASES.get(name, name)
+        counts: Dict[str, int] = {}
         try:
-            out = handler(args)
+            out = handler(args, counts)
             text, structured = out if isinstance(out, tuple) else (out, None)
+            if canonical_name in RECALL_TOOLS:
+                # Counts only: see cg_archive.record_receipt. Never raises.
+                cg_archive.record_recall("mcp." + canonical_name, chars_returned=len(text), **counts)
             result = {"content": [{"type": "text", "text": text}], "isError": False}
             if structured is not None:
                 result["structuredContent"] = structured

@@ -300,6 +300,21 @@ SEAL = os.environ.get("GUARDIAN_SEAL", "1").strip().lower() not in ("0", "false"
 # storage, another disk) and every new head is appended there too; --verify
 # then checks the chain against it.
 SEAL_ANCHOR_PATH = os.environ.get("GUARDIAN_SEAL_ANCHOR_PATH", "").strip() or None
+# RECEIPTS: counts-only evidence of what the archive is worth -- characters
+# archived, compactions whose summary points at the archive, and recall tool
+# calls the model actually made, seen in the tool_calls of later requests.
+# Appended to <data dir>/logs/receipts.jsonl (GUARDIAN_RECEIPTS_PATH) as
+# integers and booleans only; read per event, so GUARDIAN_RECEIPTS=0 takes
+# effect without a restart. Never leaves the machine. See cg_archive.py.
+# The recall tools as the model sees them. MCP clients prefix a server's tools
+# (`mcp__context-guardian__search_spans` in Claude Code), so a call is matched
+# on its last name segment; a shell call is matched on the command it runs.
+RECALL_TOOL_NAMES = ("search_spans", "read_span", "list_spans", "list_digests",
+                     "get_seal_status")
+RECALL_COMMAND = "context-guardian-recall"
+# Clients resend the whole history every request, so one recall call arrives
+# again and again. Remembered by id, bounded, so it is counted once.
+RECALL_SEEN_MAX = 10_000
 # How far write_span will walk forward to find a free index when two
 # concurrent compactions compute the same one. Bounded so a directory full of
 # spans cannot turn into an unbounded loop on the request path.
@@ -513,6 +528,11 @@ _state = {
     # spans of this run will verify as unsealed.
     "seal_failures": 0,
 }
+
+# Receipts counters for this process: what /guardian/stats shows. The file
+# keeps the durable record across restarts; see note_compaction_receipt.
+_receipts = {"chars_archived": 0, "compactions_with_pointer": 0, "recall_calls_seen": 0}
+_recall_seen: "collections.OrderedDict[str, None]" = collections.OrderedDict()
 
 # When this process started, for the health view's uptime line.
 STARTED_AT = time.time()
@@ -1325,6 +1345,69 @@ def seal_file(path: Path, kind: str = "span") -> Optional[Dict[str, Any]]:
         return None
 
 
+def note_compaction_receipt(archived: List[Dict[str, Any]], pointer: str,
+                            tokens_saved: int) -> None:
+    """Count one applied compaction for the receipts. Never raises."""
+    try:
+        chars = _json_chars(archived)
+        _receipts["chars_archived"] += chars
+        if pointer:
+            _receipts["compactions_with_pointer"] += 1
+        cg_archive.record_receipt("proxy.compaction", chars_archived=chars,
+                                  pointer=bool(pointer), tokens_saved=int(tokens_saved))
+    except Exception as exc:                               # noqa: BLE001
+        log.debug("receipt not recorded, request unaffected: %s", exc)
+
+
+def _recall_call_keys(messages: Any) -> List[str]:
+    """A stable key per recall tool call in a message list: the call's id when
+    it has one, else a hash of its name and arguments. Both the OpenAI shape
+    (assistant tool_calls) and the Anthropic one (tool_use blocks)."""
+    import hashlib
+    keys = []
+    for m in messages if isinstance(messages, list) else []:
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        calls = []
+        for call in m.get("tool_calls") or []:
+            if isinstance(call, dict):
+                fn = call.get("function") or {}
+                calls.append((call.get("id"), fn.get("name"), fn.get("arguments")))
+        content = m.get("content")
+        for block in content if isinstance(content, list) else []:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                calls.append((block.get("id"), block.get("name"), block.get("input")))
+        for call_id, name, arguments in calls:
+            name = str(name or "")
+            short = name.rsplit("__", 1)[-1].rsplit(".", 1)[-1]
+            args_text = arguments if isinstance(arguments, str) else _json_dump(arguments)
+            if short not in RECALL_TOOL_NAMES and RECALL_COMMAND not in args_text:
+                continue
+            keys.append(str(call_id) if call_id else
+                        hashlib.sha256((name + "\0" + args_text).encode("utf-8", "replace")).hexdigest())
+    return keys
+
+
+def note_recall_calls(messages: Any) -> int:
+    """Count recall tool calls this proxy has not seen before. Never raises."""
+    try:
+        new = 0
+        for key in _recall_call_keys(messages):
+            if key in _recall_seen:
+                continue
+            _recall_seen[key] = None
+            if len(_recall_seen) > RECALL_SEEN_MAX:
+                _recall_seen.popitem(last=False)
+            new += 1
+        if new:
+            _receipts["recall_calls_seen"] += new
+            cg_archive.record_receipt("proxy.recall_seen", calls=new)
+        return new
+    except Exception as exc:                               # noqa: BLE001
+        log.debug("recall receipt not recorded, request unaffected: %s", exc)
+        return 0
+
+
 def prune_spans() -> None:
     """Housekeeping only -- never allowed to break a request."""
     try:
@@ -1759,6 +1842,7 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any],
     actually succeeded -- see fail-open comment above."""
     messages = payload.get("messages", [])
     _state["requests_seen"] += 1
+    note_recall_calls(messages)
 
     message_tokens = estimate_tokens(messages)
     tool_tokens = estimate_tool_tokens(payload)
@@ -1897,6 +1981,7 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any],
     tokens_saved = event["tokens_saved"]
     _state["tokens_saved_total"] += tokens_saved
     log_event(event)
+    note_compaction_receipt(to_summarize, pointer, tokens_saved)
 
     if VERBOSE:
         # A visible banner, not a line that scrolls past in a busy log. This is
@@ -2088,6 +2173,7 @@ async def stats():
         "span_dir": str(SPAN_DIR),
         "upstream": UPSTREAM_URL,
         "seal": seal_status(),
+        "receipts": {"enabled": cg_archive.receipts_enabled(), **_receipts},
         **_state,
         # What the proxy has learned about its own estimate error, per model.
         # `last_raw_estimate` above is the pre-correction figure; this is what
@@ -2212,6 +2298,7 @@ _HEALTH_HTML = """<!doctype html>
   #notice.show{display:block}
   code{background:#21262d;padding:1px 5px;border-radius:4px}
   footer{padding:6px 22px 22px;color:#8b949e;font-size:12px}
+  .receipts{padding:0 22px;color:#8b949e;font-size:13px;max-width:996px}
   [hidden]{display:none!important}
 </style></head><body>
 <header>
@@ -2235,6 +2322,7 @@ _HEALTH_HTML = """<!doctype html>
 
 <div class="advice" id="advice" hidden></div>
 <main id="cards"></main>
+<div class="receipts" id="receipts"></div>
 <footer>Auto-refreshing every 3s from <code>/guardian/stats</code> + <code>/guardian/events</code>. Local, unauthenticated, loopback-only.</footer>
 
 <script>
@@ -2339,6 +2427,13 @@ async function tick(){
       `conversation on top of this floor but cannot shrink the floor itself. To free real room, load `+
       `fewer MCP servers (e.g. <code>--mcp-config &lt;file&gt; --strict-mcp-config</code>).`;
   } else { adv.hidden=true; }
+
+  // Receipts: counts only, local only (GUARDIAN_RECEIPTS). The seal head is the
+  // value to copy elsewhere to pin the archive as it is now.
+  const r=s.receipts||{}, seal=s.seal||{};
+  $("receipts").textContent=r.enabled===false?"Receipts off (GUARDIAN_RECEIPTS=0).":
+    `Receipts this run: ${fmt(r.compactions_with_pointer)} compaction(s) archived ${fmt(r.chars_archived)} chars, `+
+    `${fmt(r.recall_calls_seen)} recall call(s) seen · seal ${seal.enabled===false?"off":seal.head?"head "+seal.head.slice(0,12)+"… at seq "+seal.seq:"no spans yet"}`;
 
   const n=$("notice");
   if(s.update_available){n.className="show";
@@ -2518,6 +2613,7 @@ async def maybe_compact_anthropic(client: httpx.AsyncClient, payload: Dict[str, 
     if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
         return payload
     _state["requests_seen"] += 1
+    note_recall_calls(messages)
     system = payload.get("system")
     system_tokens = int(len(_anthropic_text(system)) / CHARS_PER_TOKEN_ESTIMATE)
     message_tokens = estimate_tokens(messages) + system_tokens
@@ -2558,8 +2654,8 @@ async def maybe_compact_anthropic(client: httpx.AsyncClient, payload: Dict[str, 
         return payload
 
     span_path = write_span(to_summarize, summary, _state["compactions_performed"] + 1)
-    note = _summary_message(to_summarize, summary,
-                            _span_pointer(to_summarize, span_path))["content"]
+    pointer = _span_pointer(to_summarize, span_path)
+    note = _summary_message(to_summarize, summary, pointer)["content"]
     out = dict(payload)
     if isinstance(system, list):
         out["system"] = system + [{"type": "text", "text": note}]
@@ -2575,6 +2671,7 @@ async def maybe_compact_anthropic(client: httpx.AsyncClient, payload: Dict[str, 
     event["route"] = "messages"
     _state["tokens_saved_total"] += event["tokens_saved"]
     log_event(event)
+    note_compaction_receipt(to_summarize, pointer, event["tokens_saved"])
     log.info("Compacted Anthropic request %d -> %d messages, ~%d -> ~%d tokens.",
              len(messages), len(to_keep), estimated, event["estimated_tokens_after"])
     return out

@@ -3,6 +3,7 @@
 
     context-guardian-recall <term> [--run RUN_ID]
     context-guardian-recall --verify [--run RUN_ID | --all] [--heads] [--seal-existing]
+    context-guardian-recall --receipts [--since 7d] [--share]
 
 A compaction folds older messages into a summary and archives the full text as
 <GUARDIAN_SPAN_DIR>/<run_id>/<NNNN>.json. The summary the model receives names
@@ -19,6 +20,11 @@ first break per run; exit 0 only when every checked run is OK. Without --run
 or --all it checks the most recently written run. --heads prints each run's
 chain head; --seal-existing seals spans written before sealing existed, marked
 backfilled. GUARDIAN_SEAL_ANCHOR_PATH, when that file exists, is checked too.
+
+--receipts adds up the counts-only receipts every recall path writes (see
+cg_archive.py): archive size, recall calls, spans opened, the share of the
+archive read back, tokens saved, seal status. --share prints the same as a
+short block with no paths, no text and no run ids.
 Stdlib only, Python 3.10+. MIT.
 """
 from __future__ import annotations
@@ -149,6 +155,22 @@ def cmd_verify(ns, root: Path) -> int:
     return 0 if bad == 0 else 1
 
 
+def cmd_receipts(ns, root: Path) -> int:
+    try:
+        since = cg_archive.parse_since(ns.since)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    events = cg_archive.read_receipts(cg_archive.receipts_path(), since)
+    reports = cg_archive.verify(root, all_runs=True, anchor_path=anchor_path()) if root.is_dir() else []
+    summary = cg_archive.receipts_summary(events, root, reports)
+    window = "last %s" % ns.since if ns.since else "all time"
+    print(cg_archive.format_receipts(summary, window, share=ns.share))
+    if not cg_archive.receipts_enabled():
+        print("(GUARDIAN_RECEIPTS=0: nothing new is being recorded)", file=sys.stderr)
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="context-guardian-recall",
@@ -167,9 +189,18 @@ def main(argv=None) -> int:
                        help="with --verify: print each run's chain head")
     group.add_argument("--seal-existing", action="store_true",
                        help="with --verify: seal files written before sealing existed (marked backfilled)")
+    group = parser.add_argument_group("receipts")
+    group.add_argument("--receipts", action="store_true",
+                       help="summarise the counts-only recall receipts")
+    group.add_argument("--since", metavar="AGE", default=None,
+                       help="with --receipts: only the last AGE, e.g. 24h, 7d, 2w")
+    group.add_argument("--share", action="store_true",
+                       help="with --receipts: a short copy-paste block with no paths, text or run ids")
     ns = parser.parse_args(sys.argv[1:] if argv is None else argv)
 
     root = span_dir()
+    if ns.receipts or ns.share:
+        return cmd_receipts(ns, root)
     if ns.verify or ns.heads or ns.seal_existing:
         return cmd_verify(ns, root)
     if not ns.term:
@@ -177,14 +208,19 @@ def main(argv=None) -> int:
     if not root.is_dir():
         print(f"no span archive at {root} (set GUARDIAN_SPAN_DIR)", file=sys.stderr)
         return 2
-    hits = 0
+    hits, chars, matched = 0, 0, set()
     for path, idx, role, text in search(root, ns.term, ns.run):
         label = "summary" if idx == "summary" else f"msg {idx} [{role}]"
-        print(f"{path} {label}: {text}")
+        line = f"{path} {label}: {text}"
+        print(line)
         hits += 1
+        chars += len(line)
+        matched.add(path)
         if hits >= ns.max:
             print(f"(stopped at {ns.max} hits; narrow the term or pass --run)")
             break
+    cg_archive.record_recall("cli.search", query_terms=len(ns.term.split()),
+                             spans_matched=len(matched), chars_returned=chars)
     if hits == 0:
         where = f"{root / ns.run}" if ns.run else str(root)
         print(f"no match for {ns.term!r} under {where}", file=sys.stderr)

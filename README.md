@@ -411,6 +411,8 @@ cp .env.example .env
 | `GUARDIAN_KEEP_SPANS` | `500` | How many span files to keep. `0` keeps none |
 | `GUARDIAN_SEAL` | `1` | Seal the archive: every span file is hashed as it is on disk and chained into `<run>/chain.jsonl`, so `context-guardian-recall --verify` can show nothing was changed, removed or reordered since. A pruned span is recorded as pruned, not reported as missing. `0` writes no chain |
 | `GUARDIAN_SEAL_ANCHOR_PATH` | unset | A file **outside** the data directory (synced storage, another disk). Every new chain head is appended to it, and `--verify` checks the chain against it, which catches a chain someone rewrote and rehashed |
+| `GUARDIAN_RECEIPTS` | `1` | Counts-only receipts: every recall (CLI and MCP tools) and every compaction appends a line of numbers to the receipts file, which `context-guardian-recall --receipts` adds up. No message text, query text, path or run id is ever written, and nothing leaves the machine. `0` records nothing |
+| `GUARDIAN_RECEIPTS_PATH` | `<data dir>/logs/receipts.jsonl` | Where receipts are appended |
 | `GUARDIAN_KEEP_SUMMARIES` | `1` | How many of Guardian's own previous summaries stay in the window. Retired ones are folded into the next span, not discarded |
 | `GUARDIAN_MIN_SUMMARY_CHARS` | `40` | A summary shorter than this is treated as a FAILED summarisation and nothing is evicted. See 0.4.0 in the changelog for why this exists |
 | `GUARDIAN_MIN_TRANSCRIPT_CHARS` | `80` | If the messages being evicted render to less than this, Guardian refuses to summarise rather than summarising nothing |

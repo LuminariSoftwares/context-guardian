@@ -28,6 +28,22 @@
 - **`docs/ARCHIVE_FORMAT.md`** specifies the span file, the chain, the lock and the anchor precisely enough to write an
   independent verifier.
 
+### Recall receipts
+
+- **Receipts: real numbers instead of adjectives.** Every recall path (`context-guardian-recall`, the MCP span tools)
+  and every compaction appends one counts-only line to `<data dir>/logs/receipts.jsonl`
+  (**`GUARDIAN_RECEIPTS_PATH`**): query terms as a count, spans matched and opened, characters returned, characters
+  archived, whether the summary carried an archive pointer, tokens saved. The proxy also counts recall tool calls it
+  sees in later requests' `tool_calls` (`search_spans`, `mcp__context-guardian__search_spans`, a shell call to
+  `context-guardian-recall`), once per call although clients resend the history every turn.
+- **Counts only, by construction.** A receipt can hold a tool name from a fixed list, a timestamp and integers or
+  booleans, nothing else; a test plants a unique string in the conversation, the query and the path and asserts it
+  appears in no receipt and no output. Nothing leaves the machine. **`GUARDIAN_RECEIPTS=0`** records nothing.
+- **`context-guardian-recall --receipts [--since 7d]`** prints archive size, recall calls, spans opened, the share of
+  the archive read back, tokens saved and seal status. **`--share`** prints the same as a five-line block with no
+  paths, no text and no run ids. A corrupt receipts line is skipped.
+- `/guardian/stats` gains a `receipts` block and `/guardian/health` a receipts line with this run's seal head.
+
 ### Earlier unreleased
 
 - **Releases publish from CI by trusted publishing (OIDC), not from a stored API token.** Publishing a GitHub Release

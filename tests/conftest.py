@@ -29,6 +29,7 @@ atexit.register(shutil.rmtree, _SESSION_DIR, ignore_errors=True)
 os.environ["GUARDIAN_SPAN_DIR"] = os.path.join(_SESSION_DIR, "guardian_spans")
 os.environ["GUARDIAN_LOG_PATH"] = os.path.join(_SESSION_DIR, "context_guardian_log.json")
 os.environ["GUARDIAN_VERSION_CACHE"] = os.path.join(_SESSION_DIR, "version_cache.json")
+os.environ["GUARDIAN_RECEIPTS_PATH"] = os.path.join(_SESSION_DIR, "receipts.jsonl")
 
 
 @pytest.fixture(autouse=True)
@@ -36,6 +37,7 @@ def _guardian_writes_to_tmp(monkeypatch, tmp_path):
     monkeypatch.setenv("GUARDIAN_SPAN_DIR", str(tmp_path / "guardian_spans"))
     monkeypatch.setenv("GUARDIAN_LOG_PATH", str(tmp_path / "context_guardian_log.json"))
     monkeypatch.setenv("GUARDIAN_VERSION_CACHE", str(tmp_path / "version_cache.json"))
+    monkeypatch.setenv("GUARDIAN_RECEIPTS_PATH", str(tmp_path / "receipts.jsonl"))
 
 
 @pytest.mark.asyncio

@@ -676,3 +676,236 @@ def format_report(r: RunReport) -> str:
                 % (r.run, r.detail))
     where = " at seq %d" % r.seq if r.seq is not None else ""
     return "%s  BREAK     %s%s: %s" % (r.run, r.kind, where, r.detail)
+
+
+# --- receipts --------------------------------------------------------------------
+#
+# Real numbers instead of adjectives: how much was archived, how often anything
+# was recalled, how much of the archive was read back. One counts-only JSON line
+# per event in <data dir>/logs/receipts.jsonl, local only.
+#
+# PRIVACY BY CONSTRUCTION. A receipt may carry a tool name from the fixed list
+# below, a timestamp, and integers or booleans -- nothing else is written, so no
+# message text, query text, file path or run id can reach the file whatever a
+# caller passes. tests/test_receipts.py plants a unique string in all four and
+# asserts it never appears.
+
+RECEIPT_TOOLS = frozenset((
+    "cli.search", "mcp.list_spans", "mcp.search_spans", "mcp.read_span",
+    "mcp.list_digests", "mcp.get_seal_status", "proxy.compaction", "proxy.recall_seen",
+))
+RECALL_FIELDS = ("query_terms", "spans_matched", "spans_opened", "chars_returned")
+_OFF = ("0", "false", "no", "off")
+_SINCE_RE = re.compile(r"^\s*(\d+)\s*([mhdw])\s*$", re.I)
+_SINCE_UNITS = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def receipts_enabled(env: Optional[Dict[str, str]] = None) -> bool:
+    """GUARDIAN_RECEIPTS, read at call time. Default on."""
+    env = os.environ if env is None else env
+    return (env.get("GUARDIAN_RECEIPTS") or "1").strip().lower() not in _OFF
+
+
+def receipts_path(env: Optional[Dict[str, str]] = None) -> Path:
+    """GUARDIAN_RECEIPTS_PATH, else <data dir>/logs/receipts.jsonl -- under logs/
+    so a checkout's .gitignore already covers it."""
+    env = os.environ if env is None else env
+    chosen = (env.get("GUARDIAN_RECEIPTS_PATH") or "").strip()
+    if chosen:
+        return Path(chosen)
+    import cg_paths
+    return cg_paths.data_dir() / cg_paths.RECEIPTS_SUBPATH
+
+
+def record_receipt(tool: str, path: Optional[Path] = None, **counts: Any) -> bool:
+    """Append one receipt. Only int and bool values are kept. Never raises:
+    a receipt is bookkeeping, and bookkeeping must not cost a recall or a
+    request. Returns whether a line was written."""
+    try:
+        if tool not in RECEIPT_TOOLS or not receipts_enabled():
+            return False
+        line: Dict[str, Any] = {"ts": now_iso(), "tool": tool}
+        for key, value in counts.items():
+            if isinstance(value, bool) or (isinstance(value, int) and value >= 0):
+                line[key] = value
+        target = Path(path) if path else receipts_path()
+        missing = [p for p in (target.parent, *target.parent.parents) if not p.exists()]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        for made in missing:
+            _make_private(made, PRIVATE_DIR_MODE)
+        new_file = not target.exists()
+        with open(target, "a", encoding="utf-8") as fh:
+            if new_file:
+                _make_private(target, PRIVATE_FILE_MODE)
+            fh.write(json.dumps(line, sort_keys=True) + "\n")
+        return True
+    except Exception:                                      # noqa: BLE001
+        return False
+
+
+def record_recall(tool: str, query_terms: int = 0, spans_matched: int = 0,
+                  spans_opened: int = 0, chars_returned: int = 0) -> bool:
+    """One recall-path receipt with all four counts, zeros included, so every
+    recall line has the same shape."""
+    return record_receipt(tool, query_terms=query_terms, spans_matched=spans_matched,
+                          spans_opened=spans_opened, chars_returned=chars_returned)
+
+
+def parse_since(text: Optional[str]) -> Optional[datetime.timedelta]:
+    """'7d', '24h', '30m', '2w' -> timedelta; None for no limit. Raises
+    ValueError on anything else."""
+    if not text:
+        return None
+    m = _SINCE_RE.match(text)
+    if not m:
+        raise ValueError("--since takes a number and a unit: 30m, 24h, 7d, 2w")
+    return datetime.timedelta(seconds=int(m.group(1)) * _SINCE_UNITS[m.group(2).lower()])
+
+
+def _parse_ts(value: Any) -> Optional[datetime.datetime]:
+    if not isinstance(value, str):
+        return None
+    try:
+        ts = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.astimezone()
+    return ts
+
+
+def read_receipts(path: Path, since: Optional[datetime.timedelta] = None) -> List[Dict[str, Any]]:
+    """Every well-formed receipt, oldest first. A line that is not a JSON
+    object with a known tool and a readable timestamp is skipped: one torn or
+    hand-edited line must not hide the rest."""
+    out: List[Dict[str, Any]] = []
+    cutoff = (datetime.datetime.now().astimezone() - since) if since else None
+    try:
+        fh = open(path, "rb")
+    except OSError:
+        return out
+    with fh:
+        for raw in fh:
+            try:
+                obj = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(obj, dict) or obj.get("tool") not in RECEIPT_TOOLS:
+                continue
+            ts = _parse_ts(obj.get("ts"))
+            if ts is None or (cutoff is not None and ts < cutoff):
+                continue
+            out.append(obj)
+    return out
+
+
+def _count(e: Dict[str, Any], key: str) -> int:
+    value = e.get(key, 0)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def archive_size(span_dir: Path) -> Tuple[int, int, int]:
+    """(runs, span files, bytes) currently on disk."""
+    runs = spans = size = 0
+    for d in run_dirs(span_dir):
+        names = [n for n in archived_files(d) if SPAN_NAME_RE.match(n)]
+        if names:
+            runs += 1
+        for name in archived_files(d):
+            try:
+                size += (d / name).stat().st_size
+            except OSError:
+                pass
+        spans += len(names)
+    return runs, spans, size
+
+
+def receipts_summary(events: List[Dict[str, Any]], span_dir: Path,
+                     seal_reports: Optional[List[RunReport]] = None) -> Dict[str, Any]:
+    """Everything --receipts prints, as numbers."""
+    recall = [e for e in events if e["tool"].startswith(("cli.", "mcp."))]
+    compactions = [e for e in events if e["tool"] == "proxy.compaction"]
+    runs, spans, size = archive_size(span_dir)
+    by_tool: Dict[str, int] = {}
+    for e in recall:
+        name = e["tool"].split(".", 1)[1]
+        by_tool[name] = by_tool.get(name, 0) + 1
+    chars_returned = sum(_count(e, "chars_returned") for e in recall)
+    out = {
+        "archive_runs": runs, "archive_spans": spans, "archive_bytes": size,
+        "recall_calls": len(recall), "recall_by_tool": by_tool,
+        "spans_opened": sum(_count(e, "spans_opened") for e in recall),
+        "spans_matched": sum(_count(e, "spans_matched") for e in recall),
+        "chars_returned": chars_returned,
+        # Characters returned against bytes archived: the same unit for ASCII
+        # text and close for the rest, and a number nobody can inflate by
+        # opening the same span twice past 100%.
+        "share_read": min(1.0, chars_returned / size) if size else 0.0,
+        "compactions": len(compactions),
+        "compactions_with_pointer": sum(1 for e in compactions if e.get("pointer") is True),
+        "chars_archived": sum(_count(e, "chars_archived") for e in compactions),
+        "tokens_saved": sum(_count(e, "tokens_saved") for e in compactions),
+        "recall_calls_seen_by_proxy": sum(_count(e, "calls") for e in events
+                                          if e["tool"] == "proxy.recall_seen"),
+    }
+    if seal_reports is not None:
+        out["seal"] = summarise(seal_reports)
+    return out
+
+
+def _mb(n: int) -> str:
+    return "%.1f MB" % (n / 1e6) if n >= 100_000 else "%d KB" % round(n / 1000)
+
+
+def _seal_line(seal: Optional[Dict[str, int]]) -> str:
+    if not seal:
+        return "not checked"
+    if seal["runs"] == 0:
+        return "nothing archived yet"
+    if seal["breaks"] == 0 and seal["unsealed"] == 0:
+        return "all %d run(s) verify OK" % seal["runs"]
+    parts = []
+    if seal["breaks"]:
+        parts.append("%d break(s)" % seal["breaks"])
+    if seal["unsealed"]:
+        parts.append("%d unsealed run(s)" % seal["unsealed"])
+    return "%s of %d run(s); run context-guardian-recall --verify --all" % (", ".join(parts), seal["runs"])
+
+
+def _n(count: int, word: str) -> str:
+    """'1 compaction', '3 compactions'."""
+    return "%s %s%s" % (format(count, ","), word, "" if count == 1 else "s")
+
+
+def format_receipts(s: Dict[str, Any], window: str, share: bool = False) -> str:
+    """The plain summary, or (share=True) a short block with no paths, no text
+    and no run ids, safe to paste anywhere."""
+    by_tool = ", ".join("%s %d" % kv for kv in sorted(s["recall_by_tool"].items())) or "none"
+    pct = "%.1f%%" % (100 * s["share_read"])
+    if share:
+        seal = s.get("seal") or {}
+        seal_text = ("sealed, all runs verify" if seal.get("runs") and not seal.get("breaks")
+                     and not seal.get("unsealed") else _seal_line(seal).split(";")[0])
+        return "\n".join([
+            "Context Guardian receipts (%s)" % window,
+            "- %s, ~%s tokens kept out of the window" % (_n(s["compactions"], "compaction"),
+                                                         format(s["tokens_saved"], ",")),
+            "- %s archived (%s), %s" % (_n(s["archive_spans"], "span"), _mb(s["archive_bytes"]), seal_text),
+            "- %s opened %s; %s of the archive was read back"
+            % (_n(s["recall_calls"], "recall call"), _n(s["spans_opened"], "span"), pct),
+            "- local only: no telemetry, nothing left this machine",
+        ])
+    return "\n".join([
+        "Context Guardian receipts (%s)" % window,
+        "  archive      %d span(s) in %d run(s), %s on disk" % (s["archive_spans"], s["archive_runs"],
+                                                             _mb(s["archive_bytes"])),
+        "  compactions  %d recorded, %d with an archive pointer, %s chars archived, ~%s tokens saved"
+        % (s["compactions"], s["compactions_with_pointer"], format(s["chars_archived"], ","),
+           format(s["tokens_saved"], ",")),
+        "  recall       %d recall call(s) (%s); %d span(s) opened, %d matched"
+        % (s["recall_calls"], by_tool, s["spans_opened"], s["spans_matched"]),
+        "  read back    %s of the archive (%s chars returned)" % (pct, format(s["chars_returned"], ",")),
+        "  model used   %d recall tool call(s) seen in requests through the proxy"
+        % s["recall_calls_seen_by_proxy"],
+        "  seal         %s" % _seal_line(s.get("seal")),
+    ])
