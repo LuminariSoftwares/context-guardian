@@ -2,14 +2,18 @@
 
 ## Unreleased
 
-## PyPI context-guardian 0.12.0 (not yet released)
+## dsh-context-guardian 0.2.0-beta.1 / PyPI context-guardian 0.12.0 (2026-10-23)
 
 The archive becomes something you can check. Every span is sealed in a hash chain `--verify` walks, every recall
 leaves a counts-only receipt, a model can skim the archive before opening it, a whole session can be journaled
 (opt-in), and Claude Code sessions can be archived through its hooks. The version moves to 0.12.0 in
-`pyproject.toml`, `__version__`, the MCP server and `server.json` together; the npm package (`dsh-context-guardian`)
-keeps its own version line, and its engine changes here ship with its next release. No breaking changes: every new behaviour has an off switch, and
-everything that existed answers as before.
+`pyproject.toml`, `__version__`, the MCP server and `server.json` together. No breaking changes: every new behaviour
+has an off switch, and everything that existed answers as before.
+
+- **npm `dsh-context-guardian` moves to `0.2.0-beta.1`.** The DeepSeek Harness engine writes the sealed archive and
+  the skim index through the new `cg_seal.js` (shipped in the package); the other files it carries (`cg_archive.py`,
+  `cg_recall_cli.py`, `cg_doctor.py`, `cg_paths.py`, `context_guardian.py`, README, CHANGELOG) are the 0.12.0 ones.
+  The preset row is unchanged.
 
 ### Sealed archive
 
