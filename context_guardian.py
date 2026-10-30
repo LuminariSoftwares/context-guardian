@@ -118,6 +118,7 @@ REPO_DIR = Path(__file__).resolve().parent
 # notice. See cg_paths.py.
 import cg_paths
 import cg_archive
+import cg_count
 
 _DATA_DIR_NOTICE: Optional[str] = None
 
@@ -609,6 +610,10 @@ _state = {
     "summaries_extended": 0,
     # Span files actually written this run; the archive pointer counts these.
     "spans_written": 0,
+    # Where the latest request's token count came from (cg_count): "tokenize"
+    # (the upstream counted it, chat template included), "calibrated" (the
+    # estimate with the learned factor) or "estimate". "" until a request is seen.
+    "count_source": "",
 }
 
 # GUARDIAN_SUMMARY_MEMO: tuple of evicted-message hashes -> {"hashes", "summary",
@@ -2318,13 +2323,19 @@ def _compaction_event(name: str, index: int, messages: List[Dict[str, Any]],
                       to_keep: List[Dict[str, Any]], estimated: int,
                       message_tokens: int, tool_tokens: int,
                       span_path: Optional[str], summary: str,
-                      summary_source: str = "generated") -> Dict[str, Any]:
+                      summary_source: str = "generated",
+                      count_source: str = "estimate") -> Dict[str, Any]:
     """The log record of one compaction. A dry run writes the same record
     under its own event name, so the two can be compared field for field."""
     # Compute the "after" figures once and reuse -- estimate_tokens walks every
     # message, so calling it three times on the request path was pure waste.
     msgs_after_tokens = estimate_tokens(new_messages)
     tokens_after = msgs_after_tokens + tool_tokens
+    if count_source == "tokenize" and message_tokens + tool_tokens > 0:
+        # `estimated` is the upstream's exact count and the "after" figure is
+        # still the character estimate: put it on the exact count's scale, or
+        # tokens_saved would be the estimate's error as well as the saving.
+        tokens_after = int(tokens_after * estimated / (message_tokens + tool_tokens))
     return {
         "event": name,
         # RUN_ID scopes an event to this process, so /guardian/events (and the
@@ -2351,18 +2362,22 @@ def _compaction_event(name: str, index: int, messages: List[Dict[str, Any]],
         "summary_preview": summary[:500],
         # generated | reused | extended (GUARDIAN_SUMMARY_MEMO).
         "summary_source": summary_source,
+        # tokenize (exact, from the upstream) | calibrated | estimate: where
+        # estimated_tokens_before came from (cg_count).
+        "count_source": count_source,
     }
 
 
 def _log_dry_run(messages, system_msgs, to_summarize, to_keep, summary,
-                 estimated, message_tokens, tool_tokens) -> None:
+                 estimated, message_tokens, tool_tokens, count_source: str = "estimate") -> None:
     """Record what this compaction WOULD have done. Never raises: the caller
     forwards the original request whatever happens here."""
     try:
         new_messages = system_msgs + [_summary_message(to_summarize, summary, "")] + to_keep
         event = _compaction_event("dry_run", _state["dry_runs"] + 1, messages,
                                   new_messages, to_keep, estimated,
-                                  message_tokens, tool_tokens, None, summary)
+                                  message_tokens, tool_tokens, None, summary,
+                                  count_source=count_source)
         _state["dry_runs"] += 1
         _state["dry_run_tokens_saved_total"] += event["tokens_saved"]
         log_event(event)
@@ -2372,6 +2387,50 @@ def _log_dry_run(messages, system_msgs, to_summarize, to_keep, summary,
                  event["estimated_tokens_after"], event["tokens_saved"])
     except Exception as exc:                               # noqa: BLE001
         log.warning("dry run bookkeeping failed, request unaffected: %s", exc)
+
+
+# The review measured the estimate reading low by up to x4 (CJK). A request whose
+# estimate, multiplied by this, is still under the input budget cannot be over it,
+# so the stateless exact count (vLLM: one call, nothing remembered) is skipped
+# there and short chats cost the tokenizer nothing. llama.cpp is asked on every
+# request: its running totals have to see each turn to count only the new
+# messages the next time.
+EXACT_COUNT_GATE = 8
+
+
+def _count_kind(model: str, estimated: int, budget: int) -> str:
+    """What the upstream is, for cg_count, from the window detection that
+    already ran for this model (_detect_window's source): 'vLLM', 'llama.cpp',
+    'Ollama' or '' for none of them. No request is made here. '' also when
+    counting is off, and for vLLM while `estimated` is far under `budget`
+    (EXACT_COUNT_GATE).
+
+    Only the window detection names a tokenizer: with GUARDIAN_DETECT_CONTEXT=0
+    (or a detection that found nothing) the answer is '' and no tokenize or
+    apply-template request is sent.
+    """
+    if not cg_count.ENABLED:
+        return ""
+    found = _detected.get(model)
+    if found:
+        if found["source"] == "vLLM" and estimated * EXACT_COUNT_GATE < budget:
+            return ""
+        return found["source"]
+    return ""
+
+
+def _request_tools(payload: Dict[str, Any]) -> Optional[List[Any]]:
+    """The tools the template will render: `tools`, else the legacy `functions`
+    in tool form. None when there are none, or when they are not counted."""
+    if not COUNT_TOOLS:
+        return None
+    tools = payload.get("tools")
+    if isinstance(tools, list) and tools:
+        return tools
+    functions = payload.get("functions")
+    if isinstance(functions, list) and functions:
+        return [{"type": "function", "function": f} for f in functions]
+    return None
 
 
 async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any],
@@ -2392,16 +2451,26 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any],
     # would be learning from its own output and would drift up every request.
     _state["last_raw_estimate"] = estimated
     calib_model = str(payload.get("model") or "")
-    if calibration_enabled():
-        estimated = int(estimated * CALIBRATOR.factor(calib_model))
-    _state["last_known_total_tokens"] = estimated
-    _state["last_tool_tokens"] = tool_tokens
-    _state["last_message_tokens"] = message_tokens
+    factor = CALIBRATOR.factor(calib_model) if calibration_enabled() else 1.0
+    estimated = int(estimated * factor)
+    # The window first: its detection also tells cg_count what the upstream is.
+    num_ctx = await context_window(client, calib_model, headers)
     # Compact against the budget the INPUT is actually allowed to occupy, which
     # is the window minus the space the model needs to think and answer. Take
     # whichever limit is stricter so lowering COMPACT_THRESHOLD still works.
-    num_ctx = await context_window(client, calib_model, headers)
     threshold_tokens = effective_threshold(num_ctx=num_ctx)
+    # An exact count (the upstream's tokenizer, template included) is used as
+    # it is: the calibration factor corrects the estimate and has nothing to
+    # correct there. The estimate, calibrated, is only the fallback.
+    kind = _count_kind(calib_model, estimated, threshold_tokens)
+    estimated, count_source = await cg_count.count_request(
+        client, messages if kind != "" else [], _request_tools(payload), calib_model,
+        UPSTREAM_URL, kind=kind, headers=_summary_headers(headers), estimate=estimated,
+        calibrated=factor != 1.0)
+    _state["count_source"] = count_source
+    _state["last_known_total_tokens"] = estimated
+    _state["last_tool_tokens"] = tool_tokens
+    _state["last_message_tokens"] = message_tokens
     _state["last_num_ctx"] = num_ctx
     _state["last_input_budget"] = threshold_tokens
 
@@ -2500,7 +2569,7 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any],
 
     if DRY_RUN:
         _log_dry_run(messages, system_msgs, to_summarize, to_keep, summary,
-                     estimated, message_tokens, tool_tokens)
+                     estimated, message_tokens, tool_tokens, count_source)
         return payload
 
     # Evict to disk BEFORE the messages are replaced. If this ran after, a crash
@@ -2516,7 +2585,8 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any],
     _state["compactions_performed"] += 1
     event = _compaction_event("compaction", _state["compactions_performed"],
                               messages, new_messages, to_keep, estimated,
-                              message_tokens, tool_tokens, span_path, summary, memo["source"])
+                              message_tokens, tool_tokens, span_path, summary, memo["source"],
+                              count_source)
     tokens_after = event["estimated_tokens_after"]
     tokens_saved = event["tokens_saved"]
     _state["tokens_saved_total"] += tokens_saved
@@ -2724,6 +2794,11 @@ async def stats():
                     **(_journal.stats() if _journal is not None else
                        {"messages": 0, "requests": 0, "bytes": 0, "files": 0, "stopped": False})},
         **_state,
+        # cg_count: tokenize_failures, count_cache_hits, count_cache_misses; the
+        # margin applied to any count that is not exact; count_source (in
+        # _state above) says which kind the last count was.
+        **cg_count.stats(),
+        "estimate_margin": cg_count.ESTIMATE_MARGIN,
         # What the proxy has learned about its own estimate error, per model.
         # `last_raw_estimate` above is the pre-correction figure; this is what
         # turned it into `last_known_total_tokens`.
@@ -3154,6 +3229,45 @@ async def _summarize_anthropic(client: httpx.AsyncClient, model: str,
         return None
 
 
+def _anthropic_block_text(content: Any) -> str:
+    """A Messages-API content value as the text a chat template would render,
+    in full (unlike _anthropic_text, which truncates tool input for a summary)."""
+    if isinstance(content, str):
+        return content
+    parts = []
+    for block in content if isinstance(content, list) else []:
+        if not isinstance(block, dict):
+            parts.append(str(block))
+        elif block.get("type") == "text":
+            parts.append(str(block.get("text", "")))
+        elif block.get("type") == "tool_use":
+            parts.append("%s %s" % (block.get("name") or "", _json_dump(block.get("input"))))
+        elif block.get("type") == "tool_result":
+            parts.append(_anthropic_block_text(block.get("content")))
+        else:
+            parts.append(_json_dump(block))
+    return "\n".join(p for p in parts if p)
+
+
+def _anthropic_as_chat(payload: Dict[str, Any]) -> "tuple[List[Dict[str, Any]], Optional[List[Any]]]":
+    """A /v1/messages request as chat messages and tools, so cg_count can ask a
+    chat-template tokenizer about it. A count, not a request: the text of each
+    block is what the template would see, not a faithful translation."""
+    out: List[Dict[str, Any]] = []
+    system = _anthropic_block_text(payload.get("system"))
+    if system:
+        out.append({"role": "system", "content": system})
+    for m in payload.get("messages") or []:
+        out.append({"role": m.get("role") or "user", "content": _anthropic_block_text(m.get("content"))})
+    tools = None
+    if COUNT_TOOLS and isinstance(payload.get("tools"), list) and payload["tools"]:
+        tools = [{"type": "function", "function": {
+            "name": t.get("name"), "description": t.get("description") or "",
+            "parameters": t.get("input_schema") or {"type": "object", "properties": {}}}}
+            for t in payload["tools"] if isinstance(t, dict)]
+    return out, tools
+
+
 async def maybe_compact_anthropic(client: httpx.AsyncClient, payload: Dict[str, Any],
                                   headers: Dict[str, str]) -> Dict[str, Any]:
     """maybe_compact for /v1/messages. Returns the SAME object when nothing is
@@ -3173,10 +3287,16 @@ async def maybe_compact_anthropic(client: httpx.AsyncClient, payload: Dict[str, 
     # divides the backend's report by, the corrected one is what is compared
     # with the budget.
     _state["last_raw_estimate"] = estimated
-    if calibration_enabled():
-        estimated = int(estimated * CALIBRATOR.factor(model))
+    factor = CALIBRATOR.factor(model) if calibration_enabled() else 1.0
+    estimated = int(estimated * factor)
     num_ctx = await context_window(client, model, headers)
     threshold_tokens = effective_threshold(num_ctx=num_ctx)
+    kind = _count_kind(model, estimated, threshold_tokens)
+    chat_messages, chat_tools = _anthropic_as_chat(payload) if kind != "" else ([], None)
+    estimated, count_source = await cg_count.count_request(
+        client, chat_messages, chat_tools, model, UPSTREAM_URL, kind=kind,
+        headers=_summary_headers(headers), estimate=estimated, calibrated=factor != 1.0)
+    _state["count_source"] = count_source
     _state["last_known_total_tokens"] = estimated
     _state["last_num_ctx"] = num_ctx
     _state["last_input_budget"] = threshold_tokens
@@ -3207,7 +3327,7 @@ async def maybe_compact_anthropic(client: httpx.AsyncClient, payload: Dict[str, 
     system_msgs = [{"role": "system", "content": _anthropic_text(system)}] if system else []
     if DRY_RUN:
         _log_dry_run(messages, system_msgs, to_summarize, to_keep, summary,
-                     estimated, message_tokens, tool_tokens)
+                     estimated, message_tokens, tool_tokens, count_source)
         return payload
 
     # No await between _memo_summary and here: a concurrent waiter reads the memo this stores (_settle_later).
@@ -3224,7 +3344,7 @@ async def maybe_compact_anthropic(client: httpx.AsyncClient, payload: Dict[str, 
     event = _compaction_event("compaction", _state["compactions_performed"], messages,
                               system_msgs + [{"role": "system", "content": note}] + to_keep,
                               to_keep, estimated, message_tokens, tool_tokens,
-                              span_path, summary, memo["source"])
+                              span_path, summary, memo["source"], count_source)
     event["route"] = "messages"
     _state["tokens_saved_total"] += event["tokens_saved"]
     log_event(event)
