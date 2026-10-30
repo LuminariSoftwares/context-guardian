@@ -1,4 +1,5 @@
-"""P111 S1 (B1) acceptance -- exact token counts, template included. Written by the O5 overseer; DO NOT EDIT.
+"""P111 S1 (B1) acceptance (rev 2, 2026-10-30) -- exact token counts, template included. Written by the O5 overseer;
+DO NOT EDIT.
 
 Why: README "What this does not do" (3): the estimate is characters / 3.5, content-blind, "not always conservative"
 -- dense JSON and CJK read LOW, so compaction fires late and the backend overflows first. llama.cpp and vLLM can
@@ -23,6 +24,8 @@ module state (probe results, the per-message cache, counters) lives in `cg_count
   every "compaction" event carries count_source; maybe_compact and maybe_compact_anthropic both use count_request.
 - The exact count is what decides compaction: text the char estimate calls small but the tokenizer calls big compacts.
 - README bullet (3) names llama.cpp, vLLM and GUARDIAN_ESTIMATE_MARGIN.
+- rev 2: the tokenizer kind comes from context detection; there is no port-number guess. With
+  GUARDIAN_DETECT_CONTEXT=0 no tokenize request is ever sent (counts are estimates).
 """
 import asyncio
 import importlib
@@ -240,12 +243,12 @@ def test_ollama_tokenize_is_probed_at_most_once_per_model(monkeypatch):
 
 # ------------------------------------------------------------------ the proxy -------
 
-def proxy(monkeypatch, tmp_path, kind, root, **env):
+def proxy(monkeypatch, tmp_path, kind, root, window=4000, **env):
     env = dict({"GUARDIAN_NUM_CTX": ""}, **env)
     g = load(monkeypatch, tmp_path, GUARDIAN_UPSTREAM_URL=root, **env)
     import cg_count
     importlib.reload(cg_count)
-    seen, client = stub(kind)
+    seen, client = stub(kind, window=window)
     g._http_client = client
     return g, seen
 
@@ -270,8 +273,10 @@ def test_the_exact_count_decides_compaction(monkeypatch, tmp_path):
     dense = [{"role": "user" if i % 2 == 0 else "assistant", "content": " ".join(["x"] * 60) + " t%02d" % i}
              for i in range(13)]
     est_chars = sum(len(m["content"]) for m in dense) / 3.5
-    g, seen = proxy(monkeypatch, tmp_path, "llamacpp", LLAMA, GUARDIAN_NUM_CTX="1000",
-                    GUARDIAN_DETECT_CONTEXT="0", GUARDIAN_KEEP_RECENT_MESSAGES="4")
+    # rev 2 (O5, PR review): the window comes from llama.cpp's own /props, as in normal use; rev 1 switched
+    # detection off here, which pushed the build into a port-number guess to find the tokenizer.
+    g, seen = proxy(monkeypatch, tmp_path, "llamacpp", LLAMA, window=1000, GUARDIAN_NUM_CTX="1000",
+                    GUARDIAN_KEEP_RECENT_MESSAGES="4")
     assert est_chars < g.effective_threshold(num_ctx=1000), "fixture must stay under the estimate's threshold"
     assert chat(g, dense).status_code == 200
     assert seen["summaries"] >= 1, "the tokenizer said over budget; the proxy did not compact"
@@ -285,6 +290,13 @@ def test_both_compaction_paths_use_count_request():
     for fn in ("async def maybe_compact(", "async def maybe_compact_anthropic("):
         body = src.split(fn, 1)[1].split("\nasync def ", 1)[0].split("\ndef ", 1)[0]
         assert "count_request" in body, fn
+
+
+def test_detection_off_sends_no_tokenize_request_even_on_a_default_port(monkeypatch, tmp_path):
+    g, seen = proxy(monkeypatch, tmp_path, "llamacpp", LLAMA, GUARDIAN_NUM_CTX="1000", GUARDIAN_DETECT_CONTEXT="0")
+    assert chat(g, convo(6)).status_code == 200
+    assert not seen["tokenize"] and not seen["apply"]
+    assert g._state.get("count_source") in ("calibrated", "estimate")
 
 
 def test_readme_bullet_names_the_exact_upstreams():

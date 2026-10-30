@@ -12,9 +12,14 @@
 - **llama.cpp counts only what is new each turn.** A cache of running totals, keyed by the messages' hashes, means the
   next turn sends the new messages plus one template-overhead probe, not the whole conversation again. More than
   `GUARDIAN_COUNT_RECOUNT_MISSES` new messages (8) means one whole-request recount.
-- **Nothing new is asked on the request path.** Whether the upstream is vLLM or llama.cpp comes from the window
-  detection that already runs. With `GUARDIAN_DETECT_CONTEXT=0` the counter probes `/tokenize` itself, once per model.
-  Ollama has no tokenizer route (`/api/tokenize` answers 404), so it stays on the calibrated estimate.
+- **Nothing new is asked on the request path.** Whether the upstream is vLLM or llama.cpp comes only from the window
+  detection that already runs, so exact counts need context detection on (`GUARDIAN_DETECT_CONTEXT`, the default);
+  with `GUARDIAN_DETECT_CONTEXT=0` no tokenize or apply-template request is sent and counts are estimates. Ollama has
+  no tokenizer route (`/api/tokenize` answers 404), so it stays on the calibrated estimate.
+- **vLLM is counted exactly once the chat is big enough to matter**: while the estimate times 8 is under the input
+  budget the estimate is used (the review's worst under-read is x4). llama.cpp is counted on every request, and its
+  per-turn total is exact for templates that render each message independently; otherwise the whole request is
+  re-counted.
 - **Fail open.** Any tokenizer error or timeout (`GUARDIAN_TOKENIZE_TIMEOUT`, 0.5 s) counts that request with the
   estimate and adds one to `tokenize_failures`; the request still goes through. `GUARDIAN_TOKENIZE=0` turns it off.
 - **`GUARDIAN_ESTIMATE_MARGIN`** (default 1.0) multiplies any count that is not exact: 1.4 for JSON-heavy traffic, 4.0

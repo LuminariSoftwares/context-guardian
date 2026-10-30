@@ -2396,22 +2396,18 @@ def _log_dry_run(messages, system_msgs, to_summarize, to_keep, summary,
 # request: its running totals have to see each turn to count only the new
 # messages the next time.
 EXACT_COUNT_GATE = 8
-# With window detection off there is nothing to read the upstream's kind from.
-# Ask (once per model) only an upstream on a default port of vllm serve (8000)
-# or llama-server (8080); the Ollama check above is a port test too.
-TOKENIZER_DEFAULT_PORTS = (8000, 8080)
 
 
-def _count_kind(model: str, estimated: int, budget: int) -> Optional[str]:
+def _count_kind(model: str, estimated: int, budget: int) -> str:
     """What the upstream is, for cg_count, from the window detection that
     already ran for this model (_detect_window's source): 'vLLM', 'llama.cpp',
     'Ollama' or '' for none of them. No request is made here. '' also when
     counting is off, and for vLLM while `estimated` is far under `budget`
     (EXACT_COUNT_GATE).
 
-    None only when detection is switched off and the upstream is on a default
-    port of vLLM or llama.cpp: the counter then asks it itself, once per model.
-    A detection that ran and found nothing is a known "no tokenizer".
+    Only the window detection names a tokenizer: with GUARDIAN_DETECT_CONTEXT=0
+    (or a detection that found nothing) the answer is '' and no tokenize or
+    apply-template request is sent.
     """
     if not cg_count.ENABLED:
         return ""
@@ -2420,12 +2416,7 @@ def _count_kind(model: str, estimated: int, budget: int) -> Optional[str]:
         if found["source"] == "vLLM" and estimated * EXACT_COUNT_GATE < budget:
             return ""
         return found["source"]
-    if not model or upstream_is_ollama() or DETECT_CONTEXT not in ("0", "false", "no", "off"):
-        return ""
-    try:
-        return None if urlparse(UPSTREAM_URL).port in TOKENIZER_DEFAULT_PORTS else ""
-    except ValueError:
-        return ""
+    return ""
 
 
 def _request_tools(payload: Dict[str, Any]) -> Optional[List[Any]]:

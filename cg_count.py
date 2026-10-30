@@ -117,8 +117,8 @@ async def probe_tokenizer(client: httpx.AsyncClient, upstream_root: str, model: 
     vLLM answers /tokenize {"prompt"} with a "count"; llama.cpp answers
     /tokenize {"content"} with "tokens" alone. Anything else, Ollama included,
     is '' ('ollama' is never returned: it has no tokenizer route to use).
-    Cached per (root, model). The proxy does not call this when the window
-    detection already told it what the upstream is.
+    Cached per (root, model). The proxy never calls this: it passes `kind=` from
+    its window detection, so with detection off it sends no tokenizer request.
     """
     bare = bare_root(upstream_root)
     key = (bare, model)
