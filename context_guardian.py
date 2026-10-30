@@ -73,6 +73,7 @@ by `context-guardian-configure`); see the README for the full list.
 import asyncio
 import collections
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -81,7 +82,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
@@ -610,6 +611,9 @@ _state = {
     "summaries_extended": 0,
     # Span files actually written this run; the archive pointer counts these.
     "spans_written": 0,
+    # Requests in which a message bigger than the window was archived and
+    # forwarded as head + tail + a pointer (spill_oversized).
+    "oversized_spills": 0,
     # Where the latest request's token count came from (cg_count): "tokenize"
     # (the upstream counted it, chat template included), "calibrated" (the
     # estimate with the learned factor) or "estimate". "" until a request is seen.
@@ -1588,7 +1592,8 @@ def partition_messages(messages: List[Dict[str, Any]],
 
 
 def write_span(messages: List[Dict[str, Any]], summary: str,
-               index: int, continues: Optional[str] = None) -> Optional[str]:
+               index: int, continues: Optional[str] = None,
+               extra: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """Persist the messages about to be folded away, BEFORE folding them.
 
     Called on the request path, so it must never raise. A failed span write
@@ -1634,6 +1639,11 @@ def write_span(messages: List[Dict[str, Any]], summary: str,
                 # An extended summary's span holds only the newly evicted
                 # messages; the earlier ones are in the span it continues.
                 body["continues"] = continues
+            if extra:
+                # Fields only some spans carry (an oversized message's
+                # "oversized" and "original_tokens"), written by this same
+                # path so the seal and the index see them like any span.
+                body.update(extra)
             return body
 
         written = cg_archive.write_span_file(d, index, payload, probe=MAX_SPAN_INDEX_PROBE)
@@ -2318,13 +2328,201 @@ def _summary_message(to_summarize: List[Dict[str, Any]], summary: str,
     }
 
 
+# --- the last resort: a message bigger than the window ----------------------------
+#
+# Compaction summarises OLDER messages. The newest turn and the kept recent ones go
+# upstream verbatim, and a first message has nothing older at all, so one huge paste
+# overflowed the backend however well everything else was compacted. When the request
+# still does not fit, the single largest non-system message is archived in full as its
+# own span and forwarded as its head and tail with a pointer between them.
+
+SPILL_HEAD_SHARE = 2 / 3      # head : tail about 2 : 1
+SPILL_FIT_ROUNDS = 8
+SPILL_MEMO_MAX = 64
+# sha256 of a message -> the span it was archived in. The client resends its whole
+# history every turn, so the same paste comes back; it is archived once.
+_spill_memo: "collections.OrderedDict[str, str]" = collections.OrderedDict()
+
+
+def _spill_text(m: Dict[str, Any]):
+    """(text, rebuild) for the text of `m` that can be cut, or None.
+
+    A plain string, or the largest text block of a list. Tool-call arguments and
+    non-text blocks are never cut: half of a JSON argument is worse than all of it.
+    """
+    content = m.get("content")
+    if isinstance(content, str):
+        return content, lambda t: {**m, "content": t}
+    if isinstance(content, list):
+        texts = [i for i, b in enumerate(content) if isinstance(b, dict) and isinstance(b.get("text"), str)]
+        if texts:
+            at = max(texts, key=lambda i: len(content[i]["text"]))
+
+            def rebuild(t: str) -> Dict[str, Any]:
+                blocks = list(content)
+                blocks[at] = {**content[at], "text": t}
+                return {**m, "content": blocks}
+            return content[at]["text"], rebuild
+    return None
+
+
+def _head_tail(text: str, room: int) -> Tuple[str, str]:
+    """As much head and tail as `room` characters hold, head : tail about 2 : 1,
+    cut at line boundaries. A first or last line longer than its share is cut by
+    characters. Pure."""
+    head_room = int(room * SPILL_HEAD_SHARE)
+    tail_room = max(0, room - head_room)
+    lines = text.split("\n")
+    head: List[str] = []
+    used = 0
+    for line in lines:
+        need = len(line) + (1 if head else 0)
+        if used + need > head_room:
+            break
+        head.append(line)
+        used += need
+    if not head and head_room > 0:
+        head = [lines[0][:head_room]]
+    tail: List[str] = []
+    used = 0
+    for line in reversed(lines[len(head):]):
+        need = len(line) + (1 if tail else 0)
+        if used + need > tail_room:
+            break
+        tail.append(line)
+        used += need
+    if not tail and tail_room > 0:
+        tail = [lines[-1][-tail_room:]]
+    return "\n".join(head), "\n".join(reversed(tail))
+
+
+def _spill_pointer(position: int, original_tokens: int, span_path: str, omitted_tokens: int) -> str:
+    return (f"[context-guardian: message {position} ({original_tokens} tokens) archived as {span_path} -- "
+            f"the middle {omitted_tokens} tokens are omitted; with the recall MCP server, "
+            f"search_spans/read_span open the full text]")
+
+
+def _spill_fit(messages: List[Dict[str, Any]], at: int, limit: int, span_path: str):
+    """`messages` with message `at` cut to head + pointer + tail so that the whole
+    list estimates at `limit` tokens or fewer (the pointer-only floor if even that is
+    not enough). Returns (new list, original tokens, omitted tokens), or None when the
+    cut would not shrink the message. Pure."""
+    target = _spill_text(messages[at])
+    if target is None:
+        return None
+    text, rebuild = target
+    original_tokens = estimate_tokens([messages[at]])
+    others = estimate_tokens(messages[:at] + messages[at + 1:])
+    room = max(0, int((limit - others) * CHARS_PER_TOKEN_ESTIMATE))
+    best = None
+    for _ in range(SPILL_FIT_ROUNDS):
+        head, tail = _head_tail(text, room)
+        if len(head) + len(tail) >= len(text):
+            return None
+        omitted = max(0, int((len(text) - len(head) - len(tail)) / CHARS_PER_TOKEN_ESTIMATE))
+        pointer = _spill_pointer(at + 1, original_tokens, span_path, omitted)
+        cut = "\n".join(part for part in (head, pointer, tail) if part)
+        candidate = messages[:at] + [rebuild(cut)] + messages[at + 1:]
+        best = (candidate, original_tokens, omitted)
+        over = estimate_tokens(candidate) - limit
+        if over <= 0 or room == 0:
+            break
+        room = max(0, room - int(over * CHARS_PER_TOKEN_ESTIMATE) - 8)
+    if best is None or estimate_tokens(best[0]) >= estimate_tokens(messages):
+        return None
+    return best
+
+
+def spill_oversized(messages: List[Dict[str, Any]], limit: int, tool_tokens: int = 0,
+                    margin: float = 1.0, write: bool = True) -> Optional[Dict[str, Any]]:
+    """Archive the largest non-system message in full and forward it as head +
+    pointer + tail, when the list estimates over `limit` tokens. None when it fits,
+    when there is nothing cuttable, or when the archive could not be written (a
+    message is never cut unless its full text is on disk).
+
+    `limit` is the most the MESSAGES may estimate at, in the proxy's estimate
+    units (see _spill_limit); `margin` < 1 aims a little under it. `write=False`
+    sizes the cut without writing a span (a dry run).
+
+    Returns {"messages", "message_index", "original_tokens", "omitted_tokens",
+    "span", "reused", "tokens_before", "tokens_after"}. Never raises.
+    """
+    try:
+        before = estimate_tokens(messages)
+        if before <= limit:
+            return None
+        pool = [(estimate_tokens([m]), i) for i, m in enumerate(messages)
+                if isinstance(m, dict) and m.get("role") != "system" and _spill_text(m) is not None]
+        if not pool:
+            return None
+        at = max(pool)[1]
+        aim = int(limit * margin)
+        sized = _spill_fit(messages, at, aim, str(SPAN_DIR / RUN_ID / "0000.json"))
+        if sized is None:
+            return None
+        key = hashlib.sha256(json.dumps(messages[at], sort_keys=True, ensure_ascii=False,
+                                        default=str).encode("utf-8", "replace")).hexdigest()
+        span_path = _spill_memo.get(key)
+        reused = bool(span_path) and Path(span_path).exists()
+        if not write:
+            span_path = span_path if reused else str(SPAN_DIR / RUN_ID / "0000.json")
+        elif not reused:
+            span_path = write_span([messages[at]], "", _state["spans_written"] + 1,
+                                   extra={"oversized": True, "original_tokens": sized[1]})
+            if not span_path:
+                log.warning("OVERSIZED MESSAGE NOT CUT: its span could not be written, and a message "
+                            "is not cut unless its full text is on disk. The request goes upstream "
+                            "at ~%d tokens.", before)
+                return None
+            _spill_memo[key] = span_path
+            while len(_spill_memo) > SPILL_MEMO_MAX:
+                _spill_memo.popitem(last=False)
+        final = _spill_fit(messages, at, aim, span_path)
+        if final is None:
+            return None
+        return {"messages": final[0], "message_index": at, "original_tokens": final[1],
+                "omitted_tokens": final[2], "span": span_path, "reused": reused,
+                "tokens_before": before, "tokens_after": estimate_tokens(final[0])}
+    except Exception as exc:                               # noqa: BLE001
+        log.warning("oversized-message spill skipped, request unaffected: %s", exc)
+        return None
+
+
+def _spill_limit(threshold_tokens: int, estimated: int, base_tokens: int, tool_tokens: int) -> int:
+    """The most the messages may estimate at, in estimate_tokens() units, for the
+    request to fit `threshold_tokens` by the count the proxy compared with it.
+
+    `estimated` is that count (the upstream's exact one, or the estimate times its
+    calibration factor) and `base_tokens` is the raw estimate of the same request,
+    so their ratio puts the budget back on the estimate's scale. The tool
+    definitions are a floor and come off the top."""
+    scale = estimated / base_tokens if base_tokens > 0 and estimated > 0 else 1.0
+    return int(threshold_tokens / scale) - tool_tokens
+
+
+def _note_spill(spill: Dict[str, Any], event: Optional[str]) -> None:
+    _state["oversized_spills"] += 1
+    log.info("Oversized message %d (~%d tokens) archived as %s and forwarded as head + tail "
+             "(~%d -> ~%d message tokens).", spill["message_index"] + 1, spill["original_tokens"],
+             spill["span"], spill["tokens_before"], spill["tokens_after"])
+    if event:
+        log_event({"event": event, "run_id": RUN_ID, "oversized_spilled": 1,
+                   "message_index": spill["message_index"],
+                   "original_tokens": spill["original_tokens"],
+                   "omitted_tokens": spill["omitted_tokens"],
+                   "message_tokens_before": spill["tokens_before"],
+                   "message_tokens_after": spill["tokens_after"],
+                   "span_file": spill["span"], "span_reused": spill["reused"]})
+
+
 def _compaction_event(name: str, index: int, messages: List[Dict[str, Any]],
                       new_messages: List[Dict[str, Any]],
                       to_keep: List[Dict[str, Any]], estimated: int,
                       message_tokens: int, tool_tokens: int,
                       span_path: Optional[str], summary: str,
                       summary_source: str = "generated",
-                      count_source: str = "estimate") -> Dict[str, Any]:
+                      count_source: str = "estimate",
+                      oversized_spilled: int = 0) -> Dict[str, Any]:
     """The log record of one compaction. A dry run writes the same record
     under its own event name, so the two can be compared field for field."""
     # Compute the "after" figures once and reuse -- estimate_tokens walks every
@@ -2365,19 +2563,27 @@ def _compaction_event(name: str, index: int, messages: List[Dict[str, Any]],
         # tokenize (exact, from the upstream) | calibrated | estimate: where
         # estimated_tokens_before came from (cg_count).
         "count_source": count_source,
+        # Messages cut to head + tail + a pointer after compaction (0 or 1).
+        "oversized_spilled": oversized_spilled,
     }
 
 
 def _log_dry_run(messages, system_msgs, to_summarize, to_keep, summary,
-                 estimated, message_tokens, tool_tokens, count_source: str = "estimate") -> None:
+                 estimated, message_tokens, tool_tokens, count_source: str = "estimate",
+                 spill_limit: Optional[int] = None, spill_margin: float = 1.0) -> None:
     """Record what this compaction WOULD have done. Never raises: the caller
     forwards the original request whatever happens here."""
     try:
         new_messages = system_msgs + [_summary_message(to_summarize, summary, "")] + to_keep
+        spill = (spill_oversized(new_messages, spill_limit, tool_tokens, spill_margin, write=False)
+                 if spill_limit is not None else None)
+        if spill is not None:
+            new_messages = spill["messages"]
         event = _compaction_event("dry_run", _state["dry_runs"] + 1, messages,
                                   new_messages, to_keep, estimated,
                                   message_tokens, tool_tokens, None, summary,
-                                  count_source=count_source)
+                                  count_source=count_source,
+                                  oversized_spilled=int(spill is not None))
         _state["dry_runs"] += 1
         _state["dry_run_tokens_saved_total"] += event["tokens_saved"]
         log_event(event)
@@ -2525,8 +2731,23 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any],
     to_summarize = part["to_summarize"]
     to_keep = part["to_keep"]
 
+    # The most the messages may estimate at for the request to fit; past it, the
+    # largest message is spilled once compaction (if any) has done what it can.
+    spill_limit = _spill_limit(threshold_tokens, estimated, message_tokens + tool_tokens, tool_tokens)
+    # Aim a little under it when the count is exact: the cut text is a different
+    # mix from the whole request, so the proportion is not exact for it.
+    spill_margin = 0.97 if count_source == "tokenize" else 1.0
+
     if not to_summarize:
-        return payload  # nothing meaningful to compact
+        # Nothing older to summarise: a first-message paste is the commonest way
+        # to be here. Dry run forwards the original and writes nothing.
+        spill = None if DRY_RUN else spill_oversized(messages, spill_limit, tool_tokens, spill_margin)
+        if spill is None:
+            return payload  # nothing meaningful to compact
+        _note_spill(spill, "oversized_spill")
+        new_payload = dict(payload)
+        new_payload["messages"] = spill["messages"]
+        return new_payload
 
     if part["retired_summaries"]:
         log.info("Retiring %d older Guardian summary/summaries into this span "
@@ -2569,7 +2790,8 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any],
 
     if DRY_RUN:
         _log_dry_run(messages, system_msgs, to_summarize, to_keep, summary,
-                     estimated, message_tokens, tool_tokens, count_source)
+                     estimated, message_tokens, tool_tokens, count_source,
+                     spill_limit=spill_limit, spill_margin=spill_margin)
         return payload
 
     # Evict to disk BEFORE the messages are replaced. If this ran after, a crash
@@ -2579,6 +2801,10 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any],
     span_path, pointer = _apply_memo(memo, to_summarize)
 
     new_messages = system_msgs + [_summary_message(to_summarize, summary, pointer)] + to_keep
+    spill = spill_oversized(new_messages, spill_limit, tool_tokens, spill_margin)
+    if spill is not None:
+        new_messages = spill["messages"]
+        _note_spill(spill, None)
     new_payload = dict(payload)
     new_payload["messages"] = new_messages
 
@@ -2586,7 +2812,7 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any],
     event = _compaction_event("compaction", _state["compactions_performed"],
                               messages, new_messages, to_keep, estimated,
                               message_tokens, tool_tokens, span_path, summary, memo["source"],
-                              count_source)
+                              count_source, oversized_spilled=int(spill is not None))
     tokens_after = event["estimated_tokens_after"]
     tokens_saved = event["tokens_saved"]
     _state["tokens_saved_total"] += tokens_saved

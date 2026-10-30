@@ -45,6 +45,13 @@ UTF-8 JSON, one object, written with an indent of 1. The proxy writes:
 | `messages` | array | the original messages, exactly as the client sent them |
 
 The DSH engine adds `session_id` and `engine`; the Claude Code adapter adds `source`, `transcript`, `bytes` and `lines`. A proxy span written for an *extended* summary (`GUARDIAN_SUMMARY_MEMO`) holds only the newly evicted messages and adds `continues`: the file name, in the same run, of the span holding the messages evicted before them. Its `summary` covers the whole chain.
+A proxy span written for a message bigger than the window (README, *Big pastes*) holds that one message, in full, and adds `oversized` and `original_tokens`; its `summary` is `""`, and the request carried the message's head and tail with a pointer to this file in place of the middle.
+
+| field | type | meaning |
+|---|---|---|
+| `oversized` | boolean | `true` only on that kind of span; absent on every other |
+| `original_tokens` | integer | the proxy's estimate of the message before it was cut (`characters / 3.5`) |
+
 Readers ignore fields they do not know. The file's bytes are written to a temp file, fsynced, and renamed over an
 exclusively created placeholder of the final name, so a span file is either absent, empty (claimed, never
 finished, and removed on failure) or complete.
