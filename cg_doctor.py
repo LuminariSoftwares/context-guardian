@@ -255,6 +255,7 @@ def doctor(root: Path = PACKAGE_ROOT, env: dict | None = None, preset: Path | No
         shown = f" (num_ctx {running})" if whole else ""
         out.append(_f("ok", f"proxy reachable at {url}{shown}"))
         out.extend(detected_window_findings(stats))
+        out.extend(count_source_findings(stats, work))
         if w["source"] == "env" and whole and running != w["value"]:
             out.append(_f("warn", f"proxy is running with num_ctx {running} but GUARDIAN_NUM_CTX is {w['value']}",
                           "restart the proxy so it re-reads GUARDIAN_NUM_CTX"))
@@ -297,6 +298,36 @@ def detected_window_findings(stats: dict) -> list:
         used = entry.get("used")
         note = "" if used == entry.get("window") else f"; using {used} (GUARDIAN_NUM_CTX is lower)"
         out.append(_f("ok", f"window: {entry.get('source')} reports {entry.get('window')} for {model}{note}"))
+    return out
+
+EXACT_COUNTERS = ("vLLM", "llama.cpp")
+
+def count_source_findings(stats: dict, work: dict | None = None) -> list:
+    """How the running proxy counts tokens for the upstream it is configured
+    for: exact (the upstream's tokenizer, chat template included) on vLLM and
+    llama.cpp, the estimate elsewhere. Silent for a proxy that predates the
+    exact count (no `count_source` in its stats)."""
+    if not isinstance(stats, dict) or "count_source" not in stats:
+        return []
+    off = str((work or {}).get("GUARDIAN_TOKENIZE", "1")).strip().lower() in ("0", "false", "no", "off")
+    margin = stats.get("estimate_margin")
+    note = f"; estimates are multiplied by {margin}" if isinstance(margin, (int, float)) and margin != 1 else ""
+    failures = stats.get("tokenize_failures")
+    fails = f"; {failures} tokenizer failure(s)" if isinstance(failures, int) and failures else ""
+    found = stats.get("context_detected")
+    out = []
+    for model, entry in sorted(found.items()) if isinstance(found, dict) else []:
+        source = entry.get("source") if isinstance(entry, dict) else None
+        if off:
+            out.append(_f("ok", f"count: estimate for {model} (GUARDIAN_TOKENIZE=0){note}"))
+        elif source in EXACT_COUNTERS:
+            out.append(_f("ok", f"count: exact for {model}, from {source}'s tokenizer with the chat template{fails}"))
+        else:
+            out.append(_f("ok", f"count: estimated for {model} ({source or 'upstream'} has no tokenizer route){note}"))
+    if not out:
+        last = stats.get("count_source") or ""
+        out.append(_f("ok", f"count: last request counted by {last}{note}{fails}" if last
+                      else "count: no request counted yet"))
     return out
 
 def render(findings) -> tuple[str, int]:
@@ -451,6 +482,15 @@ def _check_proxy_window_mismatch_is_warn():
         return any("num_ctx 32768 but GUARDIAN_NUM_CTX is 65536" in f["what"]
                    and "restart the proxy" in f["fix"] for f in warns)
 
+def _check_count_source_names_exact_and_estimated_upstreams():
+    stats = {"count_source": "tokenize", "estimate_margin": 1.0, "tokenize_failures": 0,
+             "context_detected": {"a": {"source": "llama.cpp"}, "b": {"source": "Ollama"}}}
+    said = [f["what"] for f in count_source_findings(stats)]
+    return said[0].startswith("count: exact for a, from llama.cpp") \
+        and said[1].startswith("count: estimated for b (Ollama has no tokenizer route)") \
+        and count_source_findings({"num_ctx": 1}) == [] \
+        and "GUARDIAN_TOKENIZE=0" in count_source_findings(stats, {"GUARDIAN_TOKENIZE": "0"})[0]["what"]
+
 def _check_bridge_failure_is_error():
     def crashed(argv, stdin_text, timeout):
         return 1, "Traceback (most recent call last): boom\n"
@@ -475,7 +515,7 @@ def _check_cli_exit_codes():
             and re.fullmatch(r"doctor: 1 ok, 0 warnings, 1 errors", last) is not None
             and ok_text.strip().splitlines()[-1] == "doctor: 1 ok, 0 warnings, 0 errors")
 
-CHECKS = [("env_file_parses_quotes_and_comments", _check_env_file_parses_quotes_and_comments), ("env_file_missing_is_empty", _check_env_file_missing_is_empty), ("preset_numctx_found_and_comment_ignored", _check_preset_numctx_found_and_comment_ignored), ("window_env_beats_preset", _check_window_env_beats_preset), ("window_preset_when_no_env", _check_window_preset_when_no_env), ("window_host_when_neither", _check_window_host_when_neither), ("window_bad_env_value_falls_through", _check_window_bad_env_value_falls_through), ("find_python_prefers_env_then_venv_then_path", _check_find_python_prefers_env_then_venv_then_path), ("default_root_is_the_file_folder", _check_default_root_is_the_file_folder), ("all_good_has_no_errors", _check_all_good_has_no_errors), ("missing_package_json_is_error", _check_missing_package_json_is_error), ("bad_numeric_is_error_with_fix", _check_bad_numeric_is_error_with_fix), ("reserve_not_below_window_is_error", _check_reserve_not_below_window_is_error), ("preset_pin_is_warn", _check_preset_pin_is_warn), ("proxy_down_is_warn_not_error", _check_proxy_down_is_warn_not_error), ("proxy_window_mismatch_is_warn", _check_proxy_window_mismatch_is_warn), ("bridge_failure_is_error", _check_bridge_failure_is_error), ("bridge_old_python_is_error", _check_bridge_old_python_is_error), ("cli_exit_codes", _check_cli_exit_codes)]
+CHECKS = [("env_file_parses_quotes_and_comments", _check_env_file_parses_quotes_and_comments), ("env_file_missing_is_empty", _check_env_file_missing_is_empty), ("preset_numctx_found_and_comment_ignored", _check_preset_numctx_found_and_comment_ignored), ("window_env_beats_preset", _check_window_env_beats_preset), ("window_preset_when_no_env", _check_window_preset_when_no_env), ("window_host_when_neither", _check_window_host_when_neither), ("window_bad_env_value_falls_through", _check_window_bad_env_value_falls_through), ("find_python_prefers_env_then_venv_then_path", _check_find_python_prefers_env_then_venv_then_path), ("default_root_is_the_file_folder", _check_default_root_is_the_file_folder), ("all_good_has_no_errors", _check_all_good_has_no_errors), ("missing_package_json_is_error", _check_missing_package_json_is_error), ("bad_numeric_is_error_with_fix", _check_bad_numeric_is_error_with_fix), ("reserve_not_below_window_is_error", _check_reserve_not_below_window_is_error), ("preset_pin_is_warn", _check_preset_pin_is_warn), ("proxy_down_is_warn_not_error", _check_proxy_down_is_warn_not_error), ("proxy_window_mismatch_is_warn", _check_proxy_window_mismatch_is_warn), ("count_source_names_exact_and_estimated_upstreams", _check_count_source_names_exact_and_estimated_upstreams), ("bridge_failure_is_error", _check_bridge_failure_is_error), ("bridge_old_python_is_error", _check_bridge_old_python_is_error), ("cli_exit_codes", _check_cli_exit_codes)]
 
 def selftest() -> int:
     total, passed = 0, 0

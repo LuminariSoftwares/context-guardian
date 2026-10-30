@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Exact token counts on llama.cpp and vLLM
+
+- **The compaction decision uses the upstream's own token count where it has one.** The estimate (`characters / 3.5`)
+  reads low on dense JSON and CJK, so compaction fired late and the backend overflowed first. On vLLM one
+  `POST /tokenize` with the messages, `add_generation_prompt` and the tools returns the count; on llama.cpp
+  `POST /apply-template` then `POST /tokenize` does, chat template included. An exact count is not multiplied by the
+  calibration factor or the margin. New module `cg_count.py`; no new dependency.
+- **llama.cpp counts only what is new each turn.** A cache of running totals, keyed by the messages' hashes, means the
+  next turn sends the new messages plus one template-overhead probe, not the whole conversation again. More than
+  `GUARDIAN_COUNT_RECOUNT_MISSES` new messages (8) means one whole-request recount.
+- **Nothing new is asked on the request path.** Whether the upstream is vLLM or llama.cpp comes from the window
+  detection that already runs. With `GUARDIAN_DETECT_CONTEXT=0` the counter probes `/tokenize` itself, once per model.
+  Ollama has no tokenizer route (`/api/tokenize` answers 404), so it stays on the calibrated estimate.
+- **Fail open.** Any tokenizer error or timeout (`GUARDIAN_TOKENIZE_TIMEOUT`, 0.5 s) counts that request with the
+  estimate and adds one to `tokenize_failures`; the request still goes through. `GUARDIAN_TOKENIZE=0` turns it off.
+- **`GUARDIAN_ESTIMATE_MARGIN`** (default 1.0) multiplies any count that is not exact: 1.4 for JSON-heavy traffic, 4.0
+  for CJK, as the external review measured.
+- **`/guardian/stats`** gains `count_source`, `tokenize_failures`, `estimate_margin`, `count_cache_hits` and
+  `count_cache_misses`; every `compaction` and `dry_run` event carries `count_source`. `context-guardian-doctor`
+  prints the count source for the configured upstream. New settings: `GUARDIAN_TOKENIZE`, `GUARDIAN_TOKENIZE_TIMEOUT`,
+  `GUARDIAN_ESTIMATE_MARGIN`, `GUARDIAN_COUNT_CACHE`, `GUARDIAN_COUNT_RECOUNT_MISSES`.
+
 ## dsh-context-guardian 0.2.0-beta.1 / PyPI context-guardian 0.12.0 (2026-10-23)
 
 The archive becomes something you can check. Every span is sealed in a hash chain `--verify` walks, every recall
