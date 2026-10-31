@@ -4,8 +4,8 @@
 Why: README bullet (10) says "Client compatibility is uneven" and only Ollama and DSH are tested. B5 runs one scripted,
 over-budget conversation through each real client and one real turn against each installed upstream, and the README's
 two Works-with tables become those runs' lines. These tests pin the runners' LOGIC with stand-ins that read their
-configuration exactly the way the real CLIs do (probed on node1 2026-10-31: aider 0.86.2, opencode 1.19.5,
-cn 1.5.47, claude 2.1.302 -- temp\\p111\\baseline_S4.md); the live runs happen on the PC.
+configuration exactly the way the real CLIs do (probed on the maintainer's Windows PC 2026-10-31: aider 0.86.2,
+opencode 1.19.5, cn 1.5.47, claude 2.1.302); the live runs happen on that PC.
 
 Contract (plan P111 decision 6 + C5; pinned by O5 2026-10-31):
 - tests/clients/mock_upstream.py: a stdlib scripted model on 127.0.0.1 (`--port`, `--log`, prints `MOCK READY port=<p>`):
