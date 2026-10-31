@@ -50,6 +50,7 @@ SEE IT, SEARCH IT
   GET /guardian/health   dashboard (latest request, compactions, estimate)
   GET /guardian/stats    every setting and counter, as JSON
   GET /guardian/events   this run's compaction events
+  GET /guardian/usage    the proxy's own context number (what the status line shows)
   context-guardian-recall "<term>" [--run RUN_ID]   search the archived spans
 
 HOW TO TEST BEFORE TRUSTING IT
@@ -73,6 +74,7 @@ by `context-guardian-configure`); see the README for the full list.
 import asyncio
 import collections
 import contextlib
+import contextvars
 import hashlib
 import json
 import logging
@@ -638,6 +640,16 @@ _capture_failures = {"count": 0}
 # keeps the durable record across restarts; see note_compaction_receipt.
 _receipts = {"chars_archived": 0, "compactions_with_pointer": 0, "recall_calls_seen": 0}
 _recall_seen: "collections.OrderedDict[str, None]" = collections.OrderedDict()
+
+# --- Session usage (GET /guardian/usage) -------------------------------------
+# The latest chat request of each session, in memory, newest last and bounded:
+# the number a client's own counter cannot know (what the proxy FORWARDED).
+USAGE_SESSIONS_MAX = 64
+_usage_sessions: "collections.OrderedDict[str, Dict[str, Any]]" = collections.OrderedDict()
+# What maybe_compact / maybe_compact_anthropic measured for THIS request, held
+# per request task so a concurrent request cannot overwrite it before it is recorded.
+_usage_snap: "contextvars.ContextVar[Optional[Dict[str, Any]]]" = contextvars.ContextVar(
+    "cg_usage_snap", default=None)
 
 # When this process started, for the health view's uptime line.
 STARTED_AT = time.time()
@@ -2682,6 +2694,8 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any],
     _state["last_message_tokens"] = message_tokens
     _state["last_num_ctx"] = num_ctx
     _state["last_input_budget"] = threshold_tokens
+    snap = {"window": num_ctx, "used": estimated, "count_source": count_source, "at": None}
+    _usage_snap.set(snap)
 
     # Tool definitions are a FLOOR, not a thing compaction can reduce -- this
     # proxy can only summarise messages. Say so out loud the first time a
@@ -2820,6 +2834,8 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any],
     tokens_saved = event["tokens_saved"]
     _state["tokens_saved_total"] += tokens_saved
     log_event(event)
+    snap["used"] = tokens_after
+    snap["at"] = event.get("timestamp") or time.strftime("%Y-%m-%dT%H:%M:%S")
     note_compaction_receipt(memo["new"], pointer, tokens_saved, memo["source"])
 
     if VERBOSE:
@@ -2963,6 +2979,75 @@ def start_version_check() -> None:
         return
     threading.Thread(target=_version_check_worker, name="cg-version-check",
                      daemon=True).start()
+
+
+def _content_text(content: Any) -> str:
+    """A message's content as text for the session key: a string as is, a list
+    as its text parts joined by a newline, anything else as ""."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(p["text"] for p in content
+                         if isinstance(p, dict) and isinstance(p.get("text"), str))
+    return ""
+
+
+def usage_session_id(headers: Dict[str, str], model: str, messages: Any,
+                     system: Any = None) -> str:
+    """The X-Guardian-Session header when non-empty, else a hash of model +
+    first system + first user message (16 hex chars). `system`, when given, is
+    the Anthropic route's top-level field and stands in for the first system
+    message."""
+    given = str(headers.get("x-guardian-session") or "").strip()
+    if given:
+        return given
+    first_system, first_user = _content_text(system), ""
+    have_system, have_user = system is not None, False
+    for m in messages if isinstance(messages, list) else []:
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") == "system" and not have_system:
+            first_system, have_system = _content_text(m.get("content")), True
+        elif m.get("role") == "user" and not have_user:
+            first_user, have_user = _content_text(m.get("content")), True
+    return hashlib.sha256((model + "\n" + first_system + "\n" + first_user)
+                          .encode("utf-8")).hexdigest()[:16]
+
+
+def record_usage(session_id: str, model: str) -> None:
+    """Store this request's measurement (see _usage_snap) as its session's
+    latest. No measurement, no change."""
+    snap = _usage_snap.get()
+    if not snap:
+        return
+    prev = _usage_sessions.pop(session_id, None)
+    _usage_sessions[session_id] = {
+        "window": snap["window"], "used_after_compaction": snap["used"],
+        "count_source": snap["count_source"], "model": model,
+        "last_compaction_at": snap["at"] or (prev or {}).get("last_compaction_at"),
+    }
+    while len(_usage_sessions) > USAGE_SESSIONS_MAX:
+        _usage_sessions.popitem(last=False)
+
+
+@app.get("/guardian/usage")
+async def usage(session: Optional[str] = None):
+    """The proxy's own context number for a session's latest chat request: what
+    it forwarded, which a client's token counter cannot know. Without `session`
+    it answers for the most recent request's session."""
+    if not session:
+        if not _usage_sessions:
+            return JSONResponse({"error": "no session seen yet"}, status_code=404)
+        session = next(reversed(_usage_sessions))
+    row = _usage_sessions.get(session)
+    if row is None:
+        return JSONResponse({"error": "unknown session"}, status_code=404)
+    window, used = row["window"], row["used_after_compaction"]
+    return JSONResponse({
+        "window": window, "used_after_compaction": used,
+        "pct": round(100.0 * used / window, 1) if window else 0.0,
+        "count_source": row["count_source"], "model": row["model"],
+        "last_compaction_at": row["last_compaction_at"]})
 
 
 @app.get("/guardian/stats")
@@ -3529,6 +3614,8 @@ async def maybe_compact_anthropic(client: httpx.AsyncClient, payload: Dict[str, 
     _state["last_known_total_tokens"] = estimated
     _state["last_num_ctx"] = num_ctx
     _state["last_input_budget"] = threshold_tokens
+    snap = {"window": num_ctx, "used": estimated, "count_source": count_source, "at": None}
+    _usage_snap.set(snap)
     if estimated < threshold_tokens:
         return payload
 
@@ -3577,6 +3664,8 @@ async def maybe_compact_anthropic(client: httpx.AsyncClient, payload: Dict[str, 
     event["route"] = "messages"
     _state["tokens_saved_total"] += event["tokens_saved"]
     log_event(event)
+    snap["used"] = event["estimated_tokens_after"]
+    snap["at"] = event.get("timestamp") or time.strftime("%Y-%m-%dT%H:%M:%S")
     note_compaction_receipt(memo["new"], pointer, event["tokens_saved"], memo["source"])
     log.info("Compacted Anthropic request %d -> %d messages, ~%d -> ~%d tokens.",
              len(messages), len(to_keep), estimated, event["estimated_tokens_after"])
@@ -3629,6 +3718,14 @@ async def proxy(path: str, request: Request):
         if isinstance(payload, dict):
             window_model = str(payload.get("model") or "")
             capture_messages(payload.get("messages"))
+            # Usage bookkeeping is fail-open too: the session id is taken from the
+            # request as the client sent it, before the rewrite replaces messages.
+            usage_sid = None
+            try:
+                _usage_snap.set(None)
+                usage_sid = usage_session_id(headers, window_model, payload.get("messages"))
+            except Exception as exc:                       # noqa: BLE001
+                log.debug("usage session id failed, request unaffected: %s", exc)
             # FAIL-OPEN for the whole rewrite step. Whatever raises in here --
             # a bug in compaction, a dry run, an injected field -- costs the
             # rewrite, never the request: it goes upstream as the client sent it.
@@ -3638,6 +3735,12 @@ async def proxy(path: str, request: Request):
                 log.error("Rewriting the request failed (%s: %s). Forwarding "
                           "it unchanged.", type(exc).__name__, exc)
                 rewritten = payload
+                _usage_snap.set(None)
+            try:
+                if usage_sid:
+                    record_usage(usage_sid, window_model)
+            except Exception as exc:                       # noqa: BLE001
+                log.debug("usage bookkeeping failed, request unaffected: %s", exc)
             # Unchanged means the client's own bytes, not a re-serialisation:
             # key order, spacing and number formatting all survive.
             if rewritten is not payload:
@@ -3664,7 +3767,19 @@ async def proxy(path: str, request: Request):
             if isinstance(payload, dict):
                 window_model = str(payload.get("model") or "")
                 capture_messages(payload.get("messages"), payload.get("system"))
+                usage_sid = None
+                try:
+                    _usage_snap.set(None)
+                    usage_sid = usage_session_id(headers, window_model, payload.get("messages"),
+                                                 payload.get("system") or "")
+                except Exception as exc:                   # noqa: BLE001
+                    log.debug("usage session id failed, request unaffected: %s", exc)
                 rewritten = await maybe_compact_anthropic(client, payload, headers)
+                try:
+                    if usage_sid:
+                        record_usage(usage_sid, window_model)
+                except Exception as exc:                   # noqa: BLE001
+                    log.debug("usage bookkeeping failed, request unaffected: %s", exc)
                 if rewritten is not payload:
                     body_bytes = json.dumps(rewritten).encode("utf-8")
                 # The calibration tap, as on chat/completions: before 0.12.0

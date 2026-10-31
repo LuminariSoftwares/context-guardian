@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### The client shows the proxy's own number
+
+- **`GET /guardian/usage[?session=<id>]` returns what the proxy forwarded for a session's latest chat request:**
+  `{window, used_after_compaction, pct, count_source, model, last_compaction_at}`. The count is the compaction's
+  "after" figure when that request compacted, else the request's own count. A client's token counter cannot know this
+  and drifts after a compaction. Sessions are told apart by the `X-Guardian-Session` header, else by a hash of the
+  model, the first system message and the first user message; the latest 64 are kept in memory. No `session` answers
+  for the most recent request; nothing seen yet or an unknown id is a 404. Recorded on `chat/completions` and
+  `/v1/messages`, fail-open: a bookkeeping error never costs the request.
+- **`context-guardian-statusline` prints it as one line**, `ctx 41% (13.2k/32k) exact`, for Claude Code's `statusLine`
+  or any prompt or status bar (`--url`, `--session`, `--format claude|opencode|plain`, `--timeout`, default 2 s). Any
+  failure prints `ctx ?` and exits 1. Standard library only. The code is the root module `cg_statusline.py`
+  (in the wheel, the npm package and the Docker image); `scripts/cg_statusline.py` runs the same `main()` from a clone.
+- README: the "does not fix your CLI's own context-usage display" limit is gone, and there is a "Show real usage in
+  your client" section.
+
 ### A message bigger than the window
 
 - **A message that still does not fit after compaction is archived and forwarded as head + tail + a pointer.** README
