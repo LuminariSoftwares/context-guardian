@@ -2457,7 +2457,10 @@ def spill_oversized(messages: List[Dict[str, Any]], limit: int, tool_tokens: int
             return None
         at = max(pool)[1]
         aim = int(limit * margin)
-        sized = _spill_fit(messages, at, aim, str(SPAN_DIR / RUN_ID / "0000.json"))
+        # The pointer names the span run-relative, the form read_span and
+        # search_spans take; an absolute path would put the user's home folder
+        # into every prompt. The event and the log keep the full path.
+        sized = _spill_fit(messages, at, aim, f"{RUN_ID}/0000.json")
         if sized is None:
             return None
         key = hashlib.sha256(json.dumps(messages[at], sort_keys=True, ensure_ascii=False,
@@ -2477,7 +2480,7 @@ def spill_oversized(messages: List[Dict[str, Any]], limit: int, tool_tokens: int
             _spill_memo[key] = span_path
             while len(_spill_memo) > SPILL_MEMO_MAX:
                 _spill_memo.popitem(last=False)
-        final = _spill_fit(messages, at, aim, span_path)
+        final = _spill_fit(messages, at, aim, f"{RUN_ID}/{Path(span_path).name}")
         if final is None:
             return None
         return {"messages": final[0], "message_index": at, "original_tokens": final[1],

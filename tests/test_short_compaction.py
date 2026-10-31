@@ -67,6 +67,8 @@ def test_a_single_user_message_is_spilled_not_summarised(monkeypatch, tmp_path):
     assert sent[0]["content"] != text
     assert sent[0]["content"].startswith("line 0000") and sent[0]["content"].endswith("line 0399 of the pasted text")
     assert "[context-guardian: message 1 (" in sent[0]["content"]
+    assert "archived as %s/0001.json --" % g.RUN_ID in sent[0]["content"], "the pointer names the span run-relative"
+    assert str(tmp_path) not in sent[0]["content"], "an absolute path leaked into the prompt"
     assert g._state["summaries_generated"] == 0 and g._state["compactions_performed"] == 0
     spans = sorted((tmp_path / "spans" / g.RUN_ID).glob("[0-9][0-9][0-9][0-9].json"))
     assert len(spans) == 1

@@ -219,10 +219,10 @@ Compaction summarises *older* messages, so it cannot help when one message is bi
 2. The request carries its head and its tail instead, about 2 : 1, cut at line boundaries (a single line longer than the room is cut by characters), with one pointer line between them. Every other message is forwarded as it came.
 
 ```
-[context-guardian: message 3 (5714 tokens) archived as /home/you/.../0002.json -- the middle 5528 tokens are omitted; with the recall MCP server, search_spans/read_span open the full text]
+[context-guardian: message 3 (5714 tokens) archived as 20261030-143012/0002.json -- the middle 5528 tokens are omitted; with the recall MCP server, search_spans/read_span open the full text]
 ```
 
-**A plain chat client sees only the cut.** It shows what it sent, the model answers from the head and tail, and nothing in the client says the middle was left out. The full text is on disk, and a model with the [recall MCP server](#mcp-server) can open it: `search_spans` finds the span, `read_span` reads the lines it needs. Without the server, `context-guardian-recall "<term>"` searches it and the span file is plain JSON. A message that fits is never cut. The same paste comes back with every turn and is archived once per run. `/guardian/stats` counts `oversized_spills`, and the `compaction` event (or an `oversized_spill` event when there was nothing to summarise) carries `oversized_spilled`.
+**A plain chat client sees only the cut.** It shows what it sent, the model answers from the head and tail, and nothing in the client says the middle was left out. The full text is on disk, and a model with the [recall MCP server](#mcp-server) can open it: `search_spans` finds the span, `read_span` reads the lines it needs (the pointer names it as `<run_id>/<NNNN>.json`, never an absolute path, so your home folder is not in the prompt). Without the server, `context-guardian-recall "<term>"` searches it and the span file is plain JSON. A message that fits is never cut. The same paste comes back with every turn and is archived once per run. `/guardian/stats` counts `oversized_spills`, and the `compaction` event (or an `oversized_spill` event when there was nothing to summarise) carries `oversized_spilled`.
 
 Only text is cut: a message whose size is tool-call arguments or non-text blocks is forwarded as it is, and so is the request when the span cannot be written. A dry run (`GUARDIAN_DRY_RUN`) reports `oversized_spilled` in its event and writes nothing. The Anthropic `/v1/messages` route does not spill yet.
 

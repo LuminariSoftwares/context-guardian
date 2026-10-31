@@ -9,7 +9,8 @@
   the first message, was never compacted at all because nothing older existed to summarise. As a last resort the
   largest non-system message is written in full as its own sealed span (`"oversized": true`, `"original_tokens"`), and
   the request carries as much of its head and tail as fits, about 2 : 1, cut at line boundaries, with one pointer line
-  between them. Every other message is forwarded as it was. A plain chat client sees only the cut; the recall MCP
+  between them; the pointer names the span run-relative (`<run_id>/0002.json`, the form `read_span` takes), never an
+  absolute path. Every other message is forwarded as it was. A plain chat client sees only the cut; the recall MCP
   server opens the full text. The same paste is archived once per run. If the span cannot be written, nothing is cut.
 - **The compaction and dry-run events gain `oversized_spilled`**, a first-message paste logs an `oversized_spill` event,
   and `/guardian/stats` gains `oversized_spills`.
