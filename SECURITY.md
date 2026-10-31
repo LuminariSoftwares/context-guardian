@@ -36,3 +36,7 @@ context-guardian sits in the path of every prompt, so its logs, checkpoints, and
 - Consider whether the data reveals anything about your project
 
 If you need to share diagnostic output for a bug report, review it carefully first.
+
+## What is stored, and encryption at rest
+
+The span archive is clear text on disk unless `GUARDIAN_ENCRYPT=1` with `context-guardian[encrypt]`: then spans, digests and summaries are inside AES-256-GCM ciphertext, the capture journal is refused, and losing the key loses the archive. Existing runs are not converted. The seal is tamper-evident, not tamper-proof (an anchor kept elsewhere catches a rewritten chain), and file names, sizes and times, the chain and the Claude Code adapter's state file stay in clear. Setup and format: [README, Encrypt the archive](README.md#encrypt-the-archive) and [docs/ARCHIVE_FORMAT.md](docs/ARCHIVE_FORMAT.md).

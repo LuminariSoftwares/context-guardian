@@ -31,5 +31,5 @@
 - What it does not do, in full: [README.md#what-this-does-not-do](README.md#what-this-does-not-do).
 - The token count is exact only on llama.cpp and vLLM; elsewhere it is an estimate, and for JSON or CJK text the estimate runs low. Set `GUARDIAN_ESTIMATE_MARGIN`.
 - It cannot shrink tool definitions, and it does not compact Claude Code itself: that adapter only archives, seals and indexes the transcript.
-- The seal is tamper-evident, not tamper-proof. The archive is clear text on disk: treat it like shell history.
+- The seal is tamper-evident, not tamper-proof. The archive is clear text on disk unless `GUARDIAN_ENCRYPT=1` with `context-guardian[encrypt]` (see [README.md#encrypt-the-archive](README.md#encrypt-the-archive)); losing the key loses the archive. Otherwise treat it like shell history.
 - Source: [github.com/LuminariSoftwares/context-guardian](https://github.com/LuminariSoftwares/context-guardian/blob/main/README.md).

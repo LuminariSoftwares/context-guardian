@@ -372,6 +372,11 @@ INDEX = os.environ.get("GUARDIAN_INDEX", "1").strip().lower() not in ("0", "fals
 # one run (default 200); past it capture stops for that run, once, with a log
 # line, and requests are untouched. See cg_archive.Journal.
 CAPTURE = os.environ.get("GUARDIAN_CAPTURE", "off").strip().lower()
+# GUARDIAN_ENCRYPT=1 writes new spans as AES-256-GCM (format 2, cg_archive.py), keeps
+# digests, terms and summary text out of the index and the compaction log, and
+# refuses the journal. main() checks the key and `cryptography` before serving;
+# importing this module never raises.
+ENCRYPT = cg_archive.encryption_on()
 try:
     CAPTURE_MAX_MB = float(os.environ.get("GUARDIAN_CAPTURE_MAX_MB", "200"))
 except ValueError:
@@ -1658,7 +1663,10 @@ def write_span(messages: List[Dict[str, Any]], summary: str,
                 body.update(extra)
             return body
 
-        written = cg_archive.write_span_file(d, index, payload, probe=MAX_SPAN_INDEX_PROBE)
+        # Built per write; no key or no `cryptography` raises here, so a span is
+        # lost (and said to be) rather than ever written in clear.
+        written = cg_archive.write_span_file(d, index, payload, probe=MAX_SPAN_INDEX_PROBE,
+                                             encryptor=cg_archive.encryptor_from_env())
         if written is None:
             log.warning("could not claim a span index near %d after %d "
                         "attempts -- this span is LOST, not deferred.",
@@ -1712,7 +1720,7 @@ def index_span(path: Path, payload: Dict[str, Any]) -> None:
     if not INDEX:
         return
     try:
-        cg_archive.append_index(Path(path).parent, cg_archive.index_entry(payload, Path(path).name))
+        cg_archive.append_index(Path(path).parent, cg_archive.index_entry(payload, Path(path).name, locked=ENCRYPT))
     except Exception as exc:                               # noqa: BLE001
         log.warning("could not index %s (%s: %s); the span is written. "
                     "context-guardian-recall --reindex rebuilds the index.",
@@ -1724,7 +1732,7 @@ def capture_messages(messages: Any, system: Any = None) -> None:
     raises and never touches the request: a journal that cannot be written is
     a missing record, not a reason to fail the user's call."""
     global _journal
-    if CAPTURE != "journal":
+    if CAPTURE != "journal" or ENCRYPT:      # the journal is clear text: never with encryption on
         return
     try:
         if _journal is None:
@@ -2572,7 +2580,7 @@ def _compaction_event(name: str, index: int, messages: List[Dict[str, Any]],
         "tokens_saved": max(0, estimated - tokens_after),
         "span_file": span_path,
         "span_written": span_path is not None,
-        "summary_preview": summary[:500],
+        "summary_preview": "" if ENCRYPT else summary[:500],
         # generated | reused | extended (GUARDIAN_SUMMARY_MEMO).
         "summary_source": summary_source,
         # tokenize (exact, from the upstream) | calibrated | estimate: where
@@ -3903,6 +3911,23 @@ def serve() -> None:
     uvicorn.run(app, host=GUARDIAN_HOST, port=GUARDIAN_PORT)
 
 
+def encryption_problem() -> Optional[str]:
+    """Why GUARDIAN_ENCRYPT=1 cannot be honoured, or None. Checked before the
+    proxy serves: an archive the user believes is encrypted must never be written in clear."""
+    if not ENCRYPT:
+        return None
+    if CAPTURE == "journal":
+        return ("GUARDIAN_ENCRYPT=1 cannot be combined with GUARDIAN_CAPTURE=journal: the journal is clear text. "
+                "Unset GUARDIAN_CAPTURE or GUARDIAN_ENCRYPT.")
+    try:
+        cg_archive.encryptor_from_env()
+    except ImportError:
+        return 'GUARDIAN_ENCRYPT=1 needs the cryptography package: %s' % cg_archive.INSTALL_HINT.replace('"', "")
+    except ValueError as exc:
+        return "%s (make a key: python -c \"import os,base64;print(base64.b64encode(os.urandom(32)).decode())\")" % exc
+    return None
+
+
 def main():
     """Console entry point (`context-guardian`) and `python context_guardian.py`."""
     if sys.argv[1:2] == ["mcp"]:  # `context-guardian mcp` = context-guardian-mcp (the MCP Registry runs `uvx context-guardian mcp`)
@@ -3920,6 +3945,11 @@ def main():
     if "--help" in args or "-h" in args:
         print(usage())
         return
+    problem = encryption_problem()
+    if problem:
+        log.error("%s", problem)
+        print("context-guardian: " + problem, file=sys.stderr)
+        sys.exit(2)
     log.info(
         "Starting Context Guardian v%s on port %d, forwarding to %s "
         "(num_ctx=%d, threshold=%.2f, keep_recent=%s). "

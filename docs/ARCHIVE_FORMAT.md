@@ -56,6 +56,45 @@ Readers ignore fields they do not know. The file's bytes are written to a temp f
 exclusively created placeholder of the final name, so a span file is either absent, empty (claimed, never
 finished, and removed on failure) or complete.
 
+## Span file, format 2 (encrypted)
+
+With `GUARDIAN_ENCRYPT=1` (and `pip install "context-guardian[encrypt]"`) every new span is a format 2 file instead:
+the same UTF-8 JSON object, indent 1, with exactly these keys and nothing else.
+
+| field | type | meaning |
+|---|---|---|
+| `format` | integer | `2`. A format 1 file has no `format` key |
+| `enc` | string | `aes-256-gcm` |
+| `nonce` | string | base64 of 12 random bytes, fresh for every file |
+| `ciphertext` | string | base64 of AES-256-GCM output: the encrypted plaintext followed by the 16-byte tag |
+| `run_id` | string | as in format 1, in clear |
+| `index` | integer | as in format 1, in clear |
+| `at` | string | as in format 1, in clear |
+
+The plaintext is the UTF-8 bytes of the complete body a format 1 file would have held (`run_id`, `index`, `at`,
+`num_ctx`, `message_count`, `summary`, `messages`, and any extra fields such as `oversized`, `original_tokens`,
+`continues`), written with Python's `json.dumps(body, ensure_ascii=False)` (default separators). A reader needs only
+to parse the JSON it decrypts. It is sealed with `AESGCM(key).encrypt(nonce, plaintext, None)` from the
+`cryptography` package: no associated data. The key is 32 bytes; the proxy and the tools take it as base64 from
+`GUARDIAN_ARCHIVE_KEY`, or from the file named by `GUARDIAN_ARCHIVE_KEY_FILE`.
+
+**The seal is unchanged.** `chain.jsonl` hashes the file's bytes as written, so a format 2 file is sealed and
+verified exactly like a format 1 file, with or without the key. A run may mix both formats; format 1 files stay
+readable forever.
+
+**Test vector** (`tests/test_encrypt_vector.py` recomputes it, so this section cannot drift):
+
+```
+key        AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=    (bytes 0..31)
+nonce      AAECAwQFBgcICQoL                                (bytes 0..11)
+plaintext  {"run_id": "20261031-120000", "index": 1, "at": "2026-10-31 12:00:00", "num_ctx": 1000, "message_count": 1, "summary": "a short summary", "messages": [{"role": "user", "content": "hello"}]}
+ciphertext PCCkbqu6q3+ve7epg9lKW7LmtAXdSm1MCFfVpzFJIttvdMuEjfsyqViEXYz8pRIYzGtQv2z7kuoSpBs5KdHP3sAG9krx/QZDciHHMYz7dsoCqvhSRlN/SN+Q+78Lkd7olJs2k8o16iC+LRKSagZUEtcGENLB/wW4LN8kpe2UGi7IJ22r1aWycSTBasxYqT+jUZGQFw8xyDGuLYcbn/DTzrHi7XCb3eBehQCylKvl6M+/9OoA484f0Ar9vZoMOYNbghcobWjkIQyHYBP1Lg==
+```
+
+What is not encrypted: the clear header above, the file's name and size, `chain.jsonl` (hashes, no text), the
+anchor file, and the Claude Code adapter's state file (`cc_state.json`: the transcript's path and byte offset).
+The capture journal is never written with encryption on.
+
 ## chain.jsonl
 
 One JSON object per line, `\n`-terminated, appended under the run's lock. Each line is the **canonical form** of
@@ -155,6 +194,11 @@ parsed content, so a rebuild produces exactly what live indexing wrote, and the 
 | `digest` | string | the first sentence of `summary`; when the span has no summary, of the first user message with text; failing that, of the first message with text. At most 160 code points; longer ones are cut to 157 plus `...` |
 | `digest_from` | string | `summary`, `first-user-message`, or `first-message` (no user message has text: the first message of any role that does) |
 | `terms` | array of strings | up to 8 keywords |
+
+**Encrypted runs.** An index line for a format 2 span has exactly `span`, `ts`, `messages`, `chars`, `est_tokens` and
+`locked` (`true`), computed as above from the plaintext when the writer has it. It has no `digest`, no `digest_from`
+and no `terms`: those are text from the span. `--reindex` produces the same shape (with the key, from the decrypted
+body; without it, an existing line is kept as it is and a span with none gets zero counts).
 
 **First sentence:** collapse every run of whitespace (Python's `str.split()` set) to one space, then take the
 shortest prefix that ends in `.`, `!` or `?` and is followed by a space or the end; if there is none, the whole
