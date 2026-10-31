@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### A message bigger than the window
+
+- **A message that still does not fit after compaction is archived and forwarded as head + tail + a pointer.** README
+  "What this does not do" said one huge paste could still overflow the backend, and the commonest case, a big paste as
+  the first message, was never compacted at all because nothing older existed to summarise. As a last resort the
+  largest non-system message is written in full as its own sealed span (`"oversized": true`, `"original_tokens"`), and
+  the request carries as much of its head and tail as fits, about 2 : 1, cut at line boundaries, with one pointer line
+  between them; the pointer names the span run-relative (`<run_id>/0002.json`, the form `read_span` takes), never an
+  absolute path. Every other message is forwarded as it was. A plain chat client sees only the cut; the recall MCP
+  server opens the full text. The same paste is archived once per run. If the span cannot be written, nothing is cut.
+- **The compaction and dry-run events gain `oversized_spilled`**, a first-message paste logs an `oversized_spill` event,
+  and `/guardian/stats` gains `oversized_spills`.
+- **`write_span` takes an optional `extra` dict**, so the oversized span goes through the same writer, seal and index.
+- `tests/test_short_compaction.py::test_a_single_user_message_is_never_summarised_away` is now
+  `..._is_spilled_not_summarised`: a lone huge message used to be forwarded untouched over the window; it is still never
+  summarised away, and is archived and forwarded as head + tail + pointer. The `/v1/messages` route is not covered yet.
+- README: the "does not protect a single message" limit is gone, and there is a "Big pastes" section.
+
 ### Exact token counts on llama.cpp and vLLM
 
 - **The compaction decision uses the upstream's own token count where it has one.** The estimate (`characters / 3.5`)

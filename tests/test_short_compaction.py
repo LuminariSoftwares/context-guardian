@@ -52,14 +52,28 @@ def test_a_system_prompt_stays_first(monkeypatch, tmp_path):
     assert sent[2:] == [msgs[1], msgs[3]]
 
 
-def test_a_single_user_message_is_never_summarised_away(monkeypatch, tmp_path):
-    """Nothing lies between the first and last user message: fail open."""
+def test_a_single_user_message_is_spilled_not_summarised(monkeypatch, tmp_path):
+    """Nothing lies between the first and last user message: no summary is made.
+    P111 S2: the message is archived whole and forwarded as head + tail + pointer,
+    where it used to go upstream untouched, over the window."""
     g = load(monkeypatch, tmp_path)
     seen = wire(g)
+    text = "\n".join("line %04d of the pasted text" % i for i in range(400))
     body = json.dumps({"model": "m", "stream": True,
-                       "messages": [{"role": "user", "content": "z" * 8000}]}).encode()
+                       "messages": [{"role": "user", "content": text}]}).encode()
     post(g, body)
-    assert seen["chat"] == [body]
+    sent = json.loads(seen["chat"][0])["messages"]
+    assert len(sent) == 1 and sent[0]["role"] == "user"
+    assert sent[0]["content"] != text
+    assert sent[0]["content"].startswith("line 0000") and sent[0]["content"].endswith("line 0399 of the pasted text")
+    assert "[context-guardian: message 1 (" in sent[0]["content"]
+    assert "archived as %s/0001.json --" % g.RUN_ID in sent[0]["content"], "the pointer names the span run-relative"
+    assert str(tmp_path) not in sent[0]["content"], "an absolute path leaked into the prompt"
+    assert g._state["summaries_generated"] == 0 and g._state["compactions_performed"] == 0
+    spans = sorted((tmp_path / "spans" / g.RUN_ID).glob("[0-9][0-9][0-9][0-9].json"))
+    assert len(spans) == 1
+    span = json.loads(spans[0].read_text(encoding="utf-8"))
+    assert span["oversized"] is True and span["messages"] == [{"role": "user", "content": text}]
 
 
 def test_a_failing_short_partition_forwards_the_original(monkeypatch, tmp_path):
