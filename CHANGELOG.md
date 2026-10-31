@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Works-with tables filled from the first live runs (2026-10-31, Windows): aider, opencode, continue and claude-code PASS through the proxy; Ollama 0.40.4 PASS. The upstream turns in `tests/clients/scripted_turns.json` are now long enough (and the threshold low enough, 0.01) to compact on a real window up to ~256k tokens; the first version only compacted on the test stub's 4k window.
+
 ### Works-with runners (clients and upstreams)
 
 - **`tests/clients/run_clients.py` runs one scripted, over-budget conversation through each real client.** Aider,
