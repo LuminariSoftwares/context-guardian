@@ -62,7 +62,7 @@ Success: the page lists the GitHub Actions publisher for `LuminariSoftwares/cont
 
 ## Every release
 
-PyPI and npm are independent version lines (today: PyPI `0.12.0`, npm `0.2.0-beta.1`). The `verify` job stops
+PyPI and npm are independent version lines (today: PyPI `0.13.0`, npm `0.3.0-beta.1`). The `verify` job stops
 the release before anything is built unless:
 
 | What | Rule |
