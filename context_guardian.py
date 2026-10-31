@@ -2764,6 +2764,12 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any],
         _note_spill(spill, "oversized_spill")
         new_payload = dict(payload)
         new_payload["messages"] = spill["messages"]
+        # /guardian/usage reports what is forwarded: the cut request, on the exact
+        # count's scale when there is one (as _compaction_event scales its "after").
+        forwarded = estimate_tokens(spill["messages"]) + tool_tokens
+        if count_source == "tokenize" and message_tokens + tool_tokens > 0:
+            forwarded = int(forwarded * estimated / (message_tokens + tool_tokens))
+        snap["used"] = forwarded
         return new_payload
 
     if part["retired_summaries"]:

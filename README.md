@@ -148,7 +148,7 @@ GET /guardian/usage[?session=<id>]
 {"window": 32000, "used_after_compaction": 12900, "pct": 40.3, "count_source": "estimate", "model": "demo", "last_compaction_at": null}
 ```
 
-`used_after_compaction` is what the proxy forwarded for the session's latest chat request: the compaction's "after" count when it compacted, else the request's own count. `count_source` is `tokenize` (exact, from the upstream), `calibrated` or `estimate`. `last_compaction_at` is the session's latest compaction, or `null`. Without `session` it answers for the most recent request; before any request it is a 404 (`no session seen yet`), and an unknown id is a 404 (`unknown session`). Sessions are kept in memory, the latest 64, and are gone on restart.
+`used_after_compaction` is what the proxy forwarded for the session's latest chat request: the compaction's "after" count when it compacted, or the cut request when a single oversized message was spilled (see [the oversized-message section](#big-pastes)), else the request's own count. `count_source` is `tokenize` (exact, from the upstream), `calibrated` or `estimate`. `last_compaction_at` is the session's latest compaction, or `null`. Without `session` it answers for the most recent request; before any request it is a 404 (`no session seen yet`), and an unknown id is a 404 (`unknown session`). Sessions are kept in memory, the latest 64, and are gone on restart.
 
 `context-guardian-statusline` (a clone runs the same code as `python scripts/cg_statusline.py`) turns that into one line, standard library only:
 
