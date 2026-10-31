@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## dsh-context-guardian 0.3.0-beta.1 / PyPI context-guardian 0.13.0 (2026-10-31)
+
+Counts you can trust and a matrix you can re-run. Token counts are exact on llama.cpp and vLLM, a single message
+bigger than the window is archived in full and sent as head + tail + a pointer instead of overflowing the backend, the client can show the proxy's own
+usage number (a Claude Code status line), `--savings` reports what compaction removed (and `llms.txt` describes the
+project for models), the archive can be encrypted (opt-in, `GUARDIAN_ENCRYPT`),
+and the Works-with tables are the output of runners anyone can re-run. The version moves to 0.13.0 in
+`pyproject.toml`, `__version__`, the MCP server and `server.json` together; npm moves to 0.3.0-beta.1. No breaking
+changes: existing settings, endpoints and archives answer as before.
 
 - Works-with tables filled from the first live runs (2026-10-31, Windows): aider, opencode, continue and claude-code PASS through the proxy; Ollama 0.40.4 PASS. The upstream turns in `tests/clients/scripted_turns.json` are now long enough (and the threshold low enough, 0.01) to compact on a real window up to ~256k tokens; the first version only compacted on the test stub's 4k window.
 
