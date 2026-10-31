@@ -139,6 +139,42 @@ Then search Claude Code's history like any other run: `context-guardian-recall "
 
 Limits: Claude Code documents its transcript lines as internal and liable to change between versions, so lines are archived verbatim and only read for their text. The adapter does not change what Claude Code keeps in its own window; it keeps a sealed, searchable copy of what was said.
 
+## Show real usage in your client
+
+A client's own context counter cannot know what the proxy forwarded, so after a compaction it reads high. The proxy keeps its own number and serves it:
+
+```
+GET /guardian/usage[?session=<id>]
+{"window": 32000, "used_after_compaction": 12900, "pct": 40.3, "count_source": "estimate", "model": "demo", "last_compaction_at": null}
+```
+
+`used_after_compaction` is what the proxy forwarded for the session's latest chat request: the compaction's "after" count when it compacted, or the cut request when a single oversized message was spilled (see [the oversized-message section](#big-pastes)), else the request's own count. `count_source` is `tokenize` (exact, from the upstream), `calibrated` or `estimate`. `last_compaction_at` is the session's latest compaction, or `null`. Without `session` it answers for the most recent request; before any request it is a 404 (`no session seen yet`), and an unknown id is a 404 (`unknown session`). Sessions are kept in memory, the latest 64, and are gone on restart.
+
+`context-guardian-statusline` (a clone runs the same code as `python scripts/cg_statusline.py`) turns that into one line, standard library only:
+
+```
+$ context-guardian-statusline --url http://127.0.0.1:8786
+ctx 40% (12.9k/32k) est
+```
+
+`exact` replaces `est` when the upstream counted the request itself. Any failure (proxy down, no session yet, slow reply) prints `ctx ?` and exits 1; the default timeout is 2 s (`--timeout`), so a status line never hangs the client. `--session <id>` picks a session, `--format claude|opencode|plain` only names the caller (every format prints the same line; `claude` reads and ignores the JSON Claude Code pipes in).
+
+**Claude Code**, in `~/.claude/settings.json`:
+
+```json
+{"statusLine": {"type": "command", "command": "context-guardian-statusline --url http://127.0.0.1:8786 --format claude"}}
+```
+
+**OpenCode**: the command does not depend on any OpenCode setting, so run it from a terminal status bar next to OpenCode, for example in tmux:
+
+```
+set -g status-right '#(context-guardian-statusline --url http://127.0.0.1:8786 --format opencode)'
+```
+
+From a clone, point the command at `python /path/to/context-guardian/scripts/cg_statusline.py` instead.
+
+**Limit: the session key.** The proxy tells sessions apart by a hash of the model, the first system message and the first user message. Two sessions with the same model, system prompt and opener collide and share one entry, and the line shows whichever sent a request last. Send an `X-Guardian-Session: <id>` header from your client (a non-empty value wins over the hash) and pass the same id as `--session`.
+
 ## DeepSeek Harness
 
 <p>
@@ -260,13 +296,14 @@ sequenceDiagram
 | How it hooks in | you point `OPENAI_BASE_URL` at it | one row in your agent preset's `compaction` group | `PreCompact` and `SessionEnd` hooks |
 | Compacts | yes: the same backend writes the summary | yes: DSH's own summary first, a deterministic checkpoint when that fails or cannot fit | no: Claude Code compacts its own window |
 | Archive | sealed, indexed spans; optional capture journal | the same format | the same format, one run per session |
-| Live view | `/guardian/health` dashboard, `/guardian/stats`, `/guardian/events` | `/guardian`, `/context` in DSH, `guardian_dsh.jsonl` | `context-guardian-claude-code status` |
+| Live view | `/guardian/health` dashboard, `/guardian/stats`, `/guardian/events`, `/guardian/usage` | `/guardian`, `/context` in DSH, `guardian_dsh.jsonl` | `context-guardian-claude-code status` |
 
 | part | file | role |
 |---|---|---|
-| proxy | `context_guardian.py` | FastAPI app: estimate, compact, archive, forward; `/guardian/stats`, `/guardian/health`, `/guardian/events` |
+| proxy | `context_guardian.py` | FastAPI app: estimate, compact, archive, forward; `/guardian/stats`, `/guardian/health`, `/guardian/events`, `/guardian/usage` |
 | archive | `cg_archive.py`, `cg_seal.js` | span writer, seal, verifier, digest index, receipts, capture journal; the JS half writes the same chain for the DSH engine |
 | DSH engine | `engine.js`, `cg_recall.js`, `cg_memory.js`, `vendor/compiler.js` | compaction row inside DeepSeek Harness, with model-facing `recall` / `search` and pinned facts |
+| status line | `cg_statusline.py` | `context-guardian-statusline`: prints the proxy's own context number as one line for a client's status line |
 | recall CLI | `cg_recall_cli.py` | `context-guardian-recall`: search, `--verify`, `--receipts`, `--reindex` |
 | MCP server | `cg_mcp.py` | `context-guardian-mcp`: six read-only tools over the proxy's stats and the archive |
 | Claude Code adapter | `cg_claude_code.py` | `context-guardian-claude-code`: capture, install, uninstall, status |
@@ -590,7 +627,6 @@ On Ollama, Guardian asks `/api/show` for each model's `num_ctx`, and on vLLM and
 ## What this does *not* do
 
 - **It doesn't replace or duplicate compression your backend already does** (prompt caching, a compressing proxy). It forwards to your backend as-is once it has decided whether to compact first; the two are complementary.
-- **It doesn't fix your CLI's own context-usage display.** Your CLI doesn't know this proxy exists, so its own token counter will drift from reality after a compaction. What matters is that the session keeps working instead of hard-stopping.
 - **The count is exact only on llama.cpp and vLLM; everywhere else it is an estimate, and an estimate is not always conservative.** On llama.cpp (`/apply-template`, then `/tokenize`) and vLLM (`/tokenize` with the messages, `add_generation_prompt` and the tools) the upstream counts the request itself, chat template included, and that count decides compaction as it is: no calibration factor, no margin. Which of the two (if either) the upstream is comes only from the window detection that already runs, so **exact counts need context detection on (`GUARDIAN_DETECT_CONTEXT`, on by default)**: no extra probe goes out on the request path, and with `GUARDIAN_DETECT_CONTEXT=0` no tokenize or apply-template request is ever sent and counts are estimates. **On vLLM the exact count is asked only once the chat is big enough to matter**: while the estimate times 8 is still under the input budget (the review's worst under-read is ×4) the estimate is used, so short chats cost the tokenizer nothing; llama.cpp is counted on every request. On llama.cpp the next turn sends only the new messages to be counted (plus one template-overhead probe per model), so a long conversation is not re-tokenised each turn; that running total is exact for a template that renders each message independently, and the request is re-counted whole otherwise (a template that refuses an empty render, or more than `GUARDIAN_COUNT_RECOUNT_MISSES` new messages). **Ollama has no tokenizer route** (`POST /api/tokenize` answers 404 on the Ollama measured), and so does any other upstream, any server error and any timeout: those use the estimate for that request, which is `characters / GUARDIAN_CHARS_PER_TOKEN` (3.5 by default) and content-blind (`tests/test_token_estimate.py` pins this). English prose runs above 3.5 characters per token, so the estimate reads high and compaction fires early; dense JSON and CJK text run well below it, so it reads **low** and compaction fires **late**, which is the direction that lets your backend overflow first. The October 2026 external review put the under-read at roughly ×1.38 on a dense JSON payload and ×4 on CJK. `GUARDIAN_CALIBRATE` (on by default) learns each model's real ratio from the `usage` the backend reports and corrects later estimates, and `GUARDIAN_OLLAMA_CONTEXT` budgets against the window Ollama actually runs at. If your traffic on an estimated upstream is mostly JSON or CJK, set **`GUARDIAN_ESTIMATE_MARGIN`**, a multiplier on every count that is not exact: **1.4** for JSON-heavy traffic, **4.0** for CJK, as the review measured. `/guardian/stats` shows `count_source` (`tokenize`, `calibrated` or `estimate`), `tokenize_failures`, `estimate_margin` and the cache counters, and every compaction event carries its `count_source`.
 - **It cannot shrink your tool definitions.** The `tools` array is counted against the budget (`GUARDIAN_COUNT_TOOLS`), but it is a fixed floor under every request: compaction only summarises messages. The proxy logs a `tool_budget` event and warns when tool definitions alone approach the window. Load fewer MCP servers, or put them behind [Tool Guardian](https://github.com/LuminariSoftwares/tool-guardian), which does exactly that half of the problem.
 - **The seal is tamper-evident, not tamper-proof.** It shows that something changed; it cannot stop someone with write access from rewriting the archive and rehashing the chain. Only an anchor kept elsewhere (`GUARDIAN_SEAL_ANCHOR_PATH`) catches that. A backfilled seal proves a file has not changed since it was backfilled, not that it matches what was first written.

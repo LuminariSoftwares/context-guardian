@@ -29,6 +29,7 @@
     "cg_paths.py",
     "cg_archive.py",
     "cg_count.py",
+    "cg_statusline.py",
     "cg_handoff.js",
     "cg_provenance.js",
     "cg_autorecall.js",
