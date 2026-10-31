@@ -933,6 +933,85 @@ def receipts_summary(events: List[Dict[str, Any]], span_dir: Path,
     return out
 
 
+# --- --savings: the compaction log's before -> after totals ---------------------------
+
+def log_path(env: Optional[Dict[str, str]] = None) -> Path:
+    """GUARDIAN_LOG_PATH, else <data dir>/logs/context_guardian_log.json: the
+    proxy's own resolution."""
+    env = os.environ if env is None else env
+    chosen = (env.get("GUARDIAN_LOG_PATH") or "").strip()
+    if chosen:
+        return Path(chosen)
+    import cg_paths
+    return cg_paths.data_dir() / cg_paths.LOG_SUBPATH
+
+
+def read_log(path: Path, since: Optional[datetime.timedelta] = None) -> List[Dict[str, Any]]:
+    """Every JSON-object line of the compaction log, oldest first. A line that
+    is not a JSON object is skipped. With `since`, an event whose local
+    "timestamp" (YYYY-MM-DDTHH:MM:SS) is older than now - since, or has none
+    that reads, is left out."""
+    out: List[Dict[str, Any]] = []
+    cutoff = (datetime.datetime.now().astimezone() - since) if since else None
+    try:
+        fh = open(path, "rb")
+    except OSError:
+        return out
+    with fh:
+        for raw in fh:
+            try:
+                obj = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(obj, dict):
+                continue
+            if cutoff is not None:
+                ts = _parse_ts(obj.get("timestamp"))
+                if ts is None or ts < cutoff:
+                    continue
+            out.append(obj)
+    return out
+
+
+def savings_summary(log_events: List[Dict[str, Any]], receipts: List[Dict[str, Any]],
+                    window: str = "all time") -> Dict[str, Any]:
+    """Everything --savings prints, counted from the log and the receipts.
+    A "dry_run" event is never counted: it forwarded the request unchanged."""
+    comps = [e for e in log_events if e.get("event") == "compaction"]
+    before = sum(_count(e, "estimated_tokens_before") for e in comps)
+    after = sum(_count(e, "estimated_tokens_after") for e in comps)
+    recall = [e for e in receipts if e["tool"].startswith(("cli.", "mcp."))]
+    return {
+        "window": window,
+        "compactions": len(comps),
+        "tokens_before": before,
+        "tokens_after": after,
+        "tokens_kept_out": sum(_count(e, "tokens_saved") for e in comps),
+        "pct_smaller": round(100 * (1 - after / before), 1) if before else 0.0,
+        "oversized_spills": sum(1 for e in log_events if e.get("event") == "oversized_spill")
+        + sum(_count(e, "oversized_spilled") for e in comps),
+        "summaries_reused": sum(1 for e in comps if e.get("summary_source") == "reused"),
+        "recall_calls": len(recall),
+        "chars_returned": sum(_count(e, "chars_returned") for e in recall),
+    }
+
+
+def format_savings(s: Dict[str, Any]) -> str:
+    head = "Context Guardian savings (%s)" % s["window"]
+    if not s["compactions"] and not s["oversized_spills"]:
+        return head + "\nno compactions in window"
+    n = lambda key: format(s[key], ",")  # noqa: E731
+    return "\n".join([
+        head,
+        "  compactions   %s" % n("compactions"),
+        "  requests      %s -> %s tokens (%.1f%% smaller)" % (n("tokens_before"), n("tokens_after"), s["pct_smaller"]),
+        "  kept out      %s tokens" % n("tokens_kept_out"),
+        "  oversized     %s pasted message(s) cut to head + tail" % n("oversized_spills"),
+        "  summaries     %s reused (no summariser call)" % n("summaries_reused"),
+        "  recall        %s call(s), %s chars returned" % (n("recall_calls"), n("chars_returned")),
+    ])
+
+
 def _mb(n: int) -> str:
     return "%.1f MB" % (n / 1e6) if n >= 100_000 else "%d KB" % round(n / 1000)
 

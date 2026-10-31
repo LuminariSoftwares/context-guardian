@@ -1,0 +1,35 @@
+# context-guardian
+
+> A local proxy that keeps a long chat with a local model from overflowing its context window. It folds old messages into a summary, archives the full originals as sealed spans on disk, and lets a person or a model search and re-read them. Fails open, no telemetry, MIT, Python 3.10+.
+
+## Install
+
+- Python: `pip install context-guardian && context-guardian` starts the proxy on `:8786` in front of Ollama on `:11434`. Point the client at `http://localhost:8786/v1`.
+- Check it: `context-guardian-doctor` tests the install and the running proxy and prints a `fix:` line for anything wrong.
+- Claude Code: `context-guardian-claude-code install` prints the hooks and the `claude mcp add` command; `--apply` writes them (it backs up `~/.claude/settings.json` first).
+- Quick start: [README.md#quick-start](README.md#quick-start). Per-client settings: [README.md#point-your-client-at-the-proxy](README.md#point-your-client-at-the-proxy).
+- DeepSeek Harness: `dsh plugin --profile web add dsh-context-guardian`, then [README.md#install-both-deepseek-harness-about-5-minutes](README.md#install-both-deepseek-harness-about-5-minutes).
+
+## Configure
+
+- Set `GUARDIAN_NUM_CTX` to the model's real context window in tokens; it is the one setting that matters per person.
+- Set `GUARDIAN_UPSTREAM_URL` to the OpenAI-compatible backend (default `http://localhost:11434/v1`).
+- `context-guardian-configure` asks for these and writes `.env`. Try `GUARDIAN_DRY_RUN=1` first: it logs what it would do and forwards every request unchanged.
+- Every setting, with defaults: [README.md#configure](README.md#configure). Where files live and how to delete them: [README.md#what-is-stored-where-and-how-to-delete-it](README.md#what-is-stored-where-and-how-to-delete-it).
+
+## Recall
+
+- `context-guardian-recall "<term>"` searches the archived originals. Exit 0 with hits, 1 without.
+- `context-guardian-recall --verify --all` checks every run's hash chain and exits 0 only when all are OK.
+- `context-guardian-recall --savings [--since 7d] [--json]` prints what compaction saved, counted from the compaction log: tokens before and after, oversized pastes cut, summaries reused, recall reads. `--receipts` adds archive size, spans opened and seal status.
+- MCP server (read-only): `uvx context-guardian mcp` gives a model `list_digests`, `search_spans`, `read_span`, `list_spans`, `get_seal_status` and `get_proxy_status`. See [README.md#mcp-server](README.md#mcp-server).
+- How to skim, search and open: [README.md#recall-skim-search-open](README.md#recall-skim-search-open). Proof it works: [README.md#prove-it](README.md#prove-it).
+- Archive format, so you can write your own verifier: [docs/ARCHIVE_FORMAT.md](docs/ARCHIVE_FORMAT.md).
+
+## Limits
+
+- What it does not do, in full: [README.md#what-this-does-not-do](README.md#what-this-does-not-do).
+- The token count is exact only on llama.cpp and vLLM; elsewhere it is an estimate, and for JSON or CJK text the estimate runs low. Set `GUARDIAN_ESTIMATE_MARGIN`.
+- It cannot shrink tool definitions, and it does not compact Claude Code itself: that adapter only archives, seals and indexes the transcript.
+- The seal is tamper-evident, not tamper-proof. The archive is clear text on disk: treat it like shell history.
+- Source: [github.com/LuminariSoftwares/context-guardian](https://github.com/LuminariSoftwares/context-guardian/blob/main/README.md).
