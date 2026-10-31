@@ -4,6 +4,7 @@
     context-guardian-recall <term> [--run RUN_ID]
     context-guardian-recall --verify [--run RUN_ID | --all] [--heads] [--seal-existing]
     context-guardian-recall --receipts [--since 7d] [--share]
+    context-guardian-recall --savings [--since 7d] [--json]
     context-guardian-recall --reindex [--run RUN_ID]
 
 A compaction folds older messages into a summary and archives the full text as
@@ -27,6 +28,12 @@ cg_archive.py): archive size, recall calls, spans opened, the share of the
 archive read back, tokens saved, seal status. --share prints the same as a
 short block with no paths, no text and no run ids. --reindex rebuilds the
 skim index (index.jsonl) for spans written before it existed.
+
+--savings adds up the compaction log (GUARDIAN_LOG_PATH) and the receipts:
+how many tokens the forwarded requests held before and after compaction, the
+percent smaller, the oversized pastes cut to head + tail, summaries reused and
+recall reads. Every figure is counted, none estimated; --json prints it as one
+object. A bad --since AGE exits 2.
 Stdlib only, Python 3.10+. MIT.
 """
 from __future__ import annotations
@@ -220,6 +227,19 @@ def cmd_receipts(ns, root: Path) -> int:
     return 0
 
 
+def cmd_savings(ns) -> int:
+    try:
+        since = cg_archive.parse_since(ns.since)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    window = "last %s" % ns.since if ns.since else "all time"
+    summary = cg_archive.savings_summary(cg_archive.read_log(cg_archive.log_path(), since),
+                                         cg_archive.read_receipts(cg_archive.receipts_path(), since), window)
+    print(json.dumps(summary) if ns.json else cg_archive.format_savings(summary))
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="context-guardian-recall",
@@ -244,12 +264,19 @@ def main(argv=None) -> int:
     group.add_argument("--receipts", action="store_true",
                        help="summarise the counts-only recall receipts")
     group.add_argument("--since", metavar="AGE", default=None,
-                       help="with --receipts: only the last AGE, e.g. 24h, 7d, 2w")
+                       help="with --receipts or --savings: only the last AGE, e.g. 24h, 7d, 2w")
     group.add_argument("--share", action="store_true",
                        help="with --receipts: a short copy-paste block with no paths, text or run ids")
+    group = parser.add_argument_group("savings")
+    group.add_argument("--savings", action="store_true",
+                       help="before -> after token totals from the compaction log, oversized pastes cut, recall reads")
+    group.add_argument("--json", action="store_true",
+                       help="with --savings: one JSON object instead of text")
     ns = parser.parse_args(sys.argv[1:] if argv is None else argv)
 
     root = span_dir()
+    if ns.savings:
+        return cmd_savings(ns)
     if ns.receipts or ns.share:
         return cmd_receipts(ns, root)
     if ns.reindex:

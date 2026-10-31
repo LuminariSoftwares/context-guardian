@@ -64,6 +64,8 @@ direct: rejected from turn 8 on. proxy: 12/12 turns answered, 6 originals archiv
 
 ## Quick start
 
+**With an AI agent:** paste one line, "Install context-guardian (docs: https://raw.githubusercontent.com/LuminariSoftwares/context-guardian/main/llms.txt) and point my client at it". [llms.txt](llms.txt) is the whole install, configure, recall and limits story in one short file an agent can read.
+
 **Local model CLI, through the proxy:**
 
 ```bash
@@ -88,11 +90,12 @@ Details: [Claude Code](#claude-code).
 
 ## Prove it
 
-Two commands turn "lossless on disk" and "it helps" from claims into numbers you can check.
+Three commands turn "lossless on disk" and "it helps" from claims into numbers you can check.
 
 ```bash
 context-guardian-recall --verify --all     # every run: OK, or the first break and what kind
 context-guardian-recall --receipts --since 7d
+context-guardian-recall --savings --since 7d   # how much smaller the requests were; add --json for scripts
 ```
 
 **`--verify`** walks each run's `chain.jsonl`: one line per archived file with the SHA-256 of its bytes on disk, chained to the line before it. It reports `OK` per run, or the first break: `content-changed`, `file-missing` (deleted with no prune record), `entry-edited`, `entry-reordered`, `chain-forked`, `unsealed-file` or `anchor-mismatch`. Spans removed by `GUARDIAN_KEEP_SPANS` are reported as pruned, as expected. It exits 0 only when every checked run is OK. `--heads` prints each run's chain head, and `--seal-existing` seals an archive written before 0.12.0, with every line marked `"backfilled": true` because it was sealed late. The MCP tool `get_seal_status` runs the same check from inside a client.
@@ -110,6 +113,20 @@ Context Guardian receipts (last 7d)
 ```
 
 (Illustrative numbers. Your own come from `--receipts --share`.)
+
+**`--savings`** is the other half: how much smaller the forwarded requests were. It reads the compaction log (`GUARDIAN_LOG_PATH`) and the receipts, and every figure is counted, none estimated: the request sizes before and after each compaction (the proxy's own count for the request, exact on llama.cpp and vLLM and an estimate elsewhere, see [What this does *not* do](#what-this-does-not-do)), the oversized pasted messages cut to head + tail, summaries reused without a summariser call, and recall reads. A dry run never counts, because it forwards the request unchanged. `--since AGE` takes `30m`, `24h`, `7d` or `2w`; a bad AGE exits 2. `--json` prints one object with the keys `window`, `compactions`, `tokens_before`, `tokens_after`, `tokens_kept_out`, `pct_smaller`, `oversized_spills`, `summaries_reused`, `recall_calls` and `chars_returned`.
+
+```text
+Context Guardian savings (last 7d)
+  compactions   35
+  requests      145,332 -> 14,819 tokens (89.8% smaller)
+  kept out      130,513 tokens
+  oversized     1 pasted message(s) cut to head + tail
+  summaries     0 reused (no summariser call)
+  recall        3 call(s), 3,170 chars returned
+```
+
+(Output from a scripted 40-turn stub session against a fake backend, not a real log. Your own come from `--savings`.)
 
 ## Point your client at the proxy
 

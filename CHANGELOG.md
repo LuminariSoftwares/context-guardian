@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Counted savings and llms.txt
+
+- **`context-guardian-recall --savings [--since AGE] [--json]` shows how much smaller the forwarded requests were.**
+  `--receipts` counted compactions and tokens saved; nothing showed the before -> after request totals, the oversized
+  pastes cut to head + tail, or any of it as data. `--savings` adds those from the compaction log
+  (`GUARDIAN_LOG_PATH`) and the receipts: compactions, `tokens_before`, `tokens_after`, `tokens_kept_out`,
+  `pct_smaller`, `oversized_spills`, `summaries_reused`, `recall_calls`, `chars_returned`. Counted, never estimated; a
+  dry run never counts. `--json` prints one object with those keys plus `window`. A bad AGE exits 2.
+  The counting is `cg_archive.savings_summary`.
+- **`llms.txt` at the repo root, and a one-prompt install line in the README.** One short file with install,
+  configure, recall and limits, linked to the README sections; it ships in the npm package.
+
 ### The client shows the proxy's own number
 
 - **`GET /guardian/usage[?session=<id>]` returns what the proxy forwarded for a session's latest chat request:**

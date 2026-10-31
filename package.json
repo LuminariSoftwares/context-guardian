@@ -41,6 +41,7 @@
     "docs/dsh-upstream-append-only.md",
     "THIRD_PARTY_NOTICES.md",
     "README.md",
+    "llms.txt",
     "CHANGELOG.md",
     "LICENSE",
     "cg_anchors.js",
