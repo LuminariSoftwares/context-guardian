@@ -364,9 +364,18 @@ Rows are the output lines of `tests/clients/run_clients.py` / `tests/upstreams/r
 
 | date | client | version | result |
 |---|---|---|---|
+| 2026-10-31 | aider | 0.86.2 | PASS |
+| 2026-10-31 | opencode | 1.19.5 | PASS |
+| 2026-10-31 | continue (`cn`) | 1.5.47 | PASS |
+| 2026-10-31 | claude-code | 2.1.302 | PASS |
+
+Run on Windows 10, Python 3.11.9 (`context-guardian client check (Windows 10, python 3.11.9)`). On Windows, `cn` installed by npm is a `.cmd` shim, and cmd.exe cuts a command line at 8,191 characters, shorter than the scripted first turn; point `--bin continue=` at a small `.py` that starts `node <cli>/dist/cn.js` (the runner runs a `.py` binary under its own interpreter).
 
 | date | upstream | version | result |
 |---|---|---|---|
+| 2026-10-31 | ollama | 0.40.4 | PASS |
+
+Run on Windows 10, Python 3.11.9 against a 2x RTX 3060 box with a 32,768-token window detected from Ollama. llama.cpp, vLLM, LM Studio and LiteLLM were not installed on that run, so they have no row yet.
 
 **How to re-run the matrix.** Each client runs one scripted, over-budget conversation (two turns, the second continuing the first) through its own proxy, in an isolated home folder, against a scripted mock model; it passes when a request reached the proxy, a compaction (or an oversized-message spill) happened, and the mock's `CG_OK` answer reached the client's output. Install the clients you want checked, then:
 
