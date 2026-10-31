@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Optional archive encryption
+
+- **`GUARDIAN_ENCRYPT=1` writes new spans as AES-256-GCM ciphertext (format 2).** README said "the archive is clear
+  text on disk". With `pip install "context-guardian[encrypt]"` (one optional package, `cryptography>=42`, imported
+  only when encryption is on) and a 32-byte key in `GUARDIAN_ARCHIVE_KEY` or `GUARDIAN_ARCHIVE_KEY_FILE`, a span file
+  is a clear header (`run_id`, `index`, `at`) plus the nonce and ciphertext of the whole body. The seal hashes the
+  bytes as written, so `--verify` is unchanged and works without the key; format 1 runs stay readable. Off by default;
+  nothing converts existing runs.
+- **No clear-text path remains for an encrypted run.** The index line is counts plus `locked: true` (no digest, no
+  keywords), also after `--reindex`; the compaction log's `summary_preview` is empty; `GUARDIAN_CAPTURE=journal` is
+  refused. The model still gets the summary and the head and tail of a cut paste. Every span writer encrypts: the
+  proxy's compaction and oversized spans and the Claude Code adapter (which, with no usable key, writes nothing and
+  still exits 0).
+- **One reader.** `cg_archive.load_span` returns a format 1 file as before, a format 2 file decrypted when the key is
+  right, else its header plus `locked: true`. `context-guardian-recall`, `search_spans`, `list_spans` and `read_span`
+  go through it and say `locked` instead of showing text.
+- **The proxy refuses to start** with `GUARDIAN_ENCRYPT=1` and no key, a key that is not 32 bytes,
+  `GUARDIAN_CAPTURE=journal`, or `cryptography` missing. Importing the module never raises.
+- Docs: README "Encrypt the archive", the format 2 section and a test vector in `docs/ARCHIVE_FORMAT.md`, SECURITY.md.
+
 ### Counted savings and llms.txt
 
 - **`context-guardian-recall --savings [--since AGE] [--json]` shows how much smaller the forwarded requests were.**

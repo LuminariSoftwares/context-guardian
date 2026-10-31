@@ -31,6 +31,7 @@ Python 3.10+, Windows and POSIX. MIT licensed.
 """
 from __future__ import annotations
 
+import base64
 import collections
 import datetime
 import hashlib
@@ -199,7 +200,103 @@ def replace_file(src: Path, dst: Path) -> None:
             time.sleep(0.02)
 
 
-def write_span_file(run_dir: Path, start_index: int, payload, probe: int = 50) -> Optional[Tuple[Path, int, Dict[str, Any]]]:
+# --- optional encryption at rest (format 2) --------------------------------------------
+#
+# GUARDIAN_ENCRYPT=1 writes each NEW span as AES-256-GCM ciphertext. The file
+# keeps a clear header (run_id, index, at) and holds the whole body a format 1
+# file would have held inside `ciphertext`. The seal hashes the file's bytes as
+# written, so it is unchanged. `cryptography` is imported only here, only when
+# encryption is on or an encrypted file is opened: it is an optional extra.
+
+ENCRYPT_FORMAT = 2
+ENC_NAME = "aes-256-gcm"
+NONCE_BYTES = 12
+KEY_BYTES = 32
+_ON = ("1", "true", "yes", "on")
+INSTALL_HINT = 'pip install "context-guardian[encrypt]"'
+
+
+def encryption_on(env: Optional[Dict[str, str]] = None) -> bool:
+    """GUARDIAN_ENCRYPT, read at call time. Default off."""
+    env = os.environ if env is None else env
+    return (env.get("GUARDIAN_ENCRYPT") or "").strip().lower() in _ON
+
+
+def archive_key(env: Optional[Dict[str, str]] = None) -> Optional[bytes]:
+    """The 32-byte key from GUARDIAN_ARCHIVE_KEY (base64) or the file named by
+    GUARDIAN_ARCHIVE_KEY_FILE (base64 text, surrounding whitespace ignored).
+    None when neither is set; ValueError, with the reason, when one is set
+    and is not base64 of exactly 32 bytes."""
+    env = os.environ if env is None else env
+    text, where = (env.get("GUARDIAN_ARCHIVE_KEY") or "").strip(), "GUARDIAN_ARCHIVE_KEY"
+    if not text:
+        name = (env.get("GUARDIAN_ARCHIVE_KEY_FILE") or "").strip()
+        if not name:
+            return None
+        where = "GUARDIAN_ARCHIVE_KEY_FILE"
+        try:
+            text = Path(name).read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ValueError("GUARDIAN_ARCHIVE_KEY_FILE %s cannot be read (%s)" % (name, type(exc).__name__)) from exc
+    try:
+        key = base64.b64decode(text, validate=True)
+    except ValueError as exc:
+        raise ValueError("%s is not valid base64; it must be base64 of exactly %d bytes" % (where, KEY_BYTES)) from exc
+    if len(key) != KEY_BYTES:
+        raise ValueError("%s decodes to %d bytes; it must be exactly %d" % (where, len(key), KEY_BYTES))
+    return key
+
+
+def _aesgcm():
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except ImportError as exc:
+        raise ImportError("encryption needs the cryptography package: %s" % INSTALL_HINT) from exc
+    return AESGCM
+
+
+class Encryptor:
+    """Seals a span body as a format 2 file object. A fresh random nonce per file."""
+
+    def __init__(self, key: bytes):
+        if len(key) != KEY_BYTES:
+            raise ValueError("the archive key must be exactly %d bytes" % KEY_BYTES)
+        self._aes = _aesgcm()(key)
+
+    def seal(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        nonce = os.urandom(NONCE_BYTES)
+        plaintext = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        return {"format": ENCRYPT_FORMAT, "enc": ENC_NAME,
+                "nonce": base64.b64encode(nonce).decode("ascii"),
+                "ciphertext": base64.b64encode(self._aes.encrypt(nonce, plaintext, None)).decode("ascii"),
+                "run_id": body.get("run_id"), "index": body.get("index"), "at": body.get("at")}
+
+
+def encryptor_from_env(env: Optional[Dict[str, str]] = None) -> Optional[Encryptor]:
+    """None when encryption is off. When it is on: an Encryptor, or ValueError
+    (no key, a bad key) or ImportError (no cryptography). Never a silent
+    fall-back to clear text: callers that cannot get one write nothing."""
+    env = os.environ if env is None else env
+    if not encryption_on(env):
+        return None
+    key = archive_key(env)
+    if key is None:
+        raise ValueError("GUARDIAN_ENCRYPT=1 needs a key: set GUARDIAN_ARCHIVE_KEY (base64 of 32 bytes) "
+                         "or GUARDIAN_ARCHIVE_KEY_FILE")
+    return Encryptor(key)
+
+
+def _decrypt(data: Dict[str, Any], key: bytes) -> Optional[Dict[str, Any]]:
+    try:
+        plain = _aesgcm()(key).decrypt(base64.b64decode(data["nonce"]), base64.b64decode(data["ciphertext"]), None)
+        body = json.loads(plain.decode("utf-8"))
+    except Exception:                                      # noqa: BLE001 -- wrong key, torn file, no cryptography
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def write_span_file(run_dir: Path, start_index: int, payload, probe: int = 50,
+                    encryptor: Optional[Encryptor] = None) -> Optional[Tuple[Path, int, Dict[str, Any]]]:
     """Write one span file: claim the first free NNNN.json at or after
     start_index with an exclusive create, write payload(index) to a temp file,
     fsync it and rename it over the claim. Returns (path, index, payload), or
@@ -209,6 +306,9 @@ def write_span_file(run_dir: Path, start_index: int, payload, probe: int = 50) -
     The claim is what stops two concurrent writers computing the same index
     from clobbering each other; the temp file and rename are what make the
     bytes on disk final before they are sealed.
+
+    With an `encryptor` the file holds the format 2 object (see Encryptor);
+    the third value returned is still the clear body, for the caller's index.
     """
     run_dir = Path(run_dir)
     path = None
@@ -229,7 +329,7 @@ def write_span_file(run_dir: Path, start_index: int, payload, probe: int = 50) -
         body = payload(index)
         with open(tmp, "x", encoding="utf-8") as fh:
             _make_private(tmp, PRIVATE_FILE_MODE)
-            json.dump(body, fh, ensure_ascii=False, indent=1)
+            json.dump(encryptor.seal(body) if encryptor else body, fh, ensure_ascii=False, indent=1)
             fh.flush()
             os.fsync(fh.fileno())
         replace_file(tmp, path)
@@ -1194,11 +1294,19 @@ def top_terms(text: str, n: int = INDEX_TERMS) -> List[str]:
     return [w for _, w in ranked[:n]]
 
 
-def index_entry(span: Dict[str, Any], name: str) -> Dict[str, Any]:
-    """The index line for one span file's parsed content."""
+def index_entry(span: Dict[str, Any], name: str, locked: bool = False) -> Dict[str, Any]:
+    """The index line for one span file's parsed content. An encrypted run's
+    line (locked, or a span load_span decrypted: format 2) carries counts only:
+    no digest and no terms, because both are text from the span."""
     messages = span.get("messages") if isinstance(span.get("messages"), list) else []
     text = "\n".join(plain_text(m) for m in messages)
     chars = len(text)
+    if locked or span.get("locked") or span.get("format") == ENCRYPT_FORMAT:
+        at = span.get("at")
+        return {"span": name[:-len(".json")] if name.endswith(".json") else name,
+                "ts": at if isinstance(at, str) else "",
+                "messages": len(messages), "chars": chars, "est_tokens": int(chars / CHARS_PER_TOKEN),
+                "locked": True}
     summary = span.get("summary")
     if isinstance(summary, str) and summary.strip():
         digest, source = first_sentence(summary), "summary"
@@ -1251,11 +1359,28 @@ def read_index(run_dir: Path) -> List[Dict[str, Any]]:
 
 
 def load_span(path: Path) -> Optional[Dict[str, Any]]:
+    """The one reader of a span file. A format 1 file is returned as it is. A
+    format 2 file is returned decrypted (the full body, marked format 2) when
+    the key in the environment is set and right; otherwise as its clear header
+    plus "locked": True, with no messages and no summary."""
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    return data if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        return None
+    if data.get("format") != ENCRYPT_FORMAT:
+        return data
+    try:
+        key = archive_key()
+    except ValueError:
+        key = None
+    body = _decrypt(data, key) if key else None
+    if body is not None:
+        body["format"] = ENCRYPT_FORMAT
+        return body
+    return {"format": ENCRYPT_FORMAT, "run_id": data.get("run_id"), "index": data.get("index"),
+            "at": data.get("at"), "locked": True}
 
 
 def reindex(span_dir: Path, run: Optional[str] = None) -> Dict[str, int]:
@@ -1268,10 +1393,16 @@ def reindex(span_dir: Path, run: Optional[str] = None) -> Dict[str, int]:
         if not names:
             continue
         lines = []
+        known = {e["span"] + ".json": e for e in read_index(d)}
         for name in names:
             span = load_span(d / name)
-            if span is not None:
-                lines.append(index_line(index_entry(span, name)))
+            if span is None:
+                continue
+            if span.get("locked") and name in known:
+                # Without the key the counts cannot be recomputed; keep the ones the writer indexed.
+                lines.append(index_line(known[name]))
+                continue
+            lines.append(index_line(index_entry(span, name)))
         with ChainLock(d):
             atomic_write_bytes(d / INDEX_FILE, b"".join(lines))
         out[d.name] = len(lines)
@@ -1310,7 +1441,8 @@ def digests(span_dir: Path, run: Optional[str] = None) -> List[Tuple[float, str,
 def digest_line(run: str, e: Dict[str, Any]) -> str:
     terms = e.get("terms") if isinstance(e.get("terms"), list) else []
     ts = str(e.get("ts") or "")[:16]
-    return "%s/%s %s ~%st: %s%s" % (run, e.get("span"), ts, e.get("est_tokens", "?"), e.get("digest", ""),
+    digest = e.get("digest", "") or ("(locked: encrypted)" if e.get("locked") else "")
+    return "%s/%s %s ~%st: %s%s" % (run, e.get("span"), ts, e.get("est_tokens", "?"), digest,
                                    " [%s]" % ", ".join(str(t) for t in terms[:4]) if terms else "")
 
 

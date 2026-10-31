@@ -50,6 +50,7 @@ import cg_paths
 PACKAGE_ROOT = Path(__file__).resolve().parent
 SNIPPET_CHARS = 80
 DEFAULT_MAX_HITS = 50
+LOCKED_NOTE = "encrypted; set GUARDIAN_ARCHIVE_KEY to search it"
 
 
 def span_dir() -> Path:
@@ -89,11 +90,11 @@ def search(root: Path, term: str, run_id: str | None = None):
     needle = term.lower()
     pattern = f"{run_id}/*.json" if run_id else "*/*.json"
     for path in sorted(root.glob(pattern)):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        data = cg_archive.load_span(path)
+        if data is None:
             continue
-        if not isinstance(data, dict):
+        if data.get("locked"):
+            yield path, "locked", "locked", LOCKED_NOTE
             continue
         for i, m in enumerate(data.get("messages") or []):
             text = message_text(m)
@@ -128,12 +129,15 @@ def ranked_search(root: Path, query: str, run: str | None = None):
     if not words:
         return []
     pattern = f"{run}/*.json" if run else "*/*.json"
-    sources = []
+    sources, locked = [], []
     for path in root.glob(pattern):
         if not cg_archive.SPAN_NAME_RE.match(path.name):
             continue
         data = cg_archive.load_span(path)
         if data is None:
+            continue
+        if data.get("locked"):
+            locked.append((path, "locked", "locked", LOCKED_NOTE, 0))
             continue
         texts = [(i, cg_archive.message_role(m), message_text(m))
                  for i, m in enumerate(data.get("messages") or [])]
@@ -166,7 +170,7 @@ def ranked_search(root: Path, query: str, run: str | None = None):
             rank = (whole, hits, mtime, str(path), -(idx if isinstance(idx, int) else 1 << 30))
             found.append((rank, path, idx, role, snippet(text, first, length), hits))
     found.sort(key=lambda t: t[0], reverse=True)
-    return [(path, idx, role, snip, hits) for _, path, idx, role, snip, hits in found]
+    return [(path, idx, role, snip, hits) for _, path, idx, role, snip, hits in found] + sorted(locked)
 
 
 def anchor_path():
@@ -295,7 +299,7 @@ def main(argv=None) -> int:
         return 2
     hits, chars, matched = 0, 0, set()
     for path, idx, role, text in search(root, ns.term, ns.run):
-        label = "summary" if idx == "summary" else f"msg {idx} [{role}]"
+        label = idx if idx in ("summary", "locked") else f"msg {idx} [{role}]"
         line = f"{path} {label}: {text}"
         print(line)
         hits += 1

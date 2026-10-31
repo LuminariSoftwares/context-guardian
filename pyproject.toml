@@ -31,6 +31,9 @@ dependencies = [
     "python-dotenv>=1.0",
 ]
 
+[project.optional-dependencies]
+encrypt = ["cryptography>=42"]
+
 [project.urls]
 Homepage = "https://github.com/LuminariSoftwares/context-guardian"
 Repository = "https://github.com/LuminariSoftwares/context-guardian"

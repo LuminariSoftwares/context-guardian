@@ -147,6 +147,13 @@ def capture(hook: Dict[str, Any], span_root: Path, deadline: float) -> int:
         raise ValueError("transcript %s does not exist" % transcript)
     event = hook.get("hook_event_name") if isinstance(hook.get("hook_event_name"), str) else ""
     run_id = RUN_PREFIX + sid
+    # Before the run directory exists: with GUARDIAN_ENCRYPT=1 and no usable
+    # key (or no cryptography) nothing is written, never a clear span. The hook still exits 0.
+    try:
+        encryptor = cg_archive.encryptor_from_env()
+    except (ValueError, ImportError) as exc:
+        log("GUARDIAN_ENCRYPT=1 but %s; nothing archived (never a clear span)" % exc)
+        return 0
     run_dir = Path(span_root) / run_id
     missing = [p for p in (run_dir, *run_dir.parents) if not p.exists()]
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -201,7 +208,7 @@ def capture(hook: Dict[str, Any], span_root: Path, deadline: float) -> int:
                         "lines": [start_line, end_line]}
 
             if messages:
-                result = cg_archive.write_span_file(run_dir, top + 1, payload)
+                result = cg_archive.write_span_file(run_dir, top + 1, payload, encryptor=encryptor)
                 if result is None:
                     raise OSError("no free span index after %d" % top)
                 path, top, body = result
@@ -215,7 +222,7 @@ def capture(hook: Dict[str, Any], span_root: Path, deadline: float) -> int:
                             "unsealed" % (run_id, path.name, exc))
                 if index:
                     try:
-                        cg_archive.append_index(run_dir, cg_archive.index_entry(body, path.name))
+                        cg_archive.append_index(run_dir, cg_archive.index_entry(body, path.name, locked=encryptor is not None))
                     except Exception as exc:               # noqa: BLE001
                         log("could not index %s/%s (%s); --reindex rebuilds it" % (run_id, path.name, exc))
                 written += 1

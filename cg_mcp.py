@@ -316,12 +316,12 @@ def _list_spans(args: Dict[str, Any], counts: Optional[Dict[str, int]] = None) -
             raise ToolError(f"No run {run} in the span archive; list_spans without `run` lists them.")
         spans = sorted(run_dir.glob("*.json"))
         for path in spans[:limit]:
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                data = None
-            if not isinstance(data, dict):
+            data = cg_archive.load_span(path)
+            if data is None:
                 lines.append(f"{run}/{path.name}: unreadable")
+                continue
+            if data.get("locked"):
+                lines.append(f"{run}/{path.name}: locked (encrypted; set GUARDIAN_ARCHIVE_KEY to open it)")
                 continue
             messages = data.get("messages")
             count = len(messages) if isinstance(messages, list) else 0
@@ -349,7 +349,7 @@ def _search_spans(args: Dict[str, Any], counts: Optional[Dict[str, int]] = None)
     lines, matched = [], set()
     counts["query_terms"] = len(term.split())
     for path, idx, role, text, _hits in cg_recall_cli.ranked_search(root, term, run):
-        label = "summary" if idx == "summary" else f"msg {idx} [{role}]"
+        label = idx if idx in ("summary", "locked") else f"msg {idx} [{role}]"
         lines.append(f"{path.parent.name}/{path.name} {label}: {text}")
         matched.add(path)
         counts["spans_matched"] = len(matched)
@@ -392,12 +392,12 @@ def _read_span(args: Dict[str, Any], counts: Optional[Dict[str, int]] = None) ->
     if index == 0:
         return _read_journal(run, start, end, counts)
     path = cg_recall_cli.span_dir() / run / f"{index:04d}.json"
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise ToolError(f"No readable span {run}/{index:04d}.json.") from exc
-    if not isinstance(data, dict):
-        raise ToolError(f"Span {run}/{index:04d}.json is not a span.")
+    data = cg_archive.load_span(path)
+    if data is None:
+        raise ToolError(f"No readable span {run}/{index:04d}.json.")
+    if data.get("locked"):
+        return (f"span {run}/{index:04d}.json is locked: it is encrypted and GUARDIAN_ARCHIVE_KEY (or "
+                "GUARDIAN_ARCHIVE_KEY_FILE) is not set to its key in this server's environment. Its text is not shown.")
     counts["spans_opened"] = 1
     messages = data.get("messages") if isinstance(data.get("messages"), list) else []
     last = len(messages) - 1 if end is None else min(end, len(messages) - 1)
