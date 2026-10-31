@@ -1,0 +1,117 @@
+{
+ "version": 1,
+ "about": "P111 S4: the scripted conversation run_clients.py drives through each client (O5). Turn 1 carries a pasted log so turn 2 is over the proxy's budget and the older turn is compacted.",
+ "model": "mock-cg-model",
+ "keep_recent": 1,
+ "num_ctx": {
+  "default": 2048
+ },
+ "turns": [
+  "Here is a build log. The codeword for this run is PELICAN-42. Just say you have it.\n\nline 000 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 001 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 002 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 003 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 004 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 005 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 006 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 007 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 008 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 009 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 010 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 011 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 012 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 013 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 014 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 015 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 016 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 017 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 018 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 019 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 020 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 021 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 022 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 023 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 024 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 025 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 026 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 027 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 028 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 029 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 030 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 031 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 032 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 033 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 034 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 035 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 036 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 037 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 038 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 039 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 040 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 041 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 042 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 043 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 044 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 045 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 046 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 047 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 048 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 049 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 050 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 051 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 052 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 053 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 054 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 055 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 056 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 057 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 058 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 059 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 060 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 061 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 062 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 063 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 064 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 065 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 066 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 067 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 068 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 069 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 070 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 071 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 072 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 073 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 074 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 075 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 076 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 077 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 078 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 079 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 080 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 081 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 082 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 083 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 084 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 085 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 086 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 087 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 088 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 089 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 090 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 091 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 092 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 093 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 094 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 095 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 096 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 097 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 098 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 099 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 100 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 101 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 102 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 103 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 104 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 105 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 106 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 107 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 108 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 109 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 110 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 111 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 112 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 113 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 114 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 115 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 116 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 117 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 118 of the pasted build log: step ok, cache warm, nothing to report on this one\nline 119 of the pasted build log: step ok, cache warm, nothing to report on this one",
+  "What was the codeword in the build log? Reply with only the codeword."
+ ],
+ "answer_marker": "CG_OK",
+ "upstream_turns": [
+  [
+   "user",
+   "Please remember: the release train leaves on platform 9."
+  ],
+  [
+   "assistant",
+   "Noted: platform 9."
+  ],
+  [
+   "user",
+   "Please remember: the release train leaves on platform 9."
+  ],
+  [
+   "assistant",
+   "Noted: platform 9."
+  ],
+  [
+   "user",
+   "Please remember: the release train leaves on platform 9."
+  ],
+  [
+   "assistant",
+   "Noted: platform 9."
+  ],
+  [
+   "user",
+   "Please remember: the release train leaves on platform 9."
+  ],
+  [
+   "assistant",
+   "Noted: platform 9."
+  ],
+  [
+   "user",
+   "Please remember: the release train leaves on platform 9."
+  ],
+  [
+   "assistant",
+   "Noted: platform 9."
+  ],
+  [
+   "user",
+   "Please remember: the release train leaves on platform 9."
+  ],
+  [
+   "assistant",
+   "Noted: platform 9."
+  ],
+  [
+   "user",
+   "Please remember: the release train leaves on platform 9."
+  ],
+  [
+   "assistant",
+   "Noted: platform 9."
+  ],
+  [
+   "user",
+   "Please remember: the release train leaves on platform 9."
+  ],
+  [
+   "assistant",
+   "Noted: platform 9."
+  ],
+  [
+   "user",
+   "Please remember: the release train leaves on platform 9."
+  ],
+  [
+   "assistant",
+   "Noted: platform 9."
+  ],
+  [
+   "user",
+   "Please remember: the release train leaves on platform 9."
+  ],
+  [
+   "assistant",
+   "Noted: platform 9."
+  ],
+  [
+   "user",
+   "Please remember: the release train leaves on platform 9."
+  ],
+  [
+   "assistant",
+   "Noted: platform 9."
+  ],
+  [
+   "user",
+   "Please remember: the release train leaves on platform 9."
+  ],
+  [
+   "assistant",
+   "Noted: platform 9."
+  ],
+  [
+   "user",
+   "Which platform does the release train leave from? One word."
+  ]
+ ],
+ "upstream_threshold": 0.05
+}
