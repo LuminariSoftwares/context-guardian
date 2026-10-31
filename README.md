@@ -358,6 +358,30 @@ Each has a short record in [docs/adr/](docs/adr/) with the alternatives that wer
 "Tested on" means the repo's test suites plus daily use on the machine this was built on. "Expected to work" is not tested; please open an issue if it does not work for you.
 | Claude Code adapter | the hooks and transcript format documented in October 2026; a real transcript replayed in tests | later Claude Code versions | the transcript line format is documented as internal; lines are archived verbatim, so a format change costs search quality, not data |
 
+### Works with
+
+Rows are the output lines of `tests/clients/run_clients.py` / `tests/upstreams/run_upstreams.py`, dated. A row is a PASS or the stated failure from one run on the date shown; a client or upstream that was not installed on that run has no row.
+
+| date | client | version | result |
+|---|---|---|---|
+
+| date | upstream | version | result |
+|---|---|---|---|
+
+**How to re-run the matrix.** Each client runs one scripted, over-budget conversation (two turns, the second continuing the first) through its own proxy, in an isolated home folder, against a scripted mock model; it passes when a request reached the proxy, a compaction (or an oversized-message spill) happened, and the mock's `CG_OK` answer reached the client's output. Install the clients you want checked, then:
+
+```bash
+python tests/clients/run_clients.py
+```
+
+Each upstream gets one real request through a proxy that detects its window; it passes when the window was detected, a compaction happened and a token-count source was recorded. Start the servers you want checked (the default ports are Ollama 11434, llama.cpp 8080, vLLM 8000, LM Studio 1234, LiteLLM 4000), then:
+
+```bash
+python tests/upstreams/run_upstreams.py
+```
+
+`--only NAME` limits either run, `--bin NAME=PATH` (clients), `--url NAME=URL` and `--model NAME=MODEL` (upstreams) point at a binary or server elsewhere, and `--keep` leaves the work folder (home folders, proxy logs, the mock's request log) for inspection.
+
 ## MCP server
 
 `context-guardian-mcp` (installed with the PyPI package; `context-guardian mcp` is the same thing) is a stdio MCP server, so an MCP client can see what the proxy is doing, and read the archive, without a terminal. It has six tools, and all six only read: nothing they do changes the proxy, its settings or the archive.

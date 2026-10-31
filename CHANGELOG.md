@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Works-with runners (clients and upstreams)
+
+- **`tests/clients/run_clients.py` runs one scripted, over-budget conversation through each real client.** Aider,
+  OpenCode, Continue (`cn`) and Claude Code each get an isolated home folder, a stripped environment, their own proxy
+  and a scripted mock model (`tests/clients/mock_upstream.py`: OpenAI chat and Anthropic Messages, plain and
+  streaming), then two turns, the second continuing the first. A client passes when a request reached the proxy, a
+  compaction or an oversized-message spill happened, and the answer reached its output. A client that is not installed
+  is `SKIP not installed`; the output is one `<name> <version> PASS|FAIL|SKIP` line each.
+- **`tests/upstreams/run_upstreams.py` sends one real request through the proxy to each installed upstream** (Ollama,
+  llama.cpp, vLLM, LM Studio, LiteLLM on their default local ports) and checks that the window was detected, a
+  compaction happened and a `count_source` was recorded. Nothing listening is `SKIP not installed`.
+- **`tests/test_p111_b5.py` pins both runners' logic** with stand-in clients that read their configuration where the
+  real CLIs do, and a fake Ollama. The live runs are not part of the test suite.
+- README: a "Works with" section holds the two tables the run lines go into, and says how to re-run them.
+
 ### Optional archive encryption
 
 - **`GUARDIAN_ENCRYPT=1` writes new spans as AES-256-GCM ciphertext (format 2).** README said "the archive is clear
