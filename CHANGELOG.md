@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **The proxy keeps the facts it is asked to keep (P124).** On the guardian-leaderboard keep-facts bench the proxy kept
+  1 of 36 facts the user had asked it to remember: its only memory of an evicted span was one rolling LLM summary, rewritten
+  at every compaction, and a question about an old fact reaching the summariser was answered "no value was mentioned".
+  - *Pins.* A sentence of an evicted user message that holds an explicit keep request (the `cg_memory.js` `PIN_RE`
+    wording: "remember this", "keep this for later", "don't forget", "make a note", "pin this", ...) is forwarded word for
+    word in a `Pinned facts` block of the summary message of every later compacted request, on `/v1/chat/completions` and
+    `/v1/messages`, whatever the summary says. Re-derived from the history the client resends, so a memo reuse or extension
+    cannot lose them. Only explicit requests, only from user messages. **`GUARDIAN_PIN_MAX_CHARS`** (default 1600, `0` off)
+    caps the block, oldest pins first; a request that still would not fit sheds the oldest pins.
+  - *Summary prompt.* `CONDENSE_PROMPT` asks for a `## Must Keep` section of exact values, to carry forward an earlier
+    summary, and not to answer questions found in the transcript, on every summary call (single, in pieces, and the Anthropic
+    route). Each bullet under `## Must Keep` is pinned for the rest of the conversation and rides in the summary memo, so a
+    later summary that omits it does not lose it.
+  - *Short summaries are retried once.* A summary under `GUARDIAN_MIN_SUMMARY_CHARS` is requested again with the same
+    prompt (one retry per summary); a second short answer fails open as before. `/guardian/stats` gains `summary_retries`,
+    `compactions_with_pins` and `last_pins_carried`.
+  - *`/v1/messages` spills an oversized message.* The Anthropic route now cuts one message bigger than the window to head +
+    pointer + tail, as `/v1/chat/completions` does, counted in `oversized_spills`.
+  - *The version reported is the running code's.* `guardian_version()` (and so `/guardian/stats`, the banner and the update
+    check) returns the module's `__version__`, no longer `importlib.metadata`, which can name a different install.
 - **Every summarisation prompt fits the window.** `summarize_older_messages` (and the Anthropic route's summariser) sent the
   whole evicted range as one prompt sized by nothing. On a 12 GB RTX 3060 at `num_ctx` 8192 (guardian-leaderboard
   calibration, 2026-11-01) that logged `compaction_refused` / `empty_or_short_summary` (29 chars) once in each of 3

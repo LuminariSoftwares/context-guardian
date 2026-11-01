@@ -268,6 +268,17 @@ python scripts/memo_drift_probe.py --upstream http://127.0.0.1:11434/v1 --model 
 
 The digest index is written as each span is written: `<run>/index.jsonl`, no extra model call. `context-guardian-recall --reindex` builds it for older archives. **Always-on capture** (`GUARDIAN_CAPTURE=journal`, off by default) also records every message of a session, not just what compaction evicts, and search and `read_span` cover it. It is off by default because it writes every message to disk in clear text and grows with the session; that is your decision to make, not a default.
 
+### Pinned facts
+
+A rolling summary holds a handful of facts at most, and each new summary can lose the ones the last one had. The proxy therefore keeps the facts you ask it to keep out of the summary's hands, on both `/v1/chat/completions` and `/v1/messages`:
+
+- **Your explicit keep requests.** A sentence of one of your messages that the proxy evicts and that holds one of the phrases `remember this/that/these`, `keep this/that/these/it ... for later`, `for later use/reference`, `don't forget`, `make a note`, `note this/that for later` or `pin this/that` is pinned (the same wording the DSH engine pins). If the request stands alone ("Remember this:"), the sentence after it goes with it. A sentence without one of these phrases is never pinned, and neither is anything in an assistant or tool message: only what you typed.
+- **`## Must Keep` bullets.** The summary prompt asks the summariser to end with a `## Must Keep` section of exact values. Each bullet of it is pinned, and stays pinned through later summaries that omit it.
+
+Pinned facts are forwarded word for word in a `Pinned facts (kept verbatim at the user's request):` block inside the summary message of every compacted request for the rest of the conversation, whatever the summary says. They are re-derived from the history your client resends, so nothing extra is stored. `GUARDIAN_PIN_MAX_CHARS` (default `1600`) caps the block; past it the oldest pins are dropped first, and a request that would still not fit the window sheds the oldest pins too. `0` turns pinning off. `/guardian/stats` counts `compactions_with_pins` and `last_pins_carried`.
+
+A summary shorter than `GUARDIAN_MIN_SUMMARY_CHARS` is now asked for once more before the proxy gives up; a second short answer fails open as before (`summary_retries` in `/guardian/stats`).
+
 ## Big pastes
 
 Compaction summarises *older* messages, so it cannot help when one message is bigger than the window: a log or a file pasted as the first message has nothing older to summarise at all. When the request still does not fit after compaction (or has nothing to compact), the proxy cuts that one message, as a last resort:
@@ -281,7 +292,7 @@ Compaction summarises *older* messages, so it cannot help when one message is bi
 
 **A plain chat client sees only the cut.** It shows what it sent, the model answers from the head and tail, and nothing in the client says the middle was left out. The full text is on disk, and a model with the [recall MCP server](#mcp-server) can open it: `search_spans` finds the span, `read_span` reads the lines it needs (the pointer names it as `<run_id>/<NNNN>.json`, never an absolute path, so your home folder is not in the prompt). Without the server, `context-guardian-recall "<term>"` searches it and the span file is plain JSON. A message that fits is never cut. The same paste comes back with every turn and is archived once per run. `/guardian/stats` counts `oversized_spills`, and the `compaction` event (or an `oversized_spill` event when there was nothing to summarise) carries `oversized_spilled`.
 
-Only text is cut: a message whose size is tool-call arguments or non-text blocks is forwarded as it is, and so is the request when the span cannot be written. A dry run (`GUARDIAN_DRY_RUN`) reports `oversized_spilled` in its event and writes nothing. The Anthropic `/v1/messages` route does not spill yet.
+Only text is cut: a message whose size is tool-call arguments or non-text blocks is forwarded as it is, and so is the request when the span cannot be written. A dry run (`GUARDIAN_DRY_RUN`) reports `oversized_spilled` in its event and writes nothing. The Anthropic `/v1/messages` route spills the same way.
 
 ## How it works
 
@@ -620,7 +631,8 @@ cp .env.example .env
 | `GUARDIAN_RECEIPTS_PATH` | `<data dir>/logs/receipts.jsonl` | Where receipts are appended |
 | `GUARDIAN_SUMMARY_MEMO` | `32` | How many compactions the proxy remembers this run (in memory only, never on disk). Your client keeps resending its whole history, so without this every request past the budget summarised the same evicted messages again. With it, an evicted range seen before reuses its summary (no summariser call, no new span), and a range that grew is summarised as the earlier summary plus only the new messages, archived as a span that names the one it continues. A client that edits its earlier history gets a full summary, as before. Two requests with the same evicted messages in flight at once share one summariser call and one span; if that summary fails, both go upstream unchanged. `0` turns it off |
 | `GUARDIAN_KEEP_SUMMARIES` | `1` | How many of Guardian's own previous summaries stay in the window. Retired ones are folded into the next span, not discarded |
-| `GUARDIAN_MIN_SUMMARY_CHARS` | `40` | A summary shorter than this is treated as a FAILED summarisation and nothing is evicted. See 0.4.0 in the changelog for why this exists |
+| `GUARDIAN_MIN_SUMMARY_CHARS` | `40` | A summary shorter than this is treated as a FAILED summarisation and nothing is evicted. The summary is asked for once more first, and only a second short answer fails open. See 0.4.0 in the changelog for why this exists |
+| `GUARDIAN_PIN_MAX_CHARS` | `1600` | The most characters of [pinned facts](#pinned-facts) (your explicit "remember this" sentences and the summary's `## Must Keep` bullets) a compacted request carries, forwarded word for word. Over it the oldest are dropped first. `0` turns pinning off |
 | `GUARDIAN_MIN_TRANSCRIPT_CHARS` | `80` | If the messages being evicted render to less than this, Guardian refuses to summarise rather than summarising nothing |
 | `GUARDIAN_TOOL_ARG_CHARS` | `300` | How much of a tool call's arguments reaches the summariser. The full text is in the span |
 | `GUARDIAN_SUMMARY_REASONING_EFFORT` | unset | Passed as `reasoning_effort` on the summarisation call only. Non-standard, so off by default; `low` roughly halved summarisation latency on gpt-oss |
