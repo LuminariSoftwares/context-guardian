@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- **Every summarisation prompt fits the window.** `summarize_older_messages` (and the Anthropic route's summariser) sent the
+  whole evicted range as one prompt sized by nothing. On a 12 GB RTX 3060 at `num_ctx` 8192 (guardian-leaderboard
+  calibration, 2026-11-01) that logged `compaction_refused` / `empty_or_short_summary` (29 chars) once in each of 3
+  seeds, at 28,654-33,428 estimated tokens, and the request then went upstream at about four times the window. A prompt
+  over `summary_input_budget(num_ctx)` (the window minus `GUARDIAN_RESERVE_OUTPUT`) is now made in consecutive groups that
+  each fit, each call condensing the summary so far plus the next group; a message too big for one call is cut to its
+  start and end for that call. A prompt that fits is still one unchanged call. `/guardian/stats` gains
+  `summaries_chunked`, and each chunked summary logs a `summary_chunked` event (`calls`, `budget_tokens`).
+
 ## dsh-context-guardian 0.3.0-beta.1 / PyPI context-guardian 0.13.0 (2026-10-31)
 
 Counts you can trust and a matrix you can re-run. Token counts are exact on llama.cpp and vLLM, a single message

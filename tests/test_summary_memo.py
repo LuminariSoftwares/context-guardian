@@ -176,7 +176,8 @@ def test_c_an_edited_earlier_message_forces_a_full_summary(monkeypatch, tmp_path
 
 # (d) -------------------------------------------------------------------------------
 def test_d_memo_off_restores_todays_behaviour(monkeypatch, tmp_path):
-    g = load(monkeypatch, tmp_path, **_probe_env(GUARDIAN_SUMMARY_MEMO="0"))
+    g = load(monkeypatch, tmp_path, **_probe_env(
+        GUARDIAN_SUMMARY_MEMO="0", GUARDIAN_NUM_CTX="9000", GUARDIAN_COMPACT_THRESHOLD="0.4"))
     seen = stub(g)
     for extra in range(3):
         post_chat(g, chat_history(6 + extra))
