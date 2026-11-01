@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## PyPI context-guardian 0.14.0 (2026-11-01)
+
+The proxy now keeps what it is asked to keep. Measured on the guardian-leaderboard keep-facts bench (qwen3-coder:30b on a
+12 GB RTX 3060, 12 facts the user asks to remember, 48 turns, 3 seeds): **35/36 at `num_ctx` 8192 (was 1/36) and 36/36 at
+32768 (was 20/36)**, with 0 refused compactions. The version moves to 0.14.0 in `pyproject.toml`, `__version__`, the MCP
+server and `server.json` together; npm stays at 0.3.0-beta.1 (no change to the DSH engine). No breaking changes:
+existing settings, endpoints and archives answer as before.
 
 - **The proxy keeps the facts it is asked to keep (P124).** On the guardian-leaderboard keep-facts bench the proxy kept
   1 of 36 facts the user had asked it to remember: its only memory of an evicted span was one rolling LLM summary, rewritten
@@ -23,9 +29,9 @@
   - *The version reported is the running code's.* `guardian_version()` (and so `/guardian/stats`, the banner and the update
     check) returns the module's `__version__`, no longer `importlib.metadata`, which can name a different install.
 - **Every summarisation prompt fits the window.** `summarize_older_messages` (and the Anthropic route's summariser) sent the
-  whole evicted range as one prompt sized by nothing. On a 12 GB RTX 3060 at `num_ctx` 8192 (guardian-leaderboard
-  calibration, 2026-11-01) that logged `compaction_refused` / `empty_or_short_summary` (29 chars) once in each of 3
-  seeds, at 28,654-33,428 estimated tokens, and the request then went upstream at about four times the window. A prompt
+  whole evicted range as one prompt sized by nothing, so a range larger than the window reached the backend truncated
+  from the front, instructions first. (The `compaction_refused` / `empty_or_short_summary` events seen on the leaderboard
+  calibration run of 2026-11-01 turned out to be short replies to prompts that fit; those are now retried, above.) A prompt
   over `summary_input_budget(num_ctx)` (the window minus `GUARDIAN_RESERVE_OUTPUT`) is now made in consecutive groups that
   each fit, each call condensing the summary so far plus the next group; a message too big for one call is cut to its
   start and end for that call. A prompt that fits is still one unchanged call. `/guardian/stats` gains

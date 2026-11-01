@@ -277,6 +277,8 @@ A rolling summary holds a handful of facts at most, and each new summary can los
 
 Pinned facts are forwarded word for word in a `Pinned facts (kept verbatim at the user's request):` block inside the summary message of every compacted request for the rest of the conversation, whatever the summary says. They are re-derived from the history your client resends, so nothing extra is stored. `GUARDIAN_PIN_MAX_CHARS` (default `1600`) caps the block; past it the oldest pins are dropped first, and a request that would still not fit the window sheds the oldest pins too. `0` turns pinning off. `/guardian/stats` counts `compactions_with_pins` and `last_pins_carried`.
 
+**Measured (0.14.0, 2026-11-01):** on the [guardian-leaderboard](https://github.com/LuminariSoftwares/guardian-leaderboard) keep-facts bench (qwen3-coder:30b on a 12 GB RTX 3060, 12 facts asked to be remembered across 48 turns, 3 seeds), the proxy kept **35/36 at `num_ctx` 8192 and 36/36 at 32768**; 0.13.0 kept 1/36 and 20/36 on the same cells.
+
 A summary shorter than `GUARDIAN_MIN_SUMMARY_CHARS` is now asked for once more before the proxy gives up; a second short answer fails open as before (`summary_retries` in `/guardian/stats`).
 
 ## Big pastes
