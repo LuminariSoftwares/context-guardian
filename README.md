@@ -11,6 +11,7 @@
   <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-blue.svg">
   <img alt="OpenAI-compatible proxy" src="https://img.shields.io/badge/OpenAI--compatible-proxy-2ea44f.svg">
   <img alt="Fails open" src="https://img.shields.io/badge/fails-open-6f42c1.svg">
+  <a href="https://hub.xerj.org/contributors/LuminariSoftwares"><img alt="XERJ Corpus Hub contributor" src="https://hub.xerj.org/contributors/LuminariSoftwares/badge.svg"></a>
 </p>
 
 mcp-name: io.github.LuminariSoftwares/context-guardian
