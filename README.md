@@ -12,6 +12,7 @@
   <img alt="OpenAI-compatible proxy" src="https://img.shields.io/badge/OpenAI--compatible-proxy-2ea44f.svg">
   <img alt="Fails open" src="https://img.shields.io/badge/fails-open-6f42c1.svg">
   <a href="https://hub.xerj.org/contributors/LuminariSoftwares"><img alt="XERJ Corpus Hub contributor" src="https://hub.xerj.org/contributors/LuminariSoftwares/badge.svg"></a>
+  <a href="https://glama.ai/mcp/servers/LuminariSoftwares/context-guardian"><img alt="context-guardian MCP server – quality and maintenance score on Glama" src="https://glama.ai/mcp/servers/LuminariSoftwares/context-guardian/badges/score.svg"></a>
 </p>
 
 mcp-name: io.github.LuminariSoftwares/context-guardian
