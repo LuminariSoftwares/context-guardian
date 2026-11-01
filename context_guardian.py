@@ -616,6 +616,9 @@ _state = {
     "summaries_generated": 0,
     "summaries_reused": 0,
     "summaries_extended": 0,
+    # Summaries that did not fit one call at the window and were made in pieces
+    # (summarize_in_pieces); the summary_chunked event carries the call count.
+    "summaries_chunked": 0,
     # Span files actually written this run; the archive pointer counts these.
     "spans_written": 0,
     # Requests in which a message bigger than the window was archived and
@@ -655,6 +658,13 @@ _usage_sessions: "collections.OrderedDict[str, Dict[str, Any]]" = collections.Or
 # per request task so a concurrent request cannot overwrite it before it is recorded.
 _usage_snap: "contextvars.ContextVar[Optional[Dict[str, Any]]]" = contextvars.ContextVar(
     "cg_usage_snap", default=None)
+
+# The prompt budget maybe_compact / maybe_compact_anthropic set for the summary
+# calls of THIS request. A ContextVar, not a new argument of the summariser the
+# memo and the tests call as (client, model, older, headers): summarize_older_messages
+# and _summarize_anthropic read it when no budget_tokens is passed.
+_summary_budget: "contextvars.ContextVar[Optional[int]]" = contextvars.ContextVar(
+    "cg_summary_budget", default=None)
 
 # When this process started, for the health view's uptime line.
 STARTED_AT = time.time()
@@ -1393,6 +1403,21 @@ def effective_threshold(num_ctx: int = None, threshold: float = None,
     return max(1, min(int(num_ctx * threshold), num_ctx - reserve))
 
 
+def summary_input_budget(num_ctx: int = None, reserve: int = None) -> int:
+    """The most tokens ONE summarisation prompt may estimate at.
+
+    The summary call is an ordinary request to the same backend, so it has the
+    same window and needs the same room for its reply: the window minus the
+    output reserve. A reserve that does not fit the window is clamped to half
+    of it, exactly as effective_threshold does (which says so once).
+    """
+    num_ctx = NUM_CTX if num_ctx is None else num_ctx
+    reserve = RESERVE_OUTPUT if reserve is None else reserve
+    if reserve >= num_ctx:
+        reserve = max(1, num_ctx // 2)
+    return max(1, num_ctx - reserve)
+
+
 def _json_chars(blob: Any) -> int:
     """Length of a payload fragment as it goes on the wire, never raising.
 
@@ -2082,6 +2107,7 @@ def extract_assistant_text(data: Any,
 async def summarize_older_messages(
     client: httpx.AsyncClient, model: str, older_messages: List[Dict[str, Any]],
     headers: Optional[Dict[str, str]] = None,
+    budget_tokens: Optional[int] = None,
 ) -> Optional[str]:
     """Ask the same backend to condense the older portion of the
     conversation. Returns None on any failure -- caller must fail open
@@ -2090,7 +2116,17 @@ async def summarize_older_messages(
 
     `headers` is the client's own request headers; the allow-listed
     credentials in them are carried over so a keyed upstream answers.
+
+    `budget_tokens` is the most one summarisation PROMPT may estimate at
+    (summary_input_budget); None falls back to the budget maybe_compact set for
+    this request, and with neither there is no limit. A prompt that fits is
+    sent as one call, unchanged. One that does not is made in pieces that do
+    (summarize_in_pieces): a prompt larger than the window is truncated by the
+    backend from the front, instructions first, and the "summary" comes back
+    empty.
     """
+    if budget_tokens is None:
+        budget_tokens = _summary_budget.get()
     transcript = "\n\n".join(_fence_safe(render_for_summary(m))
                              for m in older_messages)
     prompt = CONDENSE_PROMPT + transcript + FENCE_SUFFIX
@@ -2114,6 +2150,19 @@ async def summarize_older_messages(
                    "messages": len(older_messages),
                    "transcript_chars": len(transcript.strip())})
         return None
+    if budget_tokens is not None and _prompt_tokens(prompt) > budget_tokens:
+        return await summarize_in_pieces(
+            [_fence_safe(render_for_summary(m)) for m in older_messages],
+            lambda earlier: _fence_safe(render_for_summary(
+                {"role": EARLIER_SUMMARY_ROLE, "content": earlier})),
+            lambda p: _chat_summary_call(client, model, p, headers),
+            budget_tokens)
+    return await _chat_summary_call(client, model, prompt, headers)
+
+
+async def _chat_summary_call(client: httpx.AsyncClient, model: str, prompt: str,
+                             headers: Optional[Dict[str, str]]) -> Optional[str]:
+    """One summarisation call to /chat/completions: the text, or None."""
     try:
         resp = await client.post(
             f"{UPSTREAM_URL}/chat/completions",
@@ -2153,6 +2202,87 @@ async def summarize_older_messages(
     except Exception as exc:
         log.error("Summarization call failed, will fail OPEN (no compaction this turn): %s", exc)
         return None
+
+
+def _prompt_tokens(prompt: str) -> int:
+    """What the proxy's own estimate says a one-message prompt costs."""
+    return estimate_tokens([{"role": "user", "content": prompt}])
+
+
+def _cut_to_fit(text: str, room: int) -> str:
+    """`text` in at most `room` characters: its start and its end, with a note
+    of how much was cut between them. The cut message is still archived whole
+    (write_span); only the summary call sees less of it."""
+    if len(text) <= room:
+        return text
+    keep = max(0, room - len("[... %d chars cut for the summary call ...]" % len(text)))
+    marker = "[... %d chars cut for the summary call ...]" % (len(text) - keep)
+    return text[:keep - keep // 2] + marker + text[len(text) - keep // 2:]
+
+
+# The least room a piece's prompt may have for transcript, in characters. Below
+# it the instructions alone nearly fill the budget and no piece is worth a call.
+MIN_PIECE_ROOM = 200
+
+
+async def summarize_in_pieces(rendered: List[str], render_earlier, send,
+                              budget_tokens: int) -> Optional[str]:
+    """One rolling summary of `rendered` (messages already fence-safe text),
+    made by consecutive calls that each fit `budget_tokens`.
+
+    Call 1 condenses the first group; every later call condenses the summary so
+    far (as an "earlier summary" message, the shape the summary memo extends
+    with) plus the next group. Every message is in exactly one call, in order.
+    A message too big for a call on its own is cut to fit (_cut_to_fit); the
+    summary so far is held to half the room so a message always has the rest.
+    `render_earlier(summary)` renders the summary so far as the route does any
+    message; `send(prompt)` makes one call. None on any failure, or when the
+    budget cannot hold the instructions -- the caller fails open.
+    """
+    cap = int(budget_tokens * CHARS_PER_TOKEN_ESTIMATE)
+    while cap > 0 and int(cap / CHARS_PER_TOKEN_ESTIMATE) > budget_tokens:
+        cap -= 1                                     # float rounding: stay <= budget
+    room = cap - len(CONDENSE_PROMPT) - len(FENCE_SUFFIX)
+    if room < MIN_PIECE_ROOM:
+        log.error("Summary budget %d tokens leaves %d characters after the "
+                  "instructions: too small to summarise in pieces. Failing OPEN.",
+                  budget_tokens, room)
+        return None
+    summary: Optional[str] = None
+    calls, i = 0, 0
+    while i < len(rendered):
+        parts: List[str] = []
+        used = 0
+        if summary is not None:
+            parts.append(_cut_to_fit(render_earlier(summary), room // 2))
+            used = len(parts[0])
+        took = 0
+        while i < len(rendered):
+            need = len(rendered[i]) + (2 if parts else 0)
+            if used + need <= room:
+                parts.append(rendered[i])
+            elif took == 0:
+                parts.append(_cut_to_fit(rendered[i], room - used - (2 if parts else 0)))
+            else:
+                break
+            used += need
+            i += 1
+            took += 1
+        prompt = CONDENSE_PROMPT + "\n\n".join(parts) + FENCE_SUFFIX
+        calls += 1
+        summary = await send(prompt)
+        if summary is None or (i < len(rendered) and len(summary.strip()) < MIN_SUMMARY_CHARS):
+            # A degenerate summary in the middle would be carried into the next
+            # call as if it were the history; fail open rather than build on it.
+            log.error("Summary call %d of a summary made in pieces returned %s. "
+                      "Failing OPEN.", calls,
+                      "nothing" if summary is None else "%d usable chars" % len(summary.strip()))
+            return None
+    _state["summaries_chunked"] += 1
+    log_event({"event": "summary_chunked", "calls": calls, "budget_tokens": budget_tokens})
+    log.info("Summarised %d message(s) in %d calls of at most %d tokens each.",
+             len(rendered), calls, budget_tokens)
+    return summary
 
 
 def _message_hashes(messages: List[Dict[str, Any]]) -> tuple:
@@ -2785,8 +2915,13 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any],
                  "(keeping %d in-window).", len(part["retired_summaries"]),
                  len(part["kept_summaries"]))
 
-    memo = await _memo_summary(
-        to_summarize, lambda msgs: summarize_older_messages(client, payload.get("model", ""), msgs, headers))
+    # Every summary call of this request fits the window just measured.
+    budget_token = _summary_budget.set(summary_input_budget(num_ctx))
+    try:
+        memo = await _memo_summary(
+            to_summarize, lambda msgs: summarize_older_messages(client, payload.get("model", ""), msgs, headers))
+    finally:
+        _summary_budget.reset(budget_token)
     summary = memo["summary"]
     span_path = None
     if summary is None or len(summary.strip()) < MIN_SUMMARY_CHARS:
@@ -3532,29 +3667,45 @@ def _starts_a_turn(m: Any) -> bool:
 
 async def _summarize_anthropic(client: httpx.AsyncClient, model: str,
                                older: List[Dict[str, Any]],
-                               headers: Dict[str, str]) -> Optional[str]:
+                               headers: Dict[str, str],
+                               budget_tokens: Optional[int] = None) -> Optional[str]:
     """The same fenced condense prompt, sent to the upstream's /messages.
-    None on any failure; the caller fails open."""
-    transcript = "\n\n".join(_fence_safe("[%s]: %s" % (
-        m.get("role", "unknown"), _anthropic_text(m.get("content"))))
-        for m in older)
+    None on any failure; the caller fails open. `budget_tokens` as for
+    summarize_older_messages: a prompt over it is made in pieces that fit."""
+    if budget_tokens is None:
+        budget_tokens = _summary_budget.get()
+
+    def render(m: Dict[str, Any]) -> str:
+        return _fence_safe("[%s]: %s" % (
+            m.get("role", "unknown"), _anthropic_text(m.get("content"))))
+
+    transcript = "\n\n".join(render(m) for m in older)
     if len(transcript.strip()) < MIN_TRANSCRIPT_CHARS:
         return None
-    try:
-        resp = await client.post(
-            f"{UPSTREAM_URL}/messages", timeout=_summary_timeout(),
-            headers={k: v for k, v in headers.items()
-                     if k.lower() in ANTHROPIC_FORWARD_HEADERS},
-            json={"model": model, "max_tokens": ANTHROPIC_SUMMARY_MAX_TOKENS,
-                  "messages": [{"role": "user", "content":
-                                CONDENSE_PROMPT + transcript + FENCE_SUFFIX}]})
-        resp.raise_for_status()
-        text = _anthropic_text([b for b in resp.json().get("content") or []
-                                if isinstance(b, dict) and b.get("type") == "text"])
-        return text if text.strip() else None
-    except Exception as exc:                               # noqa: BLE001
-        log.error("Anthropic summarisation call failed, failing OPEN: %s", exc)
-        return None
+
+    async def send(prompt: str) -> Optional[str]:
+        try:
+            resp = await client.post(
+                f"{UPSTREAM_URL}/messages", timeout=_summary_timeout(),
+                headers={k: v for k, v in headers.items()
+                         if k.lower() in ANTHROPIC_FORWARD_HEADERS},
+                json={"model": model, "max_tokens": ANTHROPIC_SUMMARY_MAX_TOKENS,
+                      "messages": [{"role": "user", "content": prompt}]})
+            resp.raise_for_status()
+            text = _anthropic_text([b for b in resp.json().get("content") or []
+                                    if isinstance(b, dict) and b.get("type") == "text"])
+            return text if text.strip() else None
+        except Exception as exc:                           # noqa: BLE001
+            log.error("Anthropic summarisation call failed, failing OPEN: %s", exc)
+            return None
+
+    prompt = CONDENSE_PROMPT + transcript + FENCE_SUFFIX
+    if budget_tokens is not None and _prompt_tokens(prompt) > budget_tokens:
+        return await summarize_in_pieces(
+            [render(m) for m in older],
+            lambda earlier: render({"role": EARLIER_SUMMARY_ROLE, "content": earlier}),
+            send, budget_tokens)
+    return await send(prompt)
 
 
 def _anthropic_block_text(content: Any) -> str:
@@ -3642,8 +3793,12 @@ async def maybe_compact_anthropic(client: httpx.AsyncClient, payload: Dict[str, 
     log.info("Anthropic request ~%d tokens >= threshold %d -- compacting %d "
              "message(s).", estimated, threshold_tokens, len(to_summarize))
 
-    memo = await _memo_summary(
-        to_summarize, lambda msgs: _summarize_anthropic(client, model, msgs, headers))
+    budget_token = _summary_budget.set(summary_input_budget(num_ctx))
+    try:
+        memo = await _memo_summary(
+            to_summarize, lambda msgs: _summarize_anthropic(client, model, msgs, headers))
+    finally:
+        _summary_budget.reset(budget_token)
     summary = memo["summary"]
     if summary is None or len(summary.strip()) < MIN_SUMMARY_CHARS:
         _state["summaries_rejected_empty"] += 1

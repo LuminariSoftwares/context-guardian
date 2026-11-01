@@ -71,7 +71,7 @@ def _keyed_upstream(g, key="Bearer sekret-not-a-real-key"):
 
 def test_summary_call_carries_the_clients_authorization(monkeypatch, tmp_path):
     g = load(monkeypatch, tmp_path, GUARDIAN_KEEP_RECENT_MESSAGES="2",
-             GUARDIAN_OLLAMA_CONTEXT="0")
+             GUARDIAN_OLLAMA_CONTEXT="0", GUARDIAN_NUM_CTX="6000")
     seen, key = _keyed_upstream(g)
     r = _post(g, _over_budget_body(), {"Authorization": key})
     assert r.status_code == 200
@@ -82,7 +82,7 @@ def test_summary_call_carries_the_clients_authorization(monkeypatch, tmp_path):
 
 def test_summary_call_carries_api_key_and_x_api_key_when_present(monkeypatch, tmp_path):
     g = load(monkeypatch, tmp_path, GUARDIAN_KEEP_RECENT_MESSAGES="2",
-             GUARDIAN_OLLAMA_CONTEXT="0")
+             GUARDIAN_OLLAMA_CONTEXT="0", GUARDIAN_NUM_CTX="6000")
     seen, key = _keyed_upstream(g)
     _post(g, _over_budget_body(), {"Authorization": key, "api-key": "a1",
                                    "x-api-key": "a2", "x-custom": "nope"})
@@ -127,7 +127,7 @@ def test_a_transcript_cannot_close_the_fence(monkeypatch, tmp_path):
     """A tool result that contains END_TRANSCRIPT must not end the fence: the
     prompt the upstream receives has exactly one closing marker."""
     g = load(monkeypatch, tmp_path, GUARDIAN_KEEP_RECENT_MESSAGES="2",
-             GUARDIAN_OLLAMA_CONTEXT="0")
+             GUARDIAN_OLLAMA_CONTEXT="0", GUARDIAN_NUM_CTX="6000")
     prompts = []
 
     def handler(request):
