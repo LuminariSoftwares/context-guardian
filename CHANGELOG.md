@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## dsh-context-guardian 0.4.0-beta.1 / PyPI context-guardian 0.15.0 (2026-11-04)
+
+- **Packaging (P141 S10).** The wheel, the Docker image and the npm bundle now ship `cg_resume.py`, `cg_mask.py`, `cg_recall_index.py` and `cg_breakdown.py` (the proxy and the recall CLI import them).
+- **Versions.** PyPI `context-guardian` 0.15.0 and npm `dsh-context-guardian` 0.4.0-beta.1; both `version` fields of `server.json` read 0.15.0.
 
 - **Where the window went (P141 S9).** `/guardian/stats` gains `breakdown`: the latest request's estimated tokens split into `system`, `tool_schemas`, `history`, `tool_results`, `summary` and `pins` (zeros before any request), from the new pure `cg_breakdown.py` using the proxy's own estimators; the parts add up to the request estimate within 1%. A failure is logged and leaves the previous figures. Every other stats key is unchanged. Rewritten from the idea in context-mode (Elastic 2.0); no code was copied.
 - **Derived recall index (P141 S7b).** New `cg_recall_index.py` builds `recall.sqlite` (SQLite FTS5: porter + trigram tables, reciprocal-rank fusion, closest-word typo fallback) from the spans, refreshed best-effort after each Claude Code archive (`CG_REINDEX_SECONDS`, default 10). `context-guardian-recall --search <query>` queries it, `--reindex` also rebuilds it, and plain search orders by it only while it is newer than the newest span. Encrypted spans are never indexed; the spans stay the source of truth. Rewritten from the idea in context-mode (Elastic 2.0); no code was copied.
