@@ -96,10 +96,15 @@ def _quote(words: List[str]) -> str:
     return " ".join('"' + w.replace('"', '""') + '"' for w in words)
 
 
+_TABLES = ("spans_words", "spans_tri")
+
+
 def _top(con, table: str, match: str) -> List[Tuple[str, str]]:
+    if table not in _TABLES:   # identifiers come only from this fixed list; the user's text is the bound `?`
+        raise ValueError("unknown index table %r" % table)
     try:
         rows = con.execute(
-            f"SELECT run, name FROM {table} WHERE {table} MATCH ? ORDER BY bm25({table}, {WEIGHTS}) LIMIT {TOP_N}",
+            f"SELECT run, name FROM {table} WHERE {table} MATCH ? ORDER BY bm25({table}, {WEIGHTS}) LIMIT {TOP_N}",  # nosec B608
             (match,)).fetchall()
     except sqlite3.Error:
         return []
