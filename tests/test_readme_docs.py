@@ -13,7 +13,7 @@ def _section(heading: str) -> str:
 
 
 def test_quick_start_names_the_doctor():
-    assert "context-guardian-doctor" in _section("Quick start")
+    assert "context-guardian-doctor" in _section("Quick start (60 seconds)")
 
 
 def test_client_config_table_covers_the_four_clients():

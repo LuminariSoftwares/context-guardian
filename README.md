@@ -1,7 +1,5 @@
 <h1 align="center">Context Guardian</h1>
 
-<p align="center"><b>Your local-model session hits the context limit and dies. This stops that.</b></p>
-
 <p align="center">
   <a href="https://github.com/LuminariSoftwares/context-guardian/actions/workflows/test.yml"><img alt="tests (pytest) on Ubuntu, Windows, macOS" src="https://github.com/LuminariSoftwares/context-guardian/actions/workflows/test.yml/badge.svg"></a>
   <a href="https://github.com/LuminariSoftwares/context-guardian/actions/workflows/node.yml"><img alt="node smoke tests on Ubuntu, Windows, macOS" src="https://github.com/LuminariSoftwares/context-guardian/actions/workflows/node.yml/badge.svg"></a>
@@ -15,10 +13,63 @@
   <a href="https://glama.ai/mcp/servers/LuminariSoftwares/context-guardian"><img alt="context-guardian MCP server – quality and maintenance score on Glama" src="https://glama.ai/mcp/servers/LuminariSoftwares/context-guardian/badges/score.svg"></a>
 </p>
 
+Status: active development -- [changelog](CHANGELOG.md)
+
 mcp-name: io.github.LuminariSoftwares/context-guardian
 
+<p align="center"><b>A 40-turn session: 1,130,722 tokens sent upstream without it, 161,141 with it.</b></p>
+<!-- c6 -->
+
+A compaction proxy for OpenAI-compatible local backends that fails open, so a long session stops dying at the context limit.
+
+## Quick start (60 seconds)
+
+**Local model CLI, through the proxy:**
+
+```bash
+pip install context-guardian && context-guardian   # proxy on :8786 in front of Ollama on :11434; set OPENAI_BASE_URL=http://localhost:8786/v1
+context-guardian-doctor                            # second terminal: checks the install and the running proxy, prints a fix: line for anything wrong
+```
+
+**With an AI agent:** paste one line, "Install context-guardian (docs: https://raw.githubusercontent.com/LuminariSoftwares/context-guardian/main/llms.txt) and point my client at it". [llms.txt](llms.txt) is the whole install, configure, recall and limits story in one short file an agent can read.
+
+Another backend or window: see [examples/](examples/) or [Configure](#configure). Your client's settings: [Point your client at the proxy](#point-your-client-at-the-proxy). After a compaction, `context-guardian-recall "<term>"` searches the archived originals (the summary the model receives names the exact command and the MCP tools).
+
+**DeepSeek Harness:** `dsh plugin --profile web add dsh-context-guardian`, then `npm run setup -- --apply` in the installed package. Full steps: [Install both](#install-both-deepseek-harness-about-5-minutes).
+
+**Claude Code:**
+
+```bash
+pip install context-guardian
+context-guardian-claude-code install            # prints the hooks and the `claude mcp add` command; changes nothing
+context-guardian-claude-code install --apply    # backs up ~/.claude/settings.json, merges the hooks, prints the diff
+claude mcp add --scope user --transport stdio context-guardian -- uvx context-guardian mcp
+```
+
+Details: [Claude Code](#claude-code).
+
+## Proof
+
+```bash
+python scripts/bench_proxy.py --turns 40 --seed 1
+```
+
+```text
+turns=40 tokens_before=1130722 tokens_after=161141 compactions=27
+```
+
+Run 2026-11-05 on v0.15.0, Python 3.11, against a stub upstream. <!-- c6 -->
+
+```text
+623 passed, 1 warning in 106.22s (0:01:46)
+```
+
+`python -m pytest -q`, run 2026-11-05. <!-- c8 -->
+
+The bench runs against a stub upstream, not a real model; the token figures are the same on any machine. **Fails open.** If a summary fails, comes back empty or anything in the proxy raises, the request goes upstream exactly as your client sent it. Ollama (daily use) and DeepSeek Harness 0.1.2-alpha.2 are tested; the other backends and clients in [Compatibility](#compatibility) are configured from their documentation and marked untested.
+
 <p align="center">
-  <a href="#quick-start">Quick start</a> &middot;
+  <a href="#quick-start-60-seconds">Quick start</a> &middot;
   <a href="#prove-it">Prove it</a> &middot;
   <a href="#point-your-client-at-the-proxy">Client settings</a> &middot;
   <a href="#claude-code">Claude Code</a> &middot;
@@ -63,32 +114,6 @@ direct: rejected from turn 8 on. proxy: 12/12 turns answered, 6 originals archiv
 <!-- demo-overflow:end -->
 
 **Fails open.** If a summary fails, comes back empty or anything in the proxy raises, the request goes upstream exactly as your client sent it. The same holds for every seal, index, receipt and journal write: one that fails logs a warning, and the request goes ahead unchanged.
-
-## Quick start
-
-**With an AI agent:** paste one line, "Install context-guardian (docs: https://raw.githubusercontent.com/LuminariSoftwares/context-guardian/main/llms.txt) and point my client at it". [llms.txt](llms.txt) is the whole install, configure, recall and limits story in one short file an agent can read.
-
-**Local model CLI, through the proxy:**
-
-```bash
-pip install context-guardian && context-guardian   # proxy on :8786 in front of Ollama on :11434; set OPENAI_BASE_URL=http://localhost:8786/v1
-context-guardian-doctor                            # second terminal: checks the install and the running proxy, prints a fix: line for anything wrong
-```
-
-Another backend or window: see [examples/](examples/) or [Configure](#configure). Your client's settings: [Point your client at the proxy](#point-your-client-at-the-proxy). After a compaction, `context-guardian-recall "<term>"` searches the archived originals (the summary the model receives names the exact command and the MCP tools).
-
-**DeepSeek Harness:** `dsh plugin --profile web add dsh-context-guardian`, then `npm run setup -- --apply` in the installed package. Full steps: [Install both](#install-both-deepseek-harness-about-5-minutes).
-
-**Claude Code:**
-
-```bash
-pip install context-guardian
-context-guardian-claude-code install            # prints the hooks and the `claude mcp add` command; changes nothing
-context-guardian-claude-code install --apply    # backs up ~/.claude/settings.json, merges the hooks, prints the diff
-claude mcp add --scope user --transport stdio context-guardian -- uvx context-guardian mcp
-```
-
-Details: [Claude Code](#claude-code).
 
 ## Prove it
 
@@ -872,6 +897,8 @@ What is not covered automatically: a real model's summary quality, and the untes
 ## Why free
 
 MIT licensed, runs locally, no telemetry, no account and no licence server. Your archive is plain JSON in a documented format, so you never need a licence, or this tool, to read your own data.
+
+One of four free, MIT-licensed guardians for people running local models, each answering one question from the outside: tool-guardian (what do my tools cost the window?), context-guardian (will this session hit the limit?), stack-guardian (is my stack healthy?), code-guardian (is this code safe to run?).
 
 <!-- guardian-family:start -->
 ## The guardian family
