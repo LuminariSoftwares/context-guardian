@@ -45,6 +45,7 @@ import sys
 from pathlib import Path
 
 import cg_archive
+import cg_mask
 import cg_paths
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
@@ -300,7 +301,7 @@ def main(argv=None) -> int:
     hits, chars, matched = 0, 0, set()
     for path, idx, role, text in search(root, ns.term, ns.run):
         label = idx if idx in ("summary", "locked") else f"msg {idx} [{role}]"
-        line = f"{path} {label}: {text}"
+        line = f"{path} {label}: {cg_mask.mask(text)}"
         print(line)
         hits += 1
         chars += len(line)

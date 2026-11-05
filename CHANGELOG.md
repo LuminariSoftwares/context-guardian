@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Recall masks key-shaped values (P141 S8).** `read_span`, `search_spans` and the `cg_recall_cli.py` excerpts now show provider keys (`sk-`, `AKIA`, `ghp_`, ...) and the value of `password=` / `token=` / secret-key assignments as `<first 3>****<last 4>`, via the new `cg_mask.py`. The archive on disk, its seal and `list_spans` are untouched; set `MASK_OFF=1` to turn it off. Patterns rewritten from the idea in code-guardian; no code was copied.
 - **Resume block after a Claude Code compaction (P141 S5).** `context-guardian-claude-code install` now also adds a `SessionStart` hook with matcher `compact`. When Claude Code starts again after compacting, it prints a bounded block (goal, recent decisions, files edited, open errors, a recall pointer; at most 8000 characters) built from the session's archived spans by the new `cg_resume.py`. Startup, resume and clear print nothing, `SessionStart` never archives, and any failure is logged and prints nothing. Rewritten from the idea only; no code was taken from any other project.
 - **`get_context_status` MCP tool (P141 S6).** Read-only: estimates how full Claude Code's context window is from the transcript bytes after the last recorded compaction, using the proxy's `GUARDIAN_CHARS_PER_TOKEN`; window from `CG_CC_WINDOW`, a small model table, or 200000. Returns `ok`, `high`, `critical` or `unknown`, never an error. Rewritten from the idea only; no code was taken from any other project.
 

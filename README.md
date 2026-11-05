@@ -283,6 +283,10 @@ Pinned facts are forwarded word for word in a `Pinned facts (kept verbatim at th
 
 A summary shorter than `GUARDIAN_MIN_SUMMARY_CHARS` is now asked for once more before the proxy gives up; a second short answer fails open as before (`summary_retries` in `/guardian/stats`).
 
+### Masking keys in recall output
+
+Recall shows archived text, and archived text can hold a key someone pasted. `read_span`, `search_spans` and the `cg_recall_cli.py` excerpts replace key-shaped values with `<first 3>****<last 4>`: provider keys (`sk-`, `AKIA`, `ghp_`, `xox`, ...) and the value of a `password=`, `token=` or secret-named assignment (the name stays, so you can see what was masked). Only what recall *shows* changes: the archive on disk, its seal and `list_spans` are untouched, so `get_seal_status` stays `ok`. Set `MASK_OFF=1` to show text as archived. Masking never breaks a recall: if it fails, the text is shown unmasked and a line goes to stderr.
+
 ## Big pastes
 
 Compaction summarises *older* messages, so it cannot help when one message is bigger than the window: a log or a file pasted as the first message has nothing older to summarise at all. When the request still does not fit after compaction (or has nothing to compact), the proxy cuts that one message, as a last resort:

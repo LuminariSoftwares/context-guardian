@@ -31,6 +31,7 @@ import urllib.request
 from typing import Any, Dict, Optional
 
 import cg_archive
+import cg_mask
 import cg_paths
 import cg_recall_cli
 
@@ -363,7 +364,7 @@ def _search_spans(args: Dict[str, Any], counts: Optional[Dict[str, int]] = None)
     counts["query_terms"] = len(term.split())
     for path, idx, role, text, _hits in cg_recall_cli.ranked_search(root, term, run):
         label = idx if idx in ("summary", "locked") else f"msg {idx} [{role}]"
-        lines.append(f"{path.parent.name}/{path.name} {label}: {text}")
+        lines.append(f"{path.parent.name}/{path.name} {label}: {cg_mask.mask(text)}")
         matched.add(path)
         counts["spans_matched"] = len(matched)
         if len(lines) >= limit:
@@ -397,6 +398,11 @@ def render_message(i: int, m: Any) -> str:
 
 
 def _read_span(args: Dict[str, Any], counts: Optional[Dict[str, int]] = None) -> str:
+    """read_span with key-shaped values masked in what it shows (cg_mask); the archive is untouched."""
+    return cg_mask.mask(_read_span_raw(args, counts))
+
+
+def _read_span_raw(args: Dict[str, Any], counts: Optional[Dict[str, int]] = None) -> str:
     counts = {} if counts is None else counts
     run, index = _run_arg(args, required=True), args.get("index")
     if not isinstance(index, int) or isinstance(index, bool) or index < 0:
