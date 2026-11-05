@@ -12,8 +12,9 @@ proxy has done, without curl or a terminal:
     search_spans      find words in the spans compaction archived, best hits first
     read_span         one archived span, or a range of its messages
     get_seal_status   verify the sealed archive (cg_archive.verify)
+    get_context_status  how full Claude Code's context window is (transcript bytes since compaction)
 
-All six only read. `guardian_status` (the 0.10.0 name of get_proxy_status)
+All seven only read. `guardian_status` (the 0.10.0 name of get_proxy_status)
 is still accepted by tools/call but no longer listed. Nothing here changes the proxy, its settings or the
 archive. Protocol: newline-delimited JSON-RPC 2.0 on stdin/stdout, as the MCP
 stdio transport specifies; logs go to stderr only. Stdlib only, Python 3.10+.
@@ -78,13 +79,13 @@ RUN_ID_EXAMPLE = "20261015-120000"
 
 def _run_param(extra: str) -> Dict[str, Any]:
     return {"type": "string", "pattern": RUN_ID_RE.pattern,
-            "description": "Span folder, e.g. %s. %s" % (RUN_ID_EXAMPLE, extra),
+            "description": "Run, e.g. %s. %s" % (RUN_ID_EXAMPLE, extra),
             "examples": [RUN_ID_EXAMPLE]}
 
 
 def _max_param(top: int, default: int, example: int) -> Dict[str, Any]:
     return {"type": "integer", "minimum": 1, "maximum": top, "default": default,
-            "description": "Max rows, e.g. %d. Clamped to 1-%d." % (example, top),
+            "description": "Max, e.g. %d. Capped at %d." % (example, top),
             "examples": [example]}
 
 
@@ -97,13 +98,13 @@ STATUS_OUTPUT_SCHEMA = {
     "type": "object",
     "additionalProperties": True,
     "properties": {
-        "version": {"type": "string", "description": "Proxy version."},
-        "upstream": {"type": "string", "description": "Backend URL."},
-        "run_id": {"type": "string", "description": "Run's span folder."},
-        "num_ctx": {"type": "integer", "description": "Window, tokens."},
-        "effective_input_budget": {"type": "integer", "description": "Budget, tokens."},
+        "version": {"type": "string", "description": "Version."},
+        "upstream": {"type": "string", "description": "URL."},
+        "run_id": {"type": "string", "description": "Run id."},
+        "num_ctx": {"type": "integer", "description": "Window."},
+        "effective_input_budget": {"type": "integer", "description": "Budget."},
         "compactions_performed": {"type": "integer", "description": "Compactions."},
-        "dry_run": {"type": "boolean", "description": "Computing only."},
+        "dry_run": {"type": "boolean", "description": "Dry."},
     },
 }
 
@@ -118,20 +119,18 @@ TOOLS = [
         "name": "get_proxy_status",
         "title": "Proxy status",
         "description": (
-            "Proxy up and compacting? window, budget, compactions, tokens saved. Use "
-            "list_spans, search_spans or read_span for archived conversation text. One GET "
-            "to /guardian/stats, %g s. Returns those stats." % STATUS_TIMEOUT_SECONDS),
+            "Proxy up and compacting? Use list_spans, search_spans or read_span for archived "
+            "text. One GET to /guardian/stats, %g s. Returns stats." % STATUS_TIMEOUT_SECONDS),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         "outputSchema": STATUS_OUTPUT_SCHEMA,
         "annotations": _annotations("Proxy status", open_world=True),
     },
     {
         "name": "list_digests",
-        "title": "Skim the archive",
+        "title": "Skim spans",
         "description": (
-            "Skim the archive: a line per span, newest first, within max_tokens. Use search_spans "
-            "for words, read_span to open. Local files, no network. Returns `<run>/<NNNN> <time> "
-            "~<n>t: <digest>` lines."),
+            "Skim: a line per span. Use search_spans for words, read_span to open, "
+            "no network. Returns `<run>/<NNNN> <time> ~<n>t: <digest>` lines."),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -143,15 +142,14 @@ TOOLS = [
             },
             "additionalProperties": False,
         },
-        "annotations": _annotations("Skim the archive", open_world=False),
+        "annotations": _annotations("Skim spans", open_world=False),
     },
     {
         "name": "list_spans",
-        "title": "List archived spans",
+        "title": "List spans",
         "description": (
-            "Browse the span archive, no search term. Use search_spans for known text, "
-            "read_span to open one. Local files, no network. Returns `<run>: <n> spans` per "
-            "run, newest first, or a line per span given `run`."),
+            "Browse spans. Use search_spans for known text, read_span to open one. Local files, "
+            "no network. Returns `<run>: <n> spans`, or a line per span given `run`."),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -160,21 +158,21 @@ TOOLS = [
             },
             "additionalProperties": False,
         },
-        "annotations": _annotations("List archived spans", open_world=False),
+        "annotations": _annotations("List spans", open_world=False),
     },
     {
         "name": "search_spans",
-        "title": "Search archived spans",
+        "title": "Search spans",
         "description": (
-            "Find words in archived conversation, best match first. Use list_spans to browse, "
-            "read_span to open a hit. Local files, no network. Returns `<run>/<NNNN>.json msg <i> "
+            "Find words in archives, best match first. Use list_spans to browse, "
+            "read_span to open a hit, no network. Returns `<run>/<NNNN>.json msg <i> "
             "[<role>]: <snippet>` per hit. " + ARCHIVED_DATA_NOTE),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "term": {
                     "type": "string", "minLength": 1,
-                    "description": "Substring, any case, e.g. migration plan. Required.",
+                    "description": "Text, e.g. migration plan. Required.",
                     "examples": ["migration plan"],
                 },
                 "run": _run_param("Omit to search every run."),
@@ -183,14 +181,14 @@ TOOLS = [
             "required": ["term"],
             "additionalProperties": False,
         },
-        "annotations": _annotations("Search archived spans", open_world=False),
+        "annotations": _annotations("Search spans", open_world=False),
     },
     {
         "name": "read_span",
-        "title": "Read one archived span",
+        "title": "Read a span",
         "description": (
-            "One span's summary and original messages, verbatim, or messages start..end. Use "
-            "list_spans or search_spans first. One local file, no network. Returns `summary:` then "
+            "A span's messages, verbatim, or start..end. Use list_spans or search_spans first, "
+            "no network. Returns `summary:` then "
             "`[<i>] <role>: <text>`, cut at %d chars. %s" % (READ_SPAN_MAX_CHARS, ARCHIVED_DATA_NOTE)),
         "inputSchema": {
             "type": "object",
@@ -198,31 +196,46 @@ TOOLS = [
                 "run": _run_param("Required."),
                 "index": {
                     "type": "integer", "minimum": 0,
-                    "description": "Span number, e.g. 3 for 0003.json; 0 = capture journal. Required.",
+                    "description": "Span, e.g. 3 for 0003.json; 0 = journal. Required.",
                     "examples": [3],
                 },
                 "start": {"type": "integer", "minimum": 0, "default": 0, "examples": [5],
-                          "description": "First message, e.g. 5."},
+                          "description": "First, e.g. 5."},
                 "end": {"type": "integer", "minimum": 0, "examples": [9],
                         "description": "Last, e.g. 9. Omit for all."},
             },
             "required": ["run", "index"],
             "additionalProperties": False,
         },
-        "annotations": _annotations("Read one archived span", open_world=False),
+        "annotations": _annotations("Read a span", open_world=False),
     },
     {
         "name": "get_seal_status",
-        "title": "Verify the archive",
+        "title": "Verify seals",
         "description": (
-            "Verify the sealed archive: hash chains against files. Use list_spans for run ids. "
-            "Local files, no network. Returns `<run> OK` or `<run> BREAK <kind>` per run."),
+            "Verify archive hash chains. Use list_spans for run ids, "
+            "no network. Returns `<run> OK` or `<run> BREAK <kind>` per run."),
         "inputSchema": {
             "type": "object",
             "properties": {"run": _run_param("Omit for every run.")},
             "additionalProperties": False,
         },
-        "annotations": _annotations("Verify the archive", open_world=False),
+        "annotations": _annotations("Verify seals", open_world=False),
+    },
+    {
+        "name": "get_context_status",
+        "title": "Context fullness",
+        "description": (
+            "Claude Code context window fullness. Use before big reads, no network. "
+            "Returns state, used_tokens_est."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"transcript_path": {
+                "type": "string", "examples": ["s.jsonl"],
+                "description": "Path, e.g. s.jsonl. Omit for newest run."}},
+            "additionalProperties": False,
+        },
+        "annotations": _annotations("Context fullness", open_world=False),
     },
 ]
 # Old names tools/call still accepts. Not listed: a second name for the same
@@ -283,7 +296,7 @@ def _span_root():
 
 def _get_proxy_status(_args: Dict[str, Any], _counts: Optional[Dict[str, int]] = None):
     host = os.environ.get("GUARDIAN_HOST", "127.0.0.1")
-    if host in ("0.0.0.0", "::", ""):
+    if host in ("0.0.0.0", "::", ""):  # nosec B104 -- maps a wildcard bind to loopback for the client URL
         host = "127.0.0.1"
     port = os.environ.get("GUARDIAN_PORT", "8786")
     url = f"http://{host}:{port}/guardian/stats"
@@ -497,6 +510,117 @@ def _get_seal_status(args: Dict[str, Any], counts: Optional[Dict[str, int]] = No
                  + ("; anchor checked" if anchor else "; no anchor file"))
     return "\n".join(lines)
 
+CC_RUN_PREFIX = "cc-"
+DEFAULT_WINDOW = 200_000
+# Substring of the transcript's `model` -> window. Small on purpose.
+MODEL_WINDOWS = (("[1m]", 1_000_000),)
+HIGH_FRACTION, CRITICAL_FRACTION = 0.70, 0.90
+MODEL_TAIL_BYTES = 262_144
+
+
+def _unknown(reason: str):
+    out = {"state": "unknown", "reason": reason}
+    return json.dumps(out, sort_keys=True), out
+
+
+def _compaction_boundary(root, transcript: str) -> int:
+    """End byte of the newest PreCompact span recorded for this transcript; 0 when none."""
+    best = 0
+    try:
+        runs = [d for d in root.iterdir() if d.is_dir() and d.name.startswith(CC_RUN_PREFIX)]
+    except OSError:
+        return 0
+    for run in runs:
+        try:
+            names = sorted(n for n in cg_archive.archived_files(run) if cg_archive.SPAN_NAME_RE.match(n))
+            for name in names:
+                span = cg_archive.load_span(run / name)
+                if (span and span.get("transcript") == transcript and span.get("hook_event") == "PreCompact"
+                        and isinstance(span.get("bytes"), list) and len(span["bytes"]) == 2):
+                    best = max(best, int(span["bytes"][1]))
+        except (OSError, ValueError, TypeError):
+            continue
+    return best
+
+
+def _transcript_model(path: str, size: int) -> str:
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - MODEL_TAIL_BYTES))
+            tail = fh.read()
+    except OSError:
+        return ""
+    for raw in reversed(tail.splitlines()):
+        try:
+            msg = json.loads(raw).get("message")
+        except (ValueError, AttributeError):
+            continue
+        if isinstance(msg, dict) and isinstance(msg.get("model"), str) and msg["model"]:
+            return msg["model"]
+    return ""
+
+
+def _get_context_status(args: Dict[str, Any], _counts: Optional[Dict[str, int]] = None):
+    """Rewritten from the idea of a context-fullness status tool in context-mode
+    (mksglu/context-mode, Elastic 2.0); no code taken. Read-only: bytes of the
+    transcript after the last PreCompact boundary, divided by the proxy's
+    GUARDIAN_CHARS_PER_TOKEN, against the window. Never raises."""
+    try:
+        root = cg_recall_cli.span_dir()
+        path = args.get("transcript_path")
+        if path is not None and (not isinstance(path, str) or not path.strip()):
+            return _unknown("transcript_path must be a non-empty string")
+        if path is None:
+            runs = []
+            if root.is_dir():
+                for d in root.iterdir():
+                    if d.is_dir() and d.name.startswith(CC_RUN_PREFIX):
+                        try:
+                            runs.append((d.stat().st_mtime, d))
+                        except OSError:
+                            pass
+            if not runs:
+                return _unknown("no Claude Code run recorded by the hook under %s" % root)
+            runs.sort(key=lambda r: r[0], reverse=True)
+            try:
+                state = json.loads((runs[0][1] / "cc_state.json").read_text(encoding="utf-8"))
+                path = state.get("transcript") if isinstance(state, dict) else None
+            except (OSError, ValueError):
+                path = None
+            if not isinstance(path, str) or not path:
+                return _unknown("newest run %s has no recorded transcript" % runs[0][1].name)
+        try:
+            size = os.path.getsize(path)
+        except OSError as exc:
+            return _unknown("transcript not readable: %s" % exc.strerror)
+        boundary = _compaction_boundary(root, path) if root.is_dir() else 0
+        if boundary > size:
+            boundary = 0
+        since = size - boundary
+        ratio = float(os.environ.get("GUARDIAN_CHARS_PER_TOKEN", "3.5"))
+        env_window = os.environ.get("CG_CC_WINDOW", "").strip()
+        window, source = DEFAULT_WINDOW, "default"
+        if env_window:
+            try:
+                if int(env_window) > 0:
+                    window, source = int(env_window), "env"
+            except ValueError:
+                pass
+        if source == "default":
+            model = _transcript_model(path, size)
+            for needle, win in MODEL_WINDOWS:
+                if needle in model:
+                    window, source = win, "model"
+                    break
+        used = since / ratio
+        frac = used / window
+        state = "critical" if frac >= CRITICAL_FRACTION else "high" if frac >= HIGH_FRACTION else "ok"
+        out = {"state": state, "used_tokens_est": round(used), "remaining_est": round(window - used),
+               "window": window, "since_compaction_bytes": since, "ratio": ratio, "window_source": source}
+        return json.dumps(out, sort_keys=True), out
+    except Exception as exc:  # noqa: BLE001 -- a status tool reports, it does not fail
+        return _unknown("%s: %s" % (type(exc).__name__, exc))
+
 
 # A handler returns the text result, or (text, structuredContent) for a tool
 # that declares an outputSchema.
@@ -505,7 +629,8 @@ def _get_seal_status(args: Dict[str, Any], counts: Optional[Dict[str, int]] = No
 RECALL_TOOLS = ("list_digests", "list_spans", "search_spans", "read_span", "get_seal_status")
 HANDLERS = {"get_proxy_status": _get_proxy_status, "list_digests": _list_digests,
             "list_spans": _list_spans, "search_spans": _search_spans, "read_span": _read_span,
-            "get_seal_status": _get_seal_status}
+            "get_seal_status": _get_seal_status,
+            "get_context_status": _get_context_status}
 
 
 def handle(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
