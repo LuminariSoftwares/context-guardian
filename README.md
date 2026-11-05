@@ -156,6 +156,8 @@ Claude Code compacts its own window, and by default it talks to Anthropic's API 
 
 Then search Claude Code's history like any other run: `context-guardian-recall "<term>"`, or from inside Claude Code through the MCP server (`list_digests`, `search_spans`, `read_span`). Checked against a real 3.6 MB Claude Code transcript: two spans in 0.22 s, `--verify` OK, and a second capture added nothing.
 
+After a compaction, the `SessionStart` hook (matcher `compact`, so it does not fire on startup, resume or clear) prints a short block of plain facts from the archived spans as the hook's `additionalContext`: the goal, the latest decisions, the files edited, the errors still open and a line naming `context-guardian-recall "<term>"`. The block is built by `cg_resume.py`, is capped at 8000 characters, and is left out when the session has no archived spans. It only reads the archive; `SessionStart` never archives, and any failure is logged and prints nothing. The matcher is `compact` only because Claude Code replays saved context on resume and runs `SessionStart` again then. Re-run `install --apply` to add the third hook to an existing install.
+
 Limits: Claude Code documents its transcript lines as internal and liable to change between versions, so lines are archived verbatim and only read for their text. The adapter does not change what Claude Code keeps in its own window; it keeps a sealed, searchable copy of what was said.
 
 ## Show real usage in your client
