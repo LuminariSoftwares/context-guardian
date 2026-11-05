@@ -69,8 +69,8 @@ def test_the_budget_covers_the_whole_surface():
     """A budget that measured only some of the tools would not be a budget."""
     tools = tools_over_stdio()
     assert sorted(t["name"] for t in tools) == [
-        "get_proxy_status", "get_seal_status", "list_digests", "list_spans", "read_span",
-        "search_spans"]
+        "get_context_status", "get_proxy_status", "get_seal_status", "list_digests", "list_spans",
+        "read_span", "search_spans"]
 
 
 def test_the_console_script_entry_point_measures_the_same():

@@ -3,6 +3,8 @@
 ## Unreleased
 
 - **Resume block after a Claude Code compaction (P141 S5).** `context-guardian-claude-code install` now also adds a `SessionStart` hook with matcher `compact`. When Claude Code starts again after compacting, it prints a bounded block (goal, recent decisions, files edited, open errors, a recall pointer; at most 8000 characters) built from the session's archived spans by the new `cg_resume.py`. Startup, resume and clear print nothing, `SessionStart` never archives, and any failure is logged and prints nothing. Rewritten from the idea only; no code was taken from any other project.
+- **`get_context_status` MCP tool (P141 S6).** Read-only: estimates how full Claude Code's context window is from the transcript bytes after the last recorded compaction, using the proxy's `GUARDIAN_CHARS_PER_TOKEN`; window from `CG_CC_WINDOW`, a small model table, or 200000. Returns `ok`, `high`, `critical` or `unknown`, never an error. Rewritten from the idea only; no code was taken from any other project.
+
 
 ## PyPI context-guardian 0.14.0 (2026-11-01)
 
