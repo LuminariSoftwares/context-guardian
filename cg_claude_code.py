@@ -49,6 +49,7 @@ from typing import Any, Dict, List, Tuple
 import cg_archive
 import cg_paths
 import cg_recall_cli
+import cg_recall_index
 
 SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 RUN_PREFIX = "cc-"
@@ -268,6 +269,28 @@ def _resume(hook: Dict[str, Any], root: Path) -> None:
         log("resume block failed (%s: %s); Claude Code is unaffected" % (type(exc).__name__, exc))
 
 
+def _reindex(root: Path) -> None:
+    """Best effort: refresh the derived recall index after an archive. Waits at
+    most CG_REINDEX_SECONDS (default 10), swallows everything, never blocks."""
+    try:
+        try:
+            seconds = float(os.environ.get("CG_REINDEX_SECONDS") or 10)
+        except ValueError:
+            seconds = 10.0
+        worker = threading.Thread(target=_reindex_quietly, args=(root,), daemon=True)
+        worker.start()
+        worker.join(max(0.0, seconds))
+    except Exception:                                      # noqa: BLE001
+        pass
+
+
+def _reindex_quietly(root: Path) -> None:
+    try:
+        cg_recall_index.reindex(root)
+    except Exception as exc:                               # noqa: BLE001
+        log("recall index not refreshed (%s: %s)" % (type(exc).__name__, exc))
+
+
 def cmd_capture(ns) -> int:
     _arm_timeout(ns.timeout)
     deadline = time.monotonic() + ns.timeout * 0.6
@@ -286,6 +309,7 @@ def cmd_capture(ns) -> int:
             _resume(hook, root)
             return 0
         capture(hook, root, deadline)
+        _reindex(root)
     except ValueError as exc:
         log("not capturing: %s" % exc)
     except Exception as exc:                               # noqa: BLE001

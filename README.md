@@ -270,6 +270,8 @@ python scripts/memo_drift_probe.py --upstream http://127.0.0.1:11434/v1 --model 
 
 The digest index is written as each span is written: `<run>/index.jsonl`, no extra model call. `context-guardian-recall --reindex` builds it for older archives. **Always-on capture** (`GUARDIAN_CAPTURE=journal`, off by default) also records every message of a session, not just what compaction evicts, and search and `read_span` cover it. It is off by default because it writes every message to disk in clear text and grows with the session; that is your decision to make, not a default.
 
+**A ranked search index (`recall.sqlite`).** After each Claude Code archive, `context-guardian-claude-code` refreshes a derived SQLite FTS5 index in the span directory (stdlib only, at most `CG_REINDEX_SECONDS`, default 10, and any failure is ignored). It holds a porter-stemmed table and a trigram table, fuses their rankings, and falls back to the closest indexed word when a query has a typo. `context-guardian-recall --search "<query>"` prints `<run> <span> <score>` per hit, `--reindex` rebuilds it, and plain search uses it to order results while it is newer than the newest span. The spans stay the source of truth: delete `recall.sqlite` at any time and nothing is lost. Encrypted spans are never indexed. Rewritten from the idea only; no code was taken from any other project.
+
 ### Pinned facts
 
 A rolling summary holds a handful of facts at most, and each new summary can lose the ones the last one had. The proxy therefore keeps the facts you ask it to keep out of the summary's hands, on both `/v1/chat/completions` and `/v1/messages`:

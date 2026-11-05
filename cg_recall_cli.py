@@ -6,6 +6,7 @@
     context-guardian-recall --receipts [--since 7d] [--share]
     context-guardian-recall --savings [--since 7d] [--json]
     context-guardian-recall --reindex [--run RUN_ID]
+    context-guardian-recall --search <query>
 
 A compaction folds older messages into a summary and archives the full text as
 <GUARDIAN_SPAN_DIR>/<run_id>/<NNNN>.json. The summary the model receives names
@@ -27,7 +28,10 @@ backfilled. GUARDIAN_SEAL_ANCHOR_PATH, when that file exists, is checked too.
 cg_archive.py): archive size, recall calls, spans opened, the share of the
 archive read back, tokens saved, seal status. --share prints the same as a
 short block with no paths, no text and no run ids. --reindex rebuilds the
-skim index (index.jsonl) for spans written before it existed.
+skim index (index.jsonl) for spans written before it existed, and also
+rebuilds recall.sqlite (cg_recall_index.py), the derived full-text index;
+--search <query> lists `<run> <span> <score>` from it. A plain search uses
+recall.sqlite to order spans only while it is newer than the newest span.
 
 --savings adds up the compaction log (GUARDIAN_LOG_PATH) and the receipts:
 how many tokens the forwarded requests held before and after compaction, the
@@ -47,6 +51,7 @@ from pathlib import Path
 import cg_archive
 import cg_mask
 import cg_paths
+import cg_recall_index
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 SNIPPET_CHARS = 80
@@ -129,6 +134,7 @@ def ranked_search(root: Path, query: str, run: str | None = None):
     phrase = " ".join(query.lower().split())
     if not words:
         return []
+    order = _index_order(root, query, run)
     pattern = f"{run}/*.json" if run else "*/*.json"
     sources, locked = [], []
     for path in root.glob(pattern):
@@ -171,7 +177,51 @@ def ranked_search(root: Path, query: str, run: str | None = None):
             rank = (whole, hits, mtime, str(path), -(idx if isinstance(idx, int) else 1 << 30))
             found.append((rank, path, idx, role, snippet(text, first, length), hits))
     found.sort(key=lambda t: t[0], reverse=True)
-    return [(path, idx, role, snip, hits) for _, path, idx, role, snip, hits in found] + sorted(locked)
+    out = [(path, idx, role, snip, hits) for _, path, idx, role, snip, hits in found]
+    if order:
+        out = _apply_index_order(root, order, out)
+    return out + sorted(locked)
+
+
+def _index_order(root: Path, query: str, run: str | None):
+    """Span keys (run, file name) best first from recall.sqlite, or [] when the
+    index is missing, older than the newest span, or fails (fail open)."""
+    try:
+        idx = cg_recall_index.index_path(root)
+        if not idx.is_file():
+            return []
+        newest = max((p.stat().st_mtime for p in root.glob("*/*.json")
+                      if cg_archive.SPAN_NAME_RE.match(p.name)), default=0.0)
+        if idx.stat().st_mtime < newest:
+            return []
+        hits = cg_recall_index.search(root, query, 200)
+        return [(r, n) for r, n, _ in hits if run is None or r == run]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _apply_index_order(root: Path, order, out):
+    """Spans the index ranked come first in its order (a span the index found
+    through a typo or stem, with no literal hit, gets one line); every other hit
+    keeps its place after them. Nothing the plain search found is dropped."""
+    rank = {key: i for i, key in enumerate(order)}
+    seen = {(p.parent.name, p.name) for p, *_ in out}
+    extra = []
+    for key in order:
+        if key in seen:
+            continue
+        path = root / key[0] / key[1]
+        data = cg_archive.load_span(path)
+        if data is None or data.get("locked"):
+            continue
+        msgs = data.get("messages") or []
+        text = message_text(msgs[0]) if msgs else str(data.get("summary") or "")
+        if text:
+            extra.append((path, 0 if msgs else "summary", cg_archive.message_role(msgs[0]) if msgs else "summary",
+                          snippet(text, 0, 0), 0))
+    merged = out + extra
+    merged.sort(key=lambda t: rank.get((t[0].parent.name, t[0].name), len(rank)))
+    return merged
 
 
 def anchor_path():
@@ -265,6 +315,8 @@ def main(argv=None) -> int:
                        help="with --verify: seal files written before sealing existed (marked backfilled)")
     group.add_argument("--reindex", action="store_true",
                        help="rebuild each run's index.jsonl (the skim digests) from its span files")
+    group.add_argument("--search", metavar="QUERY", default=None,
+                       help="ranked search of the derived recall index (recall.sqlite): one line per span hit")
     group = parser.add_argument_group("receipts")
     group.add_argument("--receipts", action="store_true",
                        help="summarise the counts-only recall receipts")
@@ -290,6 +342,21 @@ def main(argv=None) -> int:
             return 2
         for run, count in cg_archive.reindex(root, ns.run).items():
             print(f"{run}  indexed {count} span(s)")
+        try:
+            print(f"recall.sqlite  indexed {cg_recall_index.reindex(root)} span(s)")
+        except Exception as exc:  # noqa: BLE001
+            print(f"recall.sqlite not rebuilt ({type(exc).__name__}: {exc})", file=sys.stderr)
+        return 0
+    if ns.search:
+        if not root.is_dir():
+            print(f"no span archive at {root} (set GUARDIAN_SPAN_DIR)", file=sys.stderr)
+            return 2
+        found = cg_recall_index.search(root, ns.search, ns.max)
+        for run, name, score in found:
+            print(f"{run} {name} score {score:.4f}")
+        if not found:
+            print(f"no match for {ns.search!r} (run --reindex first if recall.sqlite is missing)", file=sys.stderr)
+            return 1
         return 0
     if ns.verify or ns.heads or ns.seal_existing:
         return cmd_verify(ns, root)
