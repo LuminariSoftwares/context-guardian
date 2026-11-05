@@ -44,7 +44,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import cg_archive
 import cg_paths
@@ -54,7 +54,7 @@ SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 RUN_PREFIX = "cc-"
 STATE_FILE = "cc_state.json"
 CAPTURE_LOCK = "cc_capture.lock"
-EVENTS = ("PreCompact", "SessionEnd")
+EVENTS = ("PreCompact", "SessionEnd", "SessionStart")
 # Seconds Claude Code may give the hook. SessionEnd's own default budget is
 # 1.5 s; a per-hook timeout raises it (up to 60 s), so the hook asks for 30.
 HOOK_TIMEOUT_SECONDS = 30
@@ -251,6 +251,23 @@ def _arm_timeout(seconds: float) -> None:
     timer.start()
 
 
+def _resume(hook: Dict[str, Any], root: Path) -> None:
+    """SessionStart after a compaction: print the resume block as the hook's
+    additionalContext. Any other source prints nothing, and nothing is
+    archived. Never raises."""
+    try:
+        sid = hook.get("session_id")
+        if hook.get("source") != "compact" or not isinstance(sid, str) or not SESSION_RE.match(sid):
+            return
+        import cg_resume
+        block = cg_resume.build_resume(Path(root) / (RUN_PREFIX + sid))
+        if block:
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart",
+                                                     "additionalContext": block}}), flush=True)
+    except Exception as exc:                               # noqa: BLE001
+        log("resume block failed (%s: %s); Claude Code is unaffected" % (type(exc).__name__, exc))
+
+
 def cmd_capture(ns) -> int:
     _arm_timeout(ns.timeout)
     deadline = time.monotonic() + ns.timeout * 0.6
@@ -265,6 +282,9 @@ def cmd_capture(ns) -> int:
             log("ignoring hook input that is not a JSON object (%d bytes)" % len(raw))
             return 0
         root = cg_recall_cli.span_dir()
+        if hook.get("hook_event_name") == "SessionStart":
+            _resume(hook, root)
+            return 0
         capture(hook, root, deadline)
     except ValueError as exc:
         log("not capturing: %s" % exc)
@@ -311,10 +331,15 @@ def is_ours(hook: Any) -> bool:
 
 
 def our_hooks(command: str) -> Dict[str, Dict[str, Any]]:
-    """One matcher group per event. No matcher: it matches every occurrence
-    (manual and auto compaction; every reason a session ends)."""
-    return {event: {"hooks": [{"type": "command", "command": command,
-                               "timeout": HOOK_TIMEOUT_SECONDS}]} for event in EVENTS}
+    """One matcher group per event. PreCompact and SessionEnd have no matcher:
+    they match every occurrence (manual and auto compaction; every reason a
+    session ends). SessionStart matches "compact" only: Claude Code replays
+    saved additionalContext on resume and runs SessionStart again then, so a
+    resume matcher would hand the resume block over twice."""
+    groups = {event: {"hooks": [{"type": "command", "command": command,
+                                 "timeout": HOOK_TIMEOUT_SECONDS}]} for event in EVENTS}
+    groups["SessionStart"] = dict(matcher="compact", **groups["SessionStart"])
+    return groups
 
 
 def merged(settings: Dict[str, Any], command: str) -> Dict[str, Any]:

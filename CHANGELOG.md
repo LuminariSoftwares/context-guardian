@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Resume block after a Claude Code compaction (P141 S5).** `context-guardian-claude-code install` now also adds a `SessionStart` hook with matcher `compact`. When Claude Code starts again after compacting, it prints a bounded block (goal, recent decisions, files edited, open errors, a recall pointer; at most 8000 characters) built from the session's archived spans by the new `cg_resume.py`. Startup, resume and clear print nothing, `SessionStart` never archives, and any failure is logged and prints nothing. Rewritten from the idea only; no code was taken from any other project.
+
 ## PyPI context-guardian 0.14.0 (2026-11-01)
 
 The proxy now keeps what it is asked to keep. Measured on the guardian-leaderboard keep-facts bench (qwen3-coder:30b on a
