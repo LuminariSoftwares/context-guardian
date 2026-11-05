@@ -296,7 +296,7 @@ def _span_root():
 
 def _get_proxy_status(_args: Dict[str, Any], _counts: Optional[Dict[str, int]] = None):
     host = os.environ.get("GUARDIAN_HOST", "127.0.0.1")
-    if host in ("0.0.0.0", "::", ""):
+    if host in ("0.0.0.0", "::", ""):  # nosec B104 -- maps a wildcard bind to loopback for the client URL
         host = "127.0.0.1"
     port = os.environ.get("GUARDIAN_PORT", "8786")
     url = f"http://{host}:{port}/guardian/stats"
