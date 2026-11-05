@@ -31,11 +31,12 @@ import urllib.request
 from typing import Any, Dict, Optional
 
 import cg_archive
+import cg_mask
 import cg_paths
 import cg_recall_cli
 
 SERVER_NAME = "context-guardian"
-SERVER_VERSION = "0.14.0"  # keep equal to pyproject.toml version
+SERVER_VERSION = "0.15.0"  # keep equal to pyproject.toml version
 # Newest first. The client's version is echoed when supported, else ours.
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 STATUS_TIMEOUT_SECONDS = 3.0
@@ -363,7 +364,7 @@ def _search_spans(args: Dict[str, Any], counts: Optional[Dict[str, int]] = None)
     counts["query_terms"] = len(term.split())
     for path, idx, role, text, _hits in cg_recall_cli.ranked_search(root, term, run):
         label = idx if idx in ("summary", "locked") else f"msg {idx} [{role}]"
-        lines.append(f"{path.parent.name}/{path.name} {label}: {text}")
+        lines.append(f"{path.parent.name}/{path.name} {label}: {cg_mask.mask(text)}")
         matched.add(path)
         counts["spans_matched"] = len(matched)
         if len(lines) >= limit:
@@ -397,6 +398,11 @@ def render_message(i: int, m: Any) -> str:
 
 
 def _read_span(args: Dict[str, Any], counts: Optional[Dict[str, int]] = None) -> str:
+    """read_span with key-shaped values masked in what it shows (cg_mask); the archive is untouched."""
+    return cg_mask.mask(_read_span_raw(args, counts))
+
+
+def _read_span_raw(args: Dict[str, Any], counts: Optional[Dict[str, int]] = None) -> str:
     counts = {} if counts is None else counts
     run, index = _run_arg(args, required=True), args.get("index")
     if not isinstance(index, int) or isinstance(index, bool) or index < 0:

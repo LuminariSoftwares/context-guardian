@@ -12,3 +12,7 @@
 !cg_claude_code.py
 !cg_count.py
 !cg_statusline.py
+!cg_resume.py
+!cg_mask.py
+!cg_recall_index.py
+!cg_breakdown.py

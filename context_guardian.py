@@ -91,11 +91,13 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
+import cg_breakdown
+
 # Single source of truth for the running code's version. Used by /guardian/stats,
 # the /guardian/health dashboard, the banner and the PyPI update check, through
 # guardian_version(), which returns this constant and never installed metadata
 # (which can name a different, older install). Keep it in lockstep with pyproject.toml.
-__version__ = "0.14.0"  # keep equal to pyproject.toml version
+__version__ = "0.15.0"  # keep equal to pyproject.toml version
 from starlette.background import BackgroundTask
 
 # Load .env BEFORE any config is read.
@@ -3524,6 +3526,20 @@ async def usage(session: Optional[str] = None):
         "last_compaction_at": row["last_compaction_at"]})
 
 
+_breakdown: Dict[str, int] = dict.fromkeys(cg_breakdown.KEYS, 0)
+
+
+def note_breakdown(payload: Any) -> None:
+    """Store where the latest request's window went (cg_breakdown). Fail open: an
+    error is logged and the previous breakdown stays; the request is never touched."""
+    global _breakdown
+    try:
+        _breakdown = cg_breakdown.breakdown_tokens(
+            payload, estimate_messages=estimate_tokens, estimate_tools=estimate_tool_tokens)
+    except Exception as exc:                               # noqa: BLE001
+        log.debug("window breakdown failed, request unaffected: %s", exc)
+
+
 @app.get("/guardian/stats")
 async def stats():
     return JSONResponse({
@@ -3595,6 +3611,8 @@ async def stats():
         "calibration_min_samples": CALIBRATION_MIN_SAMPLES,
         "note": ("last_known_total_tokens now INCLUDES the tools array. "
                  "last_tool_tokens is the part compaction cannot touch."),
+        # Where the latest request's window went, in estimated tokens (cg_breakdown).
+        "breakdown": dict(_breakdown),
     })
 
 
@@ -4288,6 +4306,7 @@ async def proxy(path: str, request: Request):
             if rewritten is not payload:
                 body_bytes = json.dumps(rewritten).encode("utf-8")
             payload = rewritten
+            note_breakdown(payload)
             # Grabbed HERE, immediately after the estimate was recorded and
             # before anything else can touch _state. Only chat/completions
             # gets a usage block back; every other route keeps the raw stream
@@ -4324,6 +4343,7 @@ async def proxy(path: str, request: Request):
                     log.debug("usage bookkeeping failed, request unaffected: %s", exc)
                 if rewritten is not payload:
                     body_bytes = json.dumps(rewritten).encode("utf-8")
+                note_breakdown(rewritten)
                 # The calibration tap, as on chat/completions: before 0.12.0
                 # this route had none, so its estimate never learned from the
                 # usage the backend reports. The raw size of what is actually
@@ -4419,7 +4439,7 @@ Point your client's OPENAI_BASE_URL at http://127.0.0.1:{port}/v1 once it is run
 """
 
 
-def usage() -> str:
+def usage() -> str:  # noqa: F811 -- the CLI text; the earlier `usage` is the /guardian/usage route, already registered
     return USAGE.format(port=GUARDIAN_PORT, upstream=UPSTREAM_URL,
                         data=DATA_DIR, num_ctx=NUM_CTX, spans=SPAN_DIR,
                         log=LOG_PATH)

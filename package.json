@@ -1,7 +1,7 @@
 {
   "name": "dsh-context-guardian",
   "mcpName": "io.github.LuminariSoftwares/context-guardian",
-  "version": "0.3.0-beta.1",
+  "version": "0.4.0-beta.1",
   "description": "Context Guardian as a native DeepSeek Harness (DSH) bundle: deterministic, seq-pointer-preserving compaction with model-facing recall and search. Companion to dsh-tool-guardian.",
   "type": "module",
   "main": "index.js",
@@ -36,6 +36,9 @@
     "cg_postcheck.js",
     "cg_doctor.py",
     "cg_recall_cli.py",
+    "cg_mask.py",
+    "cg_recall_index.py",
+    "cg_breakdown.py",
     "requirements.txt",
     "docs/dsh-integration.md",
     "docs/dsh-upstream-append-only.md",
