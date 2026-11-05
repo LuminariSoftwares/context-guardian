@@ -4439,7 +4439,7 @@ Point your client's OPENAI_BASE_URL at http://127.0.0.1:{port}/v1 once it is run
 """
 
 
-def usage() -> str:
+def usage() -> str:  # noqa: F811 -- the CLI text; the earlier `usage` is the /guardian/usage route, already registered
     return USAGE.format(port=GUARDIAN_PORT, upstream=UPSTREAM_URL,
                         data=DATA_DIR, num_ctx=NUM_CTX, spans=SPAN_DIR,
                         log=LOG_PATH)
