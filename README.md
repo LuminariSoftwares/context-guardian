@@ -22,7 +22,7 @@ mcp-name: io.github.LuminariSoftwares/context-guardian
 
 A compaction proxy for OpenAI-compatible local backends that fails open, so a long session stops dying at the context limit.
 
-<p align="center"><a href="docs/demo_poster.png"><img alt="context-guardian promo video: 40 turns, 1,130,722 tokens sent upstream down to 161,141" src="docs/demo_poster.png" width="720"></a></p>
+https://github.com/user-attachments/assets/1d1d63e9-4e2f-446e-8111-ae56a5a82f7f
 
 ## Quick start (60 seconds)
 
