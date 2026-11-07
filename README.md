@@ -22,6 +22,8 @@ mcp-name: io.github.LuminariSoftwares/context-guardian
 
 A compaction proxy for OpenAI-compatible local backends that fails open, so a long session stops dying at the context limit.
 
+<p align="center"><a href="docs/demo_poster.png"><img alt="context-guardian promo video: 40 turns, 1,130,722 tokens sent upstream down to 161,141" src="docs/demo_poster.png" width="720"></a></p>
+
 ## Quick start (60 seconds)
 
 **Local model CLI, through the proxy:**
@@ -232,7 +234,7 @@ For [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) there is
 
 **Measured:** in a 48-prompt DeepSeek Harness session on qwen3-coder:30b (Ollama, 64K window) with codenames changed mid-session, 0.1.0-alpha.9 kept 12/12 facts current with 0 stale answers and brought back 3/3 early details in every run (n = 3), where pins alone brought back 0/3 (n = 2). Details: [Measured](#measured-does-it-keep-what-matters-2026-10-01).
 
-![Illustration of Context Guardian inside DeepSeek Harness: the context meter climbs to the 85 % line, compaction folds the old turns into a checkpoint with the pinned facts first, and later stale recall brings back an archived line](context_guardian_dsh_demo.gif)
+[Animation: Context Guardian inside DeepSeek Harness](docs/context_guardian_dsh_demo.gif) (GIF)
 
 *An illustration of what the DSH engine (0.1.0-alpha.9) does, not a DSH screen. Inside DSH you see it as DSH's own "Context compacted" row and context meter, `/context` and `/guardian` for pressure and the last compaction, and the `[context-guardian recall]` message in the conversation. What happens: at 85 % of the window it compacts, the facts you asked it to keep lead every checkpoint, the old turns stay on disk, and when a later question needs a detail that was compacted away, stale recall puts the original line back before the model answers. The results line is the benchmark in [Measured](#measured-does-it-keep-what-matters-2026-10-01). The proxy has its own monitor: see [See it work](#see-it-work).*
 
@@ -887,7 +889,7 @@ What is not covered automatically: a real model's summary quality, and the untes
 
 ## See it work
 
-![Context Guardian proxy compaction monitor: a request climbs past the budget line, gets compacted, and drops back under it](context_guardian_demo.gif)
+[Animation: the proxy compaction monitor](docs/context_guardian_demo.gif) (GIF)
 
 *The proxy's `/guardian/health` compaction monitor: a request that arrives above the compaction threshold (`GUARDIAN_COMPACT_THRESHOLD`, 85 % of the window) is compacted before it is forwarded, so the backend never sees an over-long request.*
 
