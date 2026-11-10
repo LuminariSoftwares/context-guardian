@@ -89,9 +89,10 @@ from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 import cg_breakdown
+import cg_context_tools
 import cg_cache_health
 import cg_empty_retry
 
@@ -249,6 +250,30 @@ DRY_RUN = os.environ.get("GUARDIAN_DRY_RUN", "0").strip().lower() in ("1", "true
 INJECT_STREAM_OPTIONS = os.environ.get(
     "GUARDIAN_INJECT_STREAM_OPTIONS", "0").strip().lower() in ("1", "true", "yes")
 
+# CONTEXT_TOOLS: offer the model four tools (status, search, propose a fold, cancel a fold) on
+# /v1/chat/completions once the request is part-way to the compaction budget. The model only
+# PROPOSES; the proxy validates, and its own fenced summariser writes any summary, on the next
+# request. Off by default. See cg_context_tools.py and docs/adr/0009-model-driven-context-tools.md.
+CONTEXT_TOOLS = os.environ.get(
+    "GUARDIAN_CONTEXT_TOOLS", "0").strip().lower() in ("1", "true", "yes")
+
+
+def _env_num(name: str, default: float, low: float = 0.0) -> float:
+    try:
+        v = float(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+    return v if v >= low else default
+
+
+CONTEXT_TOOLS_MIN_PCT = _env_num("GUARDIAN_CONTEXT_TOOLS_MIN_PCT", 50.0)
+CONTEXT_TOOLS_MAX_ROUNDS = int(_env_num("GUARDIAN_CONTEXT_TOOLS_MAX_ROUNDS", 3.0, 1.0))
+CONTEXT_TOOLS_MAX_CALLS = int(_env_num("GUARDIAN_CONTEXT_TOOLS_MAX_CALLS", 6.0, 1.0))
+CONTEXT_TOOLS_TIMEOUT = _env_num("GUARDIAN_CONTEXT_TOOLS_TIMEOUT", 90.0, 1.0)
+CONTEXT_TOOLS_FOLD_TIMEOUT = _env_num("GUARDIAN_CONTEXT_TOOLS_FOLD_TIMEOUT", 60.0, 1.0)
+CONTEXT_TOOLS_MAX_FOLDS = int(_env_num("GUARDIAN_CONTEXT_TOOLS_MAX_FOLDS", 4.0, 1.0))
+CONTEXT_TOOLS_PROTECT_TURNS = int(_env_num("GUARDIAN_CONTEXT_TOOLS_PROTECT_TURNS", 2.0, 1.0))
+CONTEXT_FOLDS = cg_context_tools.FoldStore()
 # CACHE_HEALTH: a per-session ledger of what each compaction did to the prefix a provider's
 # prompt cache could reuse, plus the observed cache hit rate when the upstream reports cached
 # tokens. Measures only; runs after the response has been delivered. Off by default.
@@ -663,6 +688,15 @@ _state = {
     # Summaries that did not fit one call at the window and were made in pieces
     # (summarize_in_pieces); the summary_chunked event carries the call count.
     "summaries_chunked": 0,
+    # GUARDIAN_CONTEXT_TOOLS: proxy-tool calls the model made (rejected ones too), folds applied to a
+    # request, folds dropped (history edited, summariser failed, not smaller, superseded by compaction),
+    # tool loops run and loops discarded to the normal path.
+    "context_tool_calls": 0,
+    "context_tool_rejected": 0,
+    "context_folds_applied": 0,
+    "context_folds_dropped": 0,
+    "context_loops": 0,
+    "context_loops_discarded": 0,
     # GUARDIAN_EMPTY_RETRY: turns the upstream finished empty and re-asked (one retry each),
     # the retries that produced an answer, and failures of the feature itself (the
     # client got the upstream's own answer in those).
@@ -2573,7 +2607,8 @@ def _settle_later(hashes: tuple, fut: "asyncio.Future") -> None:
         settle()
 
 
-def _apply_memo(result: Dict[str, Any], to_summarize: List[Dict[str, Any]]):
+def _apply_memo(result: Dict[str, Any], to_summarize: List[Dict[str, Any]],
+                extra: Optional[Dict[str, Any]] = None):
     """Archive and point for a summary from _memo_summary, then remember it.
     Returns (span_path, pointer). Never raises past the span write, which
     already fails open by itself."""
@@ -2582,10 +2617,10 @@ def _apply_memo(result: Dict[str, Any], to_summarize: List[Dict[str, Any]]):
         span_path, pointer = entry["span"], entry["pointer"]
     elif source == "extended":
         prev = Path(entry["span"]).name if entry.get("span") else None
-        span_path = write_span(result["new"], summary, _state["spans_written"] + 1, continues=prev)
+        span_path = write_span(result["new"], summary, _state["spans_written"] + 1, continues=prev, extra=extra)
         pointer = _span_pointer(to_summarize, span_path, chained=True)
     else:
-        span_path = write_span(to_summarize, summary, _state["spans_written"] + 1)
+        span_path = write_span(to_summarize, summary, _state["spans_written"] + 1, extra=extra)
         pointer = _span_pointer(to_summarize, span_path)
     _state["summaries_" + source] += 1
     if result["hashes"] is not None:
@@ -3728,6 +3763,8 @@ async def stats():
                  "last_tool_tokens is the part compaction cannot touch."),
         # Where the latest request's window went, in estimated tokens (cg_breakdown).
         "breakdown": dict(_breakdown),
+        "context_tools": {"enabled": CONTEXT_TOOLS, "sessions_with_folds": CONTEXT_FOLDS.sessions(),
+                          "live_folds": CONTEXT_FOLDS.total()},
         "cache_health": cache_health_stats(),
     })
 
@@ -4418,6 +4455,229 @@ async def maybe_compact_anthropic(client: httpx.AsyncClient, payload: Dict[str, 
     return out
 
 
+def _context_tools_eligible(payload: Dict[str, Any]) -> bool:
+    """May the four tools be offered on this request at all? Never when the client forces a tool or
+    a response format, asks for several choices, or already defines a tool in the proxy's namespace."""
+    if not CONTEXT_TOOLS or DRY_RUN or not isinstance(payload, dict):
+        return False
+    msgs = payload.get("messages")
+    if not isinstance(msgs, list) or not msgs or not all(isinstance(m, dict) for m in msgs):
+        return False
+    if payload.get("tool_choice") not in (None, "auto") or payload.get("response_format") is not None:
+        return False
+    if payload.get("n") not in (None, 1):
+        return False
+    tools = payload.get("tools")
+    if tools is not None and not isinstance(tools, list):
+        return False
+    return not cg_context_tools.client_tool_collides(tools)
+
+
+def _fold_audit(event: str, **fields: Any) -> None:
+    log_event(dict({"event": event}, **fields))
+
+
+async def _apply_live_folds(client: httpx.AsyncClient, payload: Dict[str, Any],
+                            headers: Optional[Dict[str, str]], session: str, num_ctx: int):
+    """Replace each live fold's turns with ONE standard summary message directly after the system
+    messages. A fold that no longer matches the history the client sent, whose summary cannot be made
+    in time, or that would not be smaller, is dropped (the request goes on without it). Returns
+    (payload, ids of the folds applied)."""
+    live = CONTEXT_FOLDS.live(session)
+    if not live:
+        return payload, []
+    msgs = payload["messages"]
+    ns_idx = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
+    hashes = [cg_archive.message_hash(msgs[i]) for i in ns_idx]
+    prefix = cg_context_tools.chain(hashes)
+    non_system = [msgs[i] for i in ns_idx]
+    turns = cg_context_tools.segment_turns(non_system, cg_archive.message_hash, lambda m: estimate_tokens([m]))
+    protected = cg_context_tools.protected_turns(
+        turns, len(non_system), CONTEXT_TOOLS_PROTECT_TURNS, keep_recent_count(non_system, num_ctx=num_ctx))
+    used_to = -1
+    keep: List[Dict[str, Any]] = []
+    for f in sorted(live, key=lambda f: f["pos"]):
+        end = f["pos"] + len(f["hashes"])
+        why = None
+        if f["pos"] < used_to or not cg_context_tools.locate(f, hashes, prefix):
+            why = "not in the history the client sent"
+        elif end < len(non_system) and non_system[end].get("role") != "user":
+            why = "no longer ends on a turn boundary"
+        elif any(t["n"] in protected and t["start"] < end and t["end"] >= f["pos"] for t in turns):
+            why = "now touches a protected turn (the first, the recent ones or the kept window)"
+        if why is None:
+            keep.append(f)
+            used_to = end
+        else:
+            CONTEXT_FOLDS.drop(session, f["id"])
+            _state["context_folds_dropped"] += 1
+            _fold_audit("context_fold", action="dropped", reason=why, fold=f["id"])
+    applied: List[Dict[str, Any]] = []
+    for f in keep:
+        if f["summary"] is None:
+            folded = [msgs[ns_idx[k]] for k in range(f["pos"], f["pos"] + len(f["hashes"]))]
+            budget_token = _summary_budget.set(summary_input_budget(num_ctx))
+            try:
+                memo = await asyncio.wait_for(
+                    _memo_summary(folded, lambda ms: summarize_older_messages(client, payload.get("model", ""), ms, headers)),
+                    timeout=CONTEXT_TOOLS_FOLD_TIMEOUT)
+            except Exception as exc:                       # noqa: BLE001 -- includes the deadline
+                memo = {"summary": None}
+                log.warning("Fold %s: summary failed (%s); the request goes on without it.", f["id"], type(exc).__name__)
+            finally:
+                _summary_budget.reset(budget_token)
+            summary = memo.get("summary")
+            if summary is None or len(summary.strip()) < MIN_SUMMARY_CHARS:
+                CONTEXT_FOLDS.drop(session, f["id"])
+                _state["context_folds_dropped"] += 1
+                _fold_audit("context_fold", action="dropped", reason="summary failed", fold=f["id"])
+                continue
+            span_path, pointer = _apply_memo(memo, folded, extra={"fold": f["id"], "model_requested": True})
+            body = "[fold %s: turns T%d-T%d, which came after the first turn shown below] %s" % (
+                f["id"], f["turns"][0], f["turns"][1], _without_must_keep(summary))
+            if estimate_tokens([{"role": "user", "content": body + pointer}]) >= f["tokens"]:
+                CONTEXT_FOLDS.drop(session, f["id"])
+                _state["context_folds_dropped"] += 1
+                _fold_audit("context_fold", action="dropped", reason="summary not smaller", fold=f["id"])
+                continue
+            f.update(summary=body, span=span_path, pointer=pointer,
+                     pins=build_pins(folded, memo.get("must_keep") or []))
+            _fold_audit("context_fold", action="applied", fold=f["id"], turns=list(f["turns"]),
+                        span=Path(span_path).name if span_path else None)
+        applied.append(f)
+    if not applied:
+        return payload, []
+    drop_idx = {ns_idx[k] for f in applied for k in range(f["pos"], f["pos"] + len(f["hashes"]))}
+    folded_all = [msgs[i] for i in sorted(drop_idx)]
+    pins = []
+    for f in applied:
+        for fact in f["pins"]:
+            if fact not in pins:
+                pins.append(fact)
+    note = _summary_message(folded_all, "\n\n".join(f["summary"] for f in applied),
+                            "".join(f["pointer"] for f in applied), _pins_block(pins))
+    out_msgs: List[Dict[str, Any]] = []
+    at = 0
+    while at < len(msgs) and msgs[at].get("role") == "system":
+        out_msgs.append(msgs[at])
+        at += 1
+    out_msgs.append(note)
+    out_msgs += [m for i, m in enumerate(msgs) if i >= at and i not in drop_idx]
+    _state["context_folds_applied"] += len(applied)
+    new_payload = dict(payload)
+    new_payload["messages"] = out_msgs
+    return new_payload, [f["id"] for f in applied]
+
+
+async def context_tools_prepare(client: httpx.AsyncClient, payload: Dict[str, Any],
+                                headers: Optional[Dict[str, str]], session: str):
+    """The request to forward and, when the tools are to be offered, the context they run in.
+    Above the compaction threshold ordinary compaction owns the history: live folds are dropped and
+    nothing is offered."""
+    msgs = payload["messages"]
+    model = str(payload.get("model") or "")
+    num_ctx = await context_window(client, model, headers)
+    threshold = effective_threshold(num_ctx=num_ctx)
+    factor = CALIBRATOR.factor(model) if calibration_enabled() else 1.0
+    unfolded = int((estimate_tokens(msgs) + estimate_tool_tokens(payload)) * factor)
+    if unfolded >= threshold:
+        n = CONTEXT_FOLDS.clear(session)
+        if n:
+            _state["context_folds_dropped"] += n
+            _fold_audit("context_fold", action="superseded", reason="compaction threshold reached", count=n)
+        return await rewrite_chat_payload(client, payload, headers), None
+    payload1, applied = await _apply_live_folds(client, payload, headers, session, num_ctx)
+    forwarded = await rewrite_chat_payload(client, payload1, headers)
+    if applied and sum(1 for m in forwarded.get("messages") or [] if isinstance(m, dict) and is_guardian_summary(m)) > 1:
+        # An exact upstream count put the folded request over the threshold after all: ordinary compaction
+        # has run on top of the fold message. Folds never coexist with it: drop them and redo it unfolded.
+        n = CONTEXT_FOLDS.clear(session)
+        _state["context_folds_dropped"] += n
+        _fold_audit("context_fold", action="superseded", reason="compaction ran on a folded request", count=n)
+        return await rewrite_chat_payload(client, payload, headers), None
+    if unfolded < threshold * CONTEXT_TOOLS_MIN_PCT / 100.0:
+        return forwarded, None
+    non_system = [m for m in msgs if m.get("role") != "system"]
+    fmsgs = forwarded.get("messages") or []
+    ctx = cg_context_tools.Context(
+        session=session, store=CONTEXT_FOLDS, non_system=non_system,
+        forwarded_hashes={cg_archive.message_hash(m) for m in fmsgs if isinstance(m, dict)},
+        hash_of=cg_archive.message_hash, tokens_of=lambda m: estimate_tokens([m]),
+        protect_turns=CONTEXT_TOOLS_PROTECT_TURNS, keep_messages=keep_recent_count(non_system, num_ctx=num_ctx),
+        max_folds=CONTEXT_TOOLS_MAX_FOLDS, used_tokens=estimate_tokens(fmsgs) + estimate_tool_tokens(forwarded),
+        window=num_ctx, budget=threshold, forwarded_messages=fmsgs, applied=applied)
+    return forwarded, ctx
+
+
+async def context_tools_loop(client: httpx.AsyncClient, forwarded: Dict[str, Any], headers: Dict[str, str],
+                             ctx: "cg_context_tools.Context", url: str, params: Dict[str, str]):
+    """Run the model's proxy-tool calls. Returns the Response for the client, or None when the loop
+    must be discarded (the caller then sends `forwarded` the normal way). Commits folds only when it
+    returns a Response. Every proxy-tool call is audited, committed or not."""
+    _state["context_loops"] += 1
+    committed = False
+    try:
+        out = await _context_tools_rounds(client, forwarded, headers, ctx, url, params)
+        committed = out is not None
+        return out
+    finally:
+        if not committed:
+            _state["context_loops_discarded"] += 1
+        for ev in ctx.events:
+            _state["context_tool_calls"] += 1
+            if not ev.get("ok"):
+                _state["context_tool_rejected"] += 1
+            _fold_audit("context_tool", **dict(ev, outcome="committed" if committed else "discarded"))
+
+
+async def _context_tools_rounds(client, forwarded, headers, ctx, url, params):
+    wants_stream = forwarded.get("stream") is True
+    include_usage = bool((forwarded.get("stream_options") or {}).get("include_usage")) if isinstance(forwarded.get("stream_options"), dict) else False
+    req = dict(forwarded)
+    req["stream"] = False
+    req.pop("stream_options", None)
+    req["tools"] = list(forwarded.get("tools") or []) + cg_context_tools.tool_definitions()
+    hdrs = {k: v for k, v in headers.items() if k.lower() not in ("accept-encoding", "content-length")}
+    base_msgs = list(forwarded["messages"])
+    extra: List[Dict[str, Any]] = []
+    rounds, calls, spent = 0, 0, 0.0
+    while True:
+        body = dict(req, messages=base_msgs + extra)
+        started = time.monotonic()
+        resp = await client.send(client.build_request("POST", url, content=json.dumps(body).encode("utf-8"),
+                                                      headers=hdrs, params=params))
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict) \
+                or not isinstance(choices[0].get("message"), dict):
+            return None
+        message = choices[0]["message"]
+        tool_calls = message.get("tool_calls") or []
+        mine = [c for c in tool_calls if isinstance(c, dict) and cg_context_tools.is_proxy_tool((c.get("function") or {}).get("name"))]
+        if not mine:
+            # The final answer round is never counted against the loop's time budget.
+            if ctx.pending or ctx.cancels:
+                CONTEXT_FOLDS.commit(ctx.session, ctx.pending, ctx.cancels)
+            if wants_stream:
+                return Response(content=cg_context_tools.sse_from_completion(data, include_usage),
+                                media_type="text/event-stream")
+            return JSONResponse(content=data)
+        rounds += 1
+        calls += len(mine)
+        if len(mine) != len(tool_calls) or rounds > CONTEXT_TOOLS_MAX_ROUNDS or calls > CONTEXT_TOOLS_MAX_CALLS:
+            return None
+        results = []
+        for c in mine:
+            fn = c.get("function") or {}
+            ok, text = ctx.call(fn.get("name"), fn.get("arguments"))
+            results.append({"role": "tool", "tool_call_id": c.get("id") or "", "content": text})
+        spent += time.monotonic() - started                  # this round: upstream time plus tool execution
+        if spent > CONTEXT_TOOLS_TIMEOUT:
+            return None
+        extra.append({"role": "assistant", "content": message.get("content"), "tool_calls": tool_calls})
+        extra += results
 def _empty_retry_event(outcome: str, route: str) -> None:
     """Count and log one empty-turn retry outcome ("retry", "recovered", "error")."""
     key = {"retry": "empty_retries", "recovered": "empty_retry_recovered",
@@ -4554,13 +4814,29 @@ async def proxy(path: str, request: Request):
             # FAIL-OPEN for the whole rewrite step. Whatever raises in here --
             # a bug in compaction, a dry run, an injected field -- costs the
             # rewrite, never the request: it goes upstream as the client sent it.
+            tools_ctx = None
+            tools_path = False
             try:
-                rewritten = await rewrite_chat_payload(client, payload, headers)
+                try:
+                    tools_path = bool(usage_sid) and _context_tools_eligible(payload)
+                except Exception:                          # noqa: BLE001 -- junk in the request: the flag-off path
+                    tools_path = False
+                if tools_path:
+                    rewritten, tools_ctx = await context_tools_prepare(client, payload, headers, usage_sid)
+                else:
+                    rewritten = await rewrite_chat_payload(client, payload, headers)
             except Exception as exc:                       # noqa: BLE001
                 log.error("Rewriting the request failed (%s: %s). Forwarding "
                           "it unchanged.", type(exc).__name__, exc)
+                tools_ctx = None
                 rewritten = payload
                 _usage_snap.set(None)
+                if tools_path:                             # the feature failed: take the path the flag-off proxy takes
+                    try:
+                        rewritten = await rewrite_chat_payload(client, payload, headers)
+                    except Exception:                      # noqa: BLE001
+                        rewritten = payload
+                        _usage_snap.set(None)
             try:
                 if usage_sid:
                     record_usage(usage_sid, window_model)
@@ -4575,6 +4851,16 @@ async def proxy(path: str, request: Request):
             if EMPTY_RETRY and not DRY_RUN and payload.get("n") in (None, 1):
                 retry_for = ("chat", payload)
             note_breakdown(payload)
+            if tools_ctx is not None:
+                try:
+                    done = await context_tools_loop(client, payload, headers, tools_ctx,
+                                                    f"{UPSTREAM_URL}/{path}", dict(request.query_params))
+                except Exception as exc:                   # noqa: BLE001
+                    log.error("Context tools failed (%s: %s). Sending the request the normal way.",
+                              type(exc).__name__, exc)
+                    done = None                            # the loop's own finally already counted the discard
+                if done is not None:
+                    return done
             # Grabbed HERE, immediately after the estimate was recorded and
             # before anything else can touch _state. Only chat/completions
             # gets a usage block back; every other route keeps the raw stream

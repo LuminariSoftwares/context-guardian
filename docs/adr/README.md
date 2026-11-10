@@ -13,6 +13,7 @@ Short records of the choices already in the code, written after the fact from th
 | [0006](0006-stdlib-read-only-mcp-server.md) | MCP server: stdlib only, hand-written JSON-RPC, read-only tools | accepted (0.10.0) |
 | [0007](0007-seal-the-archive-with-a-hash-chain.md) | Seal the archive with a hash chain; tamper-evident, anchored outside | accepted (0.12.0) |
 | [0008](0008-cache-health-ledger.md) | Cache-health ledger: measure what compaction does to the reusable prefix; do not change compaction | proposed (this change) |
+| [0009](0009-model-driven-context-tools.md) | Model-driven context tools: the model proposes a fold, the proxy validates it and does the summarising | proposed (this change) |
 | [0010](0010-launcher.md) | Launcher: point one client at the proxy for one process; start and stop the proxy only if it started it | proposed (this change) |
 
 Add a record when a change makes one of these false, or makes a new choice a reviewer would ask "why?" about.

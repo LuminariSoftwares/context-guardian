@@ -16,6 +16,7 @@
 !cg_mask.py
 !cg_recall_index.py
 !cg_breakdown.py
+!cg_context_tools.py
 !cg_launch.py
 !cg_cache_health.py
 !cg_empty_retry.py
