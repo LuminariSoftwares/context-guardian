@@ -159,7 +159,7 @@ Context Guardian savings (last 7d)
 
 ## Point your client at the proxy
 
-The proxy compacts OpenAI-style `POST /v1/chat/completions` requests. Every client below is configured from its own documented settings; none of these four has been tested against the proxy yet, so please open an issue with what you see.
+The proxy compacts OpenAI-style `POST /v1/chat/completions` requests. Every client below is configured from its own documented settings. Claude Code, aider, OpenCode and Continue also have PASS rows in [Works with](#works-with) (2026-10-31); Cline is untested. To skip the setup for one run, see [Launch a client](#launch-a-client-for-one-process).
 
 | client | where | what to set |
 |---|---|---|
@@ -186,6 +186,29 @@ Then search Claude Code's history like any other run: `context-guardian-recall "
 After a compaction, the `SessionStart` hook (matcher `compact`, so it does not fire on startup, resume or clear) prints a short block of plain facts from the archived spans as the hook's `additionalContext`: the goal, the latest decisions, the files edited, the errors still open and a line naming `context-guardian-recall "<term>"`. The block is built by `cg_resume.py`, is capped at 8000 characters, and is left out when the session has no archived spans. It only reads the archive; `SessionStart` never archives, and any failure is logged and prints nothing. The matcher is `compact` only because Claude Code replays saved context on resume and runs `SessionStart` again then. Re-run `install --apply` to add the third hook to an existing install.
 
 Limits: Claude Code documents its transcript lines as internal and liable to change between versions, so lines are archived verbatim and only read for their text. The adapter does not change what Claude Code keeps in its own window; it keeps a sealed, searchable copy of what was said.
+
+## Launch a client for one process
+
+`context-guardian launch <client>` starts the proxy if it is not running, sets the client's base-URL variable **for that one process**, runs the client, and stops the proxy again if (and only if) it started it. It changes no file you own: nothing goes into your shell profile or the client's settings. The client's exit code is returned.
+
+```bash
+context-guardian launch claude-code -- --resume       # arguments after -- go to the client
+context-guardian launch aider -- --model openai/<model>
+context-guardian launch continue --model <model>      # cn with a temporary config, removed at the end
+context-guardian launch openai -- some-openai-cli     # any CLI that reads OPENAI_BASE_URL or OPENAI_API_BASE
+context-guardian launch --list                        # what each client sets and what has been tested
+```
+
+| client | what it sets for the one process | tested |
+|---|---|---|
+| `claude-code` | `ANTHROPIC_BASE_URL` (the proxy's upstream must serve the Anthropic Messages API) | the variable passed the [Works with](#works-with) row; the launcher itself was run against Claude Code 2.1.322 on 2026-11-10 (Linux), see below |
+| `openclaude` | `CLAUDE_CODE_USE_OPENAI=1`, `OPENAI_BASE_URL`, `OPENAI_API_KEY=local` if you have none | untested |
+| `aider` | `OPENAI_API_BASE`, `OPENAI_API_KEY=local` if you have none | untested (the matrix passed with `--openai-api-base`) |
+| `continue` (`cn`) | `cn --config <temporary file>`; this replaces your own Continue config for that run | untested |
+| `openai` | `OPENAI_BASE_URL` and `OPENAI_API_BASE` | untested |
+| `opencode`, `cline`, `cursor` | needs a setting in the client itself: the exact steps are printed and nothing is changed | steps only |
+
+The port comes from `--port`, then `GUARDIAN_PORT` in the environment or the `.env` in the data directory, then 8786; the client is always given `127.0.0.1`. A proxy already answering there is used and left running; a port held by something else gets a free one. If the proxy will not start, the client is **not** started (running it without the proxy would send Claude Code to the vendor's API instead of your backend): the last lines of the proxy's output and the command to run the client directly are printed, and `--direct-if-proxy-fails` opts in to running it anyway. The proxy runs in its own process group, so pressing Ctrl-C in the client to cancel a turn does not stop it; killing the launcher with `SIGKILL` cannot be caught and leaves an idle loopback proxy running. In the DSH bundle: `npm run launch -- <client>` (on Windows `node launch.mjs <client>`; not tested on Windows).
 
 ## Show real usage in your client
 
@@ -377,6 +400,7 @@ sequenceDiagram
 | MCP server | `cg_mcp.py` | `context-guardian-mcp`: seven read-only tools over the proxy's stats, the archive and Claude Code's context fullness |
 | Claude Code adapter | `cg_claude_code.py` | `context-guardian-claude-code`: capture, install, uninstall, status |
 | setup tools | `cg_configure.py`, `cg_doctor.py`, `setup.mjs` | write a `.env`, check an install, add the DSH preset row |
+| launcher | `cg_launch.py`, `launch.mjs` | `context-guardian launch <client>`: start the proxy if needed, run one client pointed at it, stop what it started |
 
 ### Design decisions
 

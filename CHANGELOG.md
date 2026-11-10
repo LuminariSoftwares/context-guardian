@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased
+
+- **`context-guardian launch <client>`.** Starts the proxy if it is not running, sets the client's base-URL variable for that one process, runs the client, and stops the proxy it started when the client exits. Writes no file you own; a client that needs a setting in its own config (OpenCode, Cline, Cursor) gets the exact steps printed and nothing changed. Clients: `claude-code`, `openclaude`, `aider`, `continue`, `openai` (any CLI that reads `OPENAI_BASE_URL`/`OPENAI_API_BASE`), each marked tested or untested as the Compatibility table does; `--list` prints them. The proxy runs in its own process group so Ctrl-C in the client does not stop it; if it will not start the client is not started (`--direct-if-proxy-fails` opts out). New `cg_launch.py`, `launch.mjs` and `npm run launch` for the DSH bundle. README: the "none of these four has been tested" sentence now points at the Works-with rows. Idea inspired by public descriptions of ranxianglei/billion-context (MIT); implemented independently.
 ## dsh-context-guardian 0.4.0-beta.1 / PyPI context-guardian 0.15.0 (2026-11-04)
 
 - **Packaging (P141 S10).** The wheel, the Docker image and the npm bundle now ship `cg_resume.py`, `cg_mask.py`, `cg_recall_index.py` and `cg_breakdown.py` (the proxy and the recall CLI import them).
