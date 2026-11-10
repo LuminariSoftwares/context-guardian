@@ -408,6 +408,7 @@ def test_a_second_ctrl_c_during_cleanup_still_ends_in_a_kill():
     assert killed
 
 
+@posix_only
 def test_a_signal_before_the_client_starts_stops_the_wait(tmp_path, monkeypatch):
     started = []
     real = L.start_proxy
@@ -465,20 +466,22 @@ def test_port_resolution_reads_the_given_environment(tmp_path):
 
 @posix_only
 def test_sigterm_while_the_proxy_is_being_stopped_changes_nothing(tmp_path, monkeypatch):
-    import threading
     slow = str(ROOT / "tests" / "fixtures" / "slow_proxy.py")
     monkeypatch.setattr(L, "proxy_command", lambda: [sys.executable, slow])
     started = []
     real = L.start_proxy
     monkeypatch.setattr(L, "start_proxy", lambda p, e: (lambda r: (started.append(r[0]), r)[1])(real(p, e)))
+    real_stop = L.stop_proxy
+
+    def stop_with_a_signal(proc):
+        os.kill(os.getpid(), signal.SIGTERM)                          # a SIGTERM that lands during cleanup, not on a timer
+        real_stop(proc)
+    monkeypatch.setattr(L, "stop_proxy", stop_with_a_signal)
     port = L.free_port()
     out = tmp_path / "o.json"
-    timer = threading.Timer(1.5, lambda: os.kill(os.getpid(), signal.SIGTERM))   # lands inside the 3 s stop wait
-    timer.start()
     try:
         code = run(tmp_path, ["claude-code", "--port", str(port), "--bin", FAKE, "--quiet", "--", str(out), "7"])
     finally:
-        timer.cancel()
         for p in started:
             if p.poll() is None:
                 p.kill()
