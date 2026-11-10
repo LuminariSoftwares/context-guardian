@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased
+
+- **Model-driven context tools (`GUARDIAN_CONTEXT_TOOLS`, off by default).** On `/v1/chat/completions` the proxy can offer the model four tools (`guardian_context_status`, `guardian_search_context`, `guardian_compress`, `guardian_decompress`). The model proposes a range of turns; the proxy validates it and its own fenced summariser writes the summary into the standard summary message on the next request, with the originals archived as a sealed span marked `fold` / `model_requested`. The model writes no text that enters the history, and its tool calls and results never reach the client. Folds are dropped when the history reaches the compaction threshold (ordinary compaction takes over), when the client edits its history, or when the summary would not be smaller. Any failure sends the request the way it goes with the flag off. The answer is not streamed token by token while the tools are offered. Not covered: `/v1/messages`. New module `cg_context_tools.py`. Idea inspired by public descriptions of ranxianglei/billion-context (MIT); implemented independently.
 ## dsh-context-guardian 0.4.0-beta.1 / PyPI context-guardian 0.15.0 (2026-11-04)
 
 - **Packaging (P141 S10).** The wheel, the Docker image and the npm bundle now ship `cg_resume.py`, `cg_mask.py`, `cg_recall_index.py` and `cg_breakdown.py` (the proxy and the recall CLI import them).
