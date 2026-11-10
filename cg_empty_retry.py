@@ -35,18 +35,29 @@ ECHO_HOLD_MAX = 64 * 1024
 _SEP = re.compile(rb"\r?\n\r?\n")
 
 
+def _echo_state(text: str) -> str:
+    """How `text` relates to an echo of the injected header: "empty" (nothing), "echo" (the
+    header and nothing after it), "maybe" (still could become one: a prefix of the header, or
+    a header whose closing bracket has not arrived), or "other" (anything else, including a
+    header followed by real words: that is an answer, not a parrot)."""
+    t = text.strip()
+    if t == "":
+        return "empty"
+    if MARKER.startswith(t) and t != MARKER:
+        return "maybe"
+    if t.startswith(MARKER):
+        end = t.find("]")
+        if end == -1:
+            return "echo" if len(t) <= ECHO_HOLD_MAX else "other"
+        return "echo" if t[end + 1:].strip() == "" else "other"
+    return "other"
+
+
 def is_degenerate_text(text: Any) -> bool:
     """No visible text, or text that is nothing but the injected header's echo."""
     if not isinstance(text, str):
         return True
-    t = text.strip()
-    return t == "" or t.startswith(MARKER)
-
-
-def _could_become_echo(text: str) -> bool:
-    """True while `text` is still a prefix of the header (or already starts with it)."""
-    t = text.lstrip()
-    return t == "" or MARKER.startswith(t) or t.startswith(MARKER)
+    return _echo_state(text) in ("empty", "echo")
 
 
 # ---- whole (non-streaming) responses ---------------------------------------------
@@ -67,7 +78,7 @@ def response_is_empty(route: str, data: Any) -> bool:
         msg = c.get("message")
         if not isinstance(msg, dict):
             return False
-        if msg.get("tool_calls") or msg.get("function_call"):
+        if msg.get("tool_calls") or msg.get("function_call") or msg.get("refusal"):
             return False
         content = msg.get("content")
         if isinstance(content, list):
@@ -170,9 +181,10 @@ class StreamScan:
     # -- helpers
     def _text_delta(self, piece: str) -> str:
         self.text += piece
-        if self.text.strip() == "":
+        state = _echo_state(self.text)
+        if state in ("empty", "maybe"):
             return "hold"
-        if _could_become_echo(self.text) and len(self.text) <= ECHO_HOLD_MAX:
+        if state == "echo" and len(self.text) <= ECHO_HOLD_MAX:
             return "hold"
         self.visible = True
         return "release"
@@ -278,7 +290,7 @@ class StreamScan:
         done = _DONE_OPENAI if self.route == "chat" else _DONE_ANTHROPIC
         if not self.finished or self.visible or self.broken or self.finish not in done:
             return False
-        return self.text.strip() == "" or self.text.lstrip().startswith(MARKER)
+        return _echo_state(self.text) in ("empty", "echo")
 
 
 async def frames_of(chunks: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
@@ -297,13 +309,24 @@ async def frames_of(chunks: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
         yield buf
 
 
+def _is_role_only(frame: bytes) -> bool:
+    _, _, obj = _parse_frame(frame)
+    try:
+        choice = obj["choices"][0]
+        delta = choice["delta"]
+        return (choice.get("finish_reason") is None and "role" in delta
+                and set(delta) <= {"role", "content"} and not delta.get("content"))
+    except (TypeError, KeyError, IndexError):
+        return False
+
+
 def _shift_block_index(frame: bytes, offset: int) -> bytes:
     """An Anthropic frame with its content-block index moved by `offset`."""
     event, _, obj = _parse_frame(frame)
     if offset and isinstance(obj, dict) and isinstance(obj.get("index"), int) and str(obj.get("type", "")).startswith("content_block"):
         obj["index"] += offset
         head = ("event: %s\n" % event) if event else ""
-        return (head + "data: " + json.dumps(obj) + "\n\n").encode("utf-8")
+        return (head + "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode("utf-8")
     return frame
 
 
@@ -396,6 +419,8 @@ async def _read_retry(route: str, start_retry, offset: int) -> Optional[List[byt
         out: List[bytes] = []
         async for frame in frames_of(stream):
             scan.classify(frame)
+            if route == "chat" and _is_role_only(frame):
+                continue                  # the client already has this turn's role frame
             if route == "messages":
                 event, _, obj = _parse_frame(frame)
                 kind = (obj or {}).get("type") if isinstance(obj, dict) else event

@@ -4278,7 +4278,7 @@ async def _empty_retry_body(client: httpx.AsyncClient, route: str, payload: Dict
     """The response body the client reads, for a request that has the retry on. Any
     failure of the feature yields the upstream's own bytes."""
     content_type = upstream_resp.headers.get("content-type", "").lower()
-    if "text/event-stream" in content_type:
+    if "text/event-stream" in content_type or payload.get("stream") is True:
         async def start_retry():
             resp = await _send_nudged(client, route, payload, method, url, headers, params)
             if resp is None:
@@ -4300,7 +4300,11 @@ async def _empty_retry_body(client: httpx.AsyncClient, route: str, payload: Dict
     body = await upstream_resp.aread()
     out = body
     try:
-        if cg_empty_retry.response_is_empty(route, json.loads(body)):
+        try:
+            parsed = json.loads(body)
+        except ValueError:
+            parsed = None                                   # not JSON: not ours to judge
+        if parsed is not None and cg_empty_retry.response_is_empty(route, parsed):
             _empty_retry_event("retry", route)
             resp = await _send_nudged(client, route, payload, method, url, headers, params)
             if resp is not None:

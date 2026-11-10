@@ -15,6 +15,7 @@
 - Set `GUARDIAN_NUM_CTX` to the model's real context window in tokens; it is the one setting that matters per person.
 - Set `GUARDIAN_UPSTREAM_URL` to the OpenAI-compatible backend (default `http://localhost:11434/v1`).
 - `context-guardian-configure` asks for these and writes `.env`. Try `GUARDIAN_DRY_RUN=1` first: it logs what it would do and forwards every request unchanged.
+- `GUARDIAN_EMPTY_RETRY=1` (off by default): when the backend ends a turn with nothing in it, ask once more with a short nudge and return the retry's answer (details in the README config table).
 - Every setting, with defaults: [README.md#configure](README.md#configure). Where files live and how to delete them: [README.md#what-is-stored-where-and-how-to-delete-it](README.md#what-is-stored-where-and-how-to-delete-it).
 
 ## Recall

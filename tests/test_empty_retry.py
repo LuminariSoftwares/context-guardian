@@ -201,7 +201,7 @@ def test_empty_turn_is_retried_once_and_spliced(on):
 def test_a_good_turn_is_forwarded_byte_for_byte(on):
     seen = wire_seq(on, [chat_json(GOOD)])
     r = post(on, req())
-    assert r.content == json.dumps(chat_json(GOOD)).encode() or r.json() == chat_json(GOOD)
+    assert r.content == json.dumps(chat_json(GOOD)).encode()
     assert len(seen) == 1
 
 
@@ -507,3 +507,95 @@ def test_anthropic_stream_both_empty_returns_original(on):
 def test_marker_matches_the_one_the_proxy_injects(on):
     import cg_empty_retry as e
     assert e.MARKER == on.GUARDIAN_SUMMARY_MARKER
+
+
+# ---- review round 1 (reviewer findings turned into tests) ------------------------------
+
+def test_refusal_is_an_answer_not_an_empty_turn(on):
+    refusal = chat_json(None)
+    refusal["choices"][0]["message"]["refusal"] = "I can't help with that"
+    seen = wire_seq(on, [refusal, chat_json(GOOD)])
+    r = post(on, req())
+    assert len(seen) == 1 and r.json() == refusal
+
+
+def test_header_echo_followed_by_an_answer_is_an_answer(on):
+    said = MARKER + " — earlier conversation (2 messages) condensed:]\n\nThe answer is 42."
+    seen = wire_seq(on, [chat_json(said), chat_json(GOOD)])
+    r = post(on, req())
+    assert len(seen) == 1 and r.json()["choices"][0]["message"]["content"] == said
+    raw = stream_of(MARKER + " — earlier ", "conversation condensed:]", "\n\nThe answer ", "is 42.")
+    seen = wire_seq(on, [raw, stream_of(GOOD)])
+    r = post(on, req(stream=True))
+    assert len(seen) == 1 and r.content == raw
+
+
+def test_stream_retry_drops_the_duplicate_role_frame(on):
+    wire_seq(on, [stream_of(), stream_of(GOOD)])
+    text = post(on, req(stream=True)).content.decode()
+    assert text.count('"role"') == 1
+
+
+def test_sse_with_an_odd_content_type_still_streams_and_is_not_an_error(on):
+    raw = stream_of("hello")
+    seen = wire_seq(on, [R(200, raw, "text/plain")])
+    r = post(on, req(stream=True))
+    assert r.content == raw and len(seen) == 1
+    assert on._state["empty_retry_errors"] == 0
+
+
+def test_a_plain_non_json_body_is_not_counted_as_an_error(on):
+    wire_seq(on, [R(200, b"plain words")])
+    post(on, req())
+    assert on._state["empty_retry_errors"] == 0
+
+
+def test_degenerate_stream_split_mid_separator_and_with_crlf(on):
+    raw = stream_of().replace(b"\n\n", b"\r\n\r\n")
+    cut = raw.index(b"\r\n\r\n") + 2            # inside the first separator
+
+    async def pieces():
+        yield raw[:cut]
+        yield raw[cut:]
+
+    state = {"n": 0}
+
+    def handler(request):
+        if not request.url.path.endswith("/chat/completions"):
+            return httpx.Response(404, json={"error": "x"})
+        state["n"] += 1
+        if state["n"] == 1:
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=pieces())
+        return R(200, stream_of(GOOD), "text/event-stream").make()
+    on._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    r = post(on, req(stream=True))
+    assert state["n"] == 2 and GOOD in r.content.decode()
+
+
+def test_anthropic_failure_injections_return_the_original(on, monkeypatch):
+    import cg_empty_retry as e
+    empty = a_msg([{"type": "text", "text": ""}])
+    # retry upstream error
+    seen = wire_seq(on, [empty, R(500, b'{"error": "x"}')])
+    r = post(on, a_req(), "/v1/messages")
+    assert r.json() == empty and len(seen) == 2
+    # nudge builder bug, plain and streaming
+    monkeypatch.setattr(e, "nudged_payload", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("injected")))
+    seen = wire_seq(on, [empty, a_msg([{"type": "text", "text": GOOD}])])
+    assert post(on, a_req(), "/v1/messages").json() == empty and len(seen) == 1
+    raw = a_stream(text="")
+    seen = wire_seq(on, [raw, a_stream(text=GOOD)])
+    assert post(on, a_req(stream=True), "/v1/messages").content == raw and len(seen) == 1
+    monkeypatch.undo()
+    # scanner bug
+    monkeypatch.setattr(e.StreamScan, "classify", lambda self, frame: (_ for _ in ()).throw(RuntimeError("injected")))
+    seen = wire_seq(on, [raw, a_stream(text=GOOD)])
+    assert post(on, a_req(stream=True), "/v1/messages").content == raw and len(seen) == 1
+    monkeypatch.undo()
+
+
+def test_anthropic_nudge_is_never_replayed(on):
+    seen = wire_seq(on, [a_msg([{"type": "text", "text": ""}]), a_msg([{"type": "text", "text": GOOD}]), a_msg([{"type": "text", "text": GOOD}])])
+    post(on, a_req(), "/v1/messages")
+    post(on, a_req(), "/v1/messages")
+    assert seen[2] == a_req() and on.EMPTY_RETRY_NUDGE.encode() not in seen[2]
