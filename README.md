@@ -692,6 +692,8 @@ cp .env.example .env
 | `GUARDIAN_VERSION_CACHE` | `<data dir>/logs/.version_check_cache.json` | Where the update check caches PyPI's answer so frequent restarts don't re-hit the network (24h TTL) |
 | `GUARDIAN_DRY_RUN` | `0` | `1`: compute every compaction (the summariser is still called) and log it as a `dry_run` event with the same fields as a real one, but forward the client's request byte-for-byte. Counted on the health dashboard. For watching what the proxy would do before letting it |
 | `GUARDIAN_INJECT_STREAM_OPTIONS` | `0` | `1`: add `stream_options: {"include_usage": true}` to streaming chat requests that do not already carry `stream_options`, so the usage frame reaches the calibrator. Off by default because the client then receives one extra final frame with empty `choices`, which some clients do not expect |
+| `GUARDIAN_EMPTY_RETRY` | `0` | `1`: when the upstream finishes a turn with nothing visible in it (an empty message, a reasoning block and no answer, or only an echo of the `[Context Guardian auto-compaction` header the proxy injects), ask once more and give the client the retry's answer. The retry is the same forwarded request with one short user message appended (`GUARDIAN_EMPTY_RETRY_NUDGE`); that message exists only in the retry request, is never stored and never reaches the client. At most one retry per turn, on `/v1/chat/completions` and `/v1/messages`, streaming and not. A turn that ended for any other reason (`length`, a tool call, a filter) is not retried. If the retry fails or is empty too, the client gets the upstream's own answer, byte for byte. Off in `GUARDIAN_DRY_RUN`. Counted as `empty_retries`, `empty_retry_recovered` and `empty_retry_errors` in `/guardian/stats` |
+| `GUARDIAN_EMPTY_RETRY_NUDGE` | a short built-in sentence | The text of that one appended user message |
 
 **A note on timeouts:** local "thinking"/reasoning models can go silent for a long time before their first output token. If you see `500` errors appear only on real (non-trivial) requests after a long pause, raise `GUARDIAN_UPSTREAM_TIMEOUT` before assuming something is broken — the default 5-second timeout most HTTP clients ship with is sized for ordinary REST APIs, not local LLM inference, which is exactly the bug this project's own commit history caught during development.
 
@@ -923,6 +925,8 @@ Context Guardian stands on other people's ideas, and says so:
 - **[VCC](https://github.com/lllyasviel/VCC)** (lllyasviel) — the conversation-compiler principle that compiler ports: compile the log into a compact view made only of original tokens, with a pointer back to every elided part.
 - **[dsh-openwolf](https://github.com/hawk2048/dsh-openwolf)** (MIT) — the idea of snapshotting session state right before a compaction. The engine's `precompact-<seq>.json` and the `FILES WRITTEN` list are an independent implementation of that idea; no openwolf code is included.
 - **[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)** — `summarize()` is the hook its compaction engine documents for exactly this.
+
+Several features were inspired by public descriptions of ranxianglei/billion-context (MIT); implemented independently.
 
 Full third-party notices: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
