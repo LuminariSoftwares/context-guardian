@@ -292,7 +292,7 @@ def test_a_proposed_fold_is_applied_on_the_next_request_and_never_leaks(g):
     assert model.summaries == 1
     assert "MARK-U3" not in texts(nxt) and "MARK-U2" not in texts(nxt) and "MARK-A4" not in texts(nxt)
     assert "MARK-U5" in texts(nxt) and "MARK-U1" in texts(nxt)
-    assert nxt["messages"][0]["content"].startswith("[Context Guardian auto-compaction") and "[fold f1: turns T2-T4]" in nxt["messages"][0]["content"]
+    assert nxt["messages"][0]["content"].startswith("[Context Guardian auto-compaction") and "[fold f1: turns T2-T4" in nxt["messages"][0]["content"]
     assert len(texts(nxt)) < len(texts({"messages": history(9)}))
 
 
@@ -515,3 +515,128 @@ def test_a_pending_cancel_in_a_discarded_loop_changes_nothing(g):
     assert g.CONTEXT_FOLDS.total() == 1
     chat(g, history(9), tools=[{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}])
     assert g.CONTEXT_FOLDS.total() == 1                                    # the discarded loop's cancellation was not committed
+
+
+# ---- review round 1 ----------------------------------------------------------------------------------
+
+def test_a_rewind_that_makes_a_folded_range_recent_drops_the_fold(g):
+    model = Model([[(ct.T_COMPRESS, {"from_turn": 2, "to_turn": 4})], "ok", "fine"]).wire(g)
+    chat(g, history(8))
+    rewound = history(4) + [{"role": "user", "content": "EDITED question 5"}]       # the client rewinds to turn 5
+    chat(g, rewound)
+    sent = model.calls[-1]["messages"]
+    assert "[fold f1" not in texts(model.calls[-1])
+    assert [m for m in sent if m["role"] != "system"] == rewound                    # nothing recent was replaced
+    assert g._state["context_folds_dropped"] == 1
+
+
+def test_the_loop_time_budget_counts_the_upstream_rounds(monkeypatch, tmp_path):
+    import time as _t
+    g = load(monkeypatch, tmp_path, GUARDIAN_CONTEXT_TOOLS="1", GUARDIAN_NUM_CTX="8000", GUARDIAN_RESERVE_OUTPUT="100",
+             GUARDIAN_COMPACT_THRESHOLD="0.85", GUARDIAN_CONTEXT_TOOLS_TIMEOUT="1", GUARDIAN_CONTEXT_TOOLS_MAX_ROUNDS="10",
+             GUARDIAN_CONTEXT_TOOLS_MAX_CALLS="50")
+    model = Model([[(ct.T_STATUS, {})]]).wire(g)
+    real = model.handler
+
+    def slow(request):
+        if "BEGIN_TRANSCRIPT" not in request.content.decode("utf-8", "replace"):
+            _t.sleep(0.6)
+        return real(request)
+    g._http_client = httpx.AsyncClient(transport=httpx.MockTransport(slow))
+    r = chat(g, history(8))
+    assert r.status_code == 200
+    assert g._state["context_loops_discarded"] == 1
+    assert len(model.calls) <= 4                               # two slow rounds blew the 1 s budget; then the normal send
+
+
+def test_a_slow_final_answer_round_is_not_cut_off(monkeypatch, tmp_path):
+    import time as _t
+    g = load(monkeypatch, tmp_path, GUARDIAN_CONTEXT_TOOLS="1", GUARDIAN_NUM_CTX="8000", GUARDIAN_RESERVE_OUTPUT="100",
+             GUARDIAN_COMPACT_THRESHOLD="0.85", GUARDIAN_CONTEXT_TOOLS_TIMEOUT="1")
+    model = Model([[(ct.T_STATUS, {})], "the slow answer"]).wire(g)
+    real = model.handler
+
+    def slow(request):
+        if len(model.calls) >= 1 and "BEGIN_TRANSCRIPT" not in request.content.decode("utf-8", "replace"):
+            _t.sleep(1.5)                                      # the answer round alone exceeds the whole budget
+        return real(request)
+    g._http_client = httpx.AsyncClient(transport=httpx.MockTransport(slow))
+    r = chat(g, history(8))
+    assert r.json()["choices"][0]["message"]["content"] == "the slow answer" and g._state["context_loops_discarded"] == 0
+
+
+@pytest.mark.parametrize("junk", [{"type": "function", "function": "read_file"}, "not-a-dict", None, {"function": {"name": 5}}])
+def test_junk_in_tools_is_the_flag_off_request_byte_for_byte(monkeypatch, tmp_path, junk):
+    sent = {}
+    for flag in ("0", "1"):
+        g = load(monkeypatch, tmp_path, GUARDIAN_CONTEXT_TOOLS=flag, GUARDIAN_NUM_CTX="8000", GUARDIAN_COMPACT_THRESHOLD="0.85",
+                 GUARDIAN_RESERVE_OUTPUT="100")
+        model = Model(["x", "x"]).wire(g)
+        chat(g, history(14), tools=[junk])                      # over the threshold: ordinary compaction applies
+        sent[flag] = [c for c in model.calls]
+    import re
+    norm = lambda x: re.sub(r"\d{8}-\d{6}/\d{4}\.json", "RUN/SPAN", json.dumps(x, sort_keys=True))     # the run id / span index differ per load
+    assert norm(sent["0"]) == norm(sent["1"])
+
+
+def test_below_the_gate_the_request_is_the_flag_off_request(monkeypatch, tmp_path):
+    sent = {}
+    for flag in ("0", "1"):
+        g = load(monkeypatch, tmp_path, GUARDIAN_CONTEXT_TOOLS=flag, GUARDIAN_NUM_CTX="8000", GUARDIAN_COMPACT_THRESHOLD="0.85",
+                 GUARDIAN_RESERVE_OUTPUT="100")
+        model = Model(["x"]).wire(g)
+        chat(g, history(2))
+        sent[flag] = model.calls[0]
+    assert sent["0"] == sent["1"]
+
+
+def test_every_proxy_tool_call_is_audited_even_in_a_discarded_loop(g):
+    model = Model([[(ct.T_COMPRESS, {"from_turn": 2, "to_turn": 4})]]).wire(g)       # asks to fold forever: the cap discards the loop
+    chat(g, history(8))
+    log = [json.loads(ln) for ln in Path(g.LOG_PATH).read_text(encoding="utf-8").splitlines()]
+    tools = [e for e in log if e["event"] == "context_tool"]
+    assert tools and all(e["outcome"] == "discarded" for e in tools)
+    assert g._state["context_tool_calls"] == len(tools) >= 3
+    assert g.CONTEXT_FOLDS.total() == 0                                                # nothing was committed
+
+
+def test_a_status_only_loop_creates_no_store_record(g):
+    Model([[(ct.T_STATUS, {})], "ok"]).wire(g)
+    chat(g, history(8), session="only-status")
+    assert g.CONTEXT_FOLDS.sessions() == 0
+
+
+def test_the_fold_summary_sits_directly_after_the_system_messages(g):
+    system = [{"role": "system", "content": "You are a careful assistant."}]
+    model = Model([[(ct.T_COMPRESS, {"from_turn": 2, "to_turn": 4})], "ok", "fine"]).wire(g)
+    chat(g, system + history(8))
+    chat(g, system + history(9))
+    sent = model.calls[-1]["messages"]
+    assert sent[0] == system[0] and sent[1]["content"].startswith("[Context Guardian auto-compaction") and "[fold f1" in sent[1]["content"]
+    assert [m for m in sent[2:]][0]["content"].startswith("question 1 ")           # then the first turn, as the model saw it
+
+
+def test_a_streaming_client_gets_the_usage_chunk_it_asked_for(g):
+    Model(["the answer"]).wire(g)
+    r = chat(g, history(8), stream=True, stream_options={"include_usage": True})
+    frames = [json.loads(ln[6:]) for ln in r.text.splitlines() if ln.startswith("data: ") and "[DONE]" not in ln]
+    assert frames[0]["choices"][0]["delta"]["content"] == "the answer"
+    assert frames[-1]["choices"] == [] and frames[-1]["usage"]["prompt_tokens"] == 100
+    plain = chat(g, history(8), stream=True)
+    assert all("usage" not in json.loads(ln[6:]) for ln in plain.text.splitlines() if ln.startswith("data: ") and "[DONE]" not in ln)
+
+
+def test_compaction_on_top_of_a_fold_drops_the_fold(g, monkeypatch):
+    model = Model([[(ct.T_COMPRESS, {"from_turn": 2, "to_turn": 4})], "ok", "fine"]).wire(g)
+    chat(g, history(8))
+    real = g.maybe_compact
+
+    async def exact_count_says_over(client, payload, headers=None):
+        out = await real(client, payload, headers)
+        msgs = list(out["messages"])
+        if sum(1 for m in msgs if m.get("role") == "system" and str(m.get("content")).startswith("[Context Guardian auto-compaction")) >= 1:
+            msgs.insert(0, {"role": "system", "content": "[Context Guardian auto-compaction — an ordinary summary]"})
+        return dict(out, messages=msgs)
+    monkeypatch.setattr(g, "maybe_compact", exact_count_says_over)
+    chat(g, history(9))
+    assert g.CONTEXT_FOLDS.total() == 0 and g._state["context_folds_dropped"] >= 1

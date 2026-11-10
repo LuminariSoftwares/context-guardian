@@ -52,11 +52,28 @@ def is_proxy_tool(name: Any) -> bool:
 
 
 def client_tool_collides(tools: Any) -> bool:
+    """True when the client defines a tool in the proxy's namespace. Tolerates any junk in `tools`."""
     for t in tools if isinstance(tools, list) else []:
-        name = (t.get("function") or {}).get("name") if isinstance(t, dict) else None
+        fn = t.get("function") if isinstance(t, dict) else None
+        name = fn.get("name") if isinstance(fn, dict) else None
         if isinstance(name, str) and name.startswith(TOOL_PREFIX):
             return True
     return False
+
+
+def protected_turns(turns: List[Dict[str, Any]], message_count: int, protect_turns: int, keep_messages: int) -> set:
+    """Turn numbers that can never be folded: the first (the task), the last `protect_turns`, and
+    every turn touching the newest `keep_messages` messages."""
+    out = set()
+    if turns:
+        out.add(1)
+        for t in turns[-max(1, protect_turns):]:
+            out.add(t["n"])
+        floor = message_count - max(0, keep_messages)
+        for t in turns:
+            if t["end"] >= floor:
+                out.add(t["n"])
+    return out
 
 
 # ---- turns -------------------------------------------------------------------------------
@@ -184,18 +201,9 @@ class Context:
         self.applied = set(applied)             # fold ids whose turns are folded in the forwarded view
         self.pending: List[Dict[str, Any]] = []
         self.cancels: List[str] = []
-        self.events: List[Dict[str, Any]] = []   # audit records the proxy writes to the log
+        self.events: List[Dict[str, Any]] = []   # audit records the proxy writes to the log (even for a discarded loop)
         self.calls = 0
-        protected = set()
-        if self.turns:
-            protected.add(1)
-            for t in self.turns[-max(1, protect_turns):]:
-                protected.add(t["n"])
-            floor = len(non_system) - max(0, keep_messages)
-            for t in self.turns:
-                if t["end"] >= floor:
-                    protected.add(t["n"])
-        self.protected = protected
+        self.protected = protected_turns(self.turns, len(non_system), protect_turns, keep_messages)
         self.fold_of_turn: Dict[int, str] = {}
         for f in store.live(session):
             a, b = f["turns"]

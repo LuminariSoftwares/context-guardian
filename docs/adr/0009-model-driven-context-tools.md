@@ -199,3 +199,18 @@ Adopted from the non-blocking lists: 1,500-token minimum and "apply only if smal
 until commit, synchronous id allocation, the fold marker on the span, round-1 error handling, client-visible usage, session-key note,
 SDK parse evidence. Kept against the reviewer's "what to cut": `decompress` (as a cancel) and SSE re-framing, because the brief names
 four tools and coding CLIs stream.
+
+Code review (fresh Opus reviewer, after implementation), round 1 -- four blockers, all reproduced and fixed: (1) a fold could cover the most
+recent turns: protection was checked when the fold was proposed but not when it was applied, so a client that rewound its history made a
+folded range "recent" (now re-checked on every application against the current history, plus a turn-boundary check); (2)
+`GUARDIAN_CONTEXT_TOOLS_TIMEOUT` never limited anything (the clock started after the upstream reply; it now counts each round that ended
+in proxy tool calls, upstream time included, and never the answer round, with tests for both); (3) fail-open was broken for a `tools`
+entry like `{"function": "read_file"}`: the eligibility check raised, and so did the fallback, so a request over the threshold lost the
+compaction the flag-off proxy would apply (the check is type-safe and the fallback no longer re-runs it; tested byte for byte against the
+flag-off request); (4) the audit trail only covered committed loops (events and counters are now written in a `finally`, with an
+`outcome` of `committed` or `discarded`). Also fixed: an exact upstream token count could put a folded request over the threshold so
+ordinary compaction ran on top of the fold message (folds are dropped and the unfolded request redone); a status-only loop churned the
+fold store's LRU (a record is written only when there is something to commit); the fold label now says it came after the first turn
+shown below. Left and documented: the loop path does not feed calibration; session ids that collide drop each other's folds; a
+mid-history `developer` role message counts as part of a turn; the failed-prepare fallback runs the rewrite a second time.
+
