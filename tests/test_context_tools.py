@@ -575,7 +575,8 @@ def test_junk_in_tools_is_the_flag_off_request_byte_for_byte(monkeypatch, tmp_pa
         chat(g, history(14), tools=[junk])                      # over the threshold: ordinary compaction applies
         sent[flag] = [c for c in model.calls]
     import re
-    norm = lambda x: re.sub(r"\d{8}-\d{6}/\d{4}\.json", "RUN/SPAN", json.dumps(x, sort_keys=True))     # the run id / span index differ per load
+    # The summary's pointer paragraph names the run (a timestamp), the span and the machine's paths: they differ per load.
+    norm = lambda x: re.sub(r"\[Full text of those .*?read_span to open a message range\.\]", "POINTER", json.dumps(x, sort_keys=True), flags=re.S)
     assert norm(sent["0"]) == norm(sent["1"])
 
 
