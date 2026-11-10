@@ -6,6 +6,7 @@
 
 - Python: `pip install context-guardian && context-guardian` starts the proxy on `:8786` in front of Ollama on `:11434`. Point the client at `http://localhost:8786/v1`.
 - Check it: `context-guardian-doctor` tests the install and the running proxy and prints a `fix:` line for anything wrong.
+- One run without any setup: `context-guardian launch claude-code` (also `aider`, `continue`, `openai -- <cli>`; `--list` shows what is tested) starts the proxy if needed, points that one client at it and stops what it started.
 - Claude Code: `context-guardian-claude-code install` prints the hooks and the `claude mcp add` command; `--apply` writes them (it backs up `~/.claude/settings.json` first).
 - Quick start: [README.md#quick-start-60-seconds](README.md#quick-start-60-seconds). Per-client settings: [README.md#point-your-client-at-the-proxy](README.md#point-your-client-at-the-proxy).
 - DeepSeek Harness: `dsh plugin --profile web add dsh-context-guardian`, then [README.md#install-both-deepseek-harness-about-5-minutes](README.md#install-both-deepseek-harness-about-5-minutes).

@@ -135,6 +135,9 @@ def _data_dir_notice(message: str) -> None:
 
 
 DATA_DIR = cg_paths.data_dir(notify=_data_dir_notice)
+# The environment as the shell gave it, before any .env is loaded below: `context-guardian launch`
+# hands THIS to the client, never the .env values (which can hold GUARDIAN_ARCHIVE_KEY).
+_ENV_AT_START = dict(os.environ)
 try:
     from dotenv import load_dotenv
     load_dotenv(DATA_DIR / cg_paths.ENV_FILENAME, override=False)
@@ -4691,6 +4694,7 @@ USAGE = """context-guardian -- compaction proxy for any OpenAI-compatible backen
 
   context-guardian              start the proxy (default: 127.0.0.1:{port}, forwarding to {upstream})
   context-guardian mcp          run the stdio MCP server instead (same as context-guardian-mcp)
+  context-guardian launch CLIENT [-- args]   start the proxy if needed, run CLIENT pointed at it, stop what it started
   context-guardian --version    print the version and exit
   context-guardian --help       print this and exit
 
@@ -4752,6 +4756,9 @@ def encryption_problem() -> Optional[str]:
 
 def main():
     """Console entry point (`context-guardian`) and `python context_guardian.py`."""
+    if sys.argv[1:2] == ["launch"]:  # `context-guardian launch <client>`: before the --help/--version scan below, so client flags reach the client
+        import cg_launch
+        sys.exit(cg_launch.launch(sys.argv[2:], environ=_ENV_AT_START))
     if sys.argv[1:2] == ["mcp"]:  # `context-guardian mcp` = context-guardian-mcp (the MCP Registry runs `uvx context-guardian mcp`)
         import cg_mcp
         sys.exit(cg_mcp.main())
