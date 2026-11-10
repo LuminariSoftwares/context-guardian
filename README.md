@@ -201,12 +201,18 @@ context-guardian launch --list                        # what each client sets an
 
 | client | what it sets for the one process | tested |
 |---|---|---|
-| `claude-code` | `ANTHROPIC_BASE_URL` (the proxy's upstream must serve the Anthropic Messages API) | the variable passed the [Works with](#works-with) row; the launcher itself was run against Claude Code 2.1.322 on 2026-11-10 (Linux), see below |
+| `claude-code` | `ANTHROPIC_BASE_URL` (the proxy's upstream must serve the Anthropic Messages API) | the variable passed the [Works with](#works-with) row; the launcher itself: see the launcher table below |
 | `openclaude` | `CLAUDE_CODE_USE_OPENAI=1`, `OPENAI_BASE_URL`, `OPENAI_API_KEY=local` if you have none | untested |
 | `aider` | `OPENAI_API_BASE`, `OPENAI_API_KEY=local` if you have none | untested (the matrix passed with `--openai-api-base`) |
 | `continue` (`cn`) | `cn --config <temporary file>`; this replaces your own Continue config for that run | untested |
 | `openai` | `OPENAI_BASE_URL` and `OPENAI_API_BASE` | untested |
 | `opencode`, `cline`, `cursor` | needs a setting in the client itself: the exact steps are printed and nothing is changed | steps only |
+
+| date | client through `launch` | version | result |
+|---|---|---|---|
+| 2026-11-10 | claude-code | 2.1.322 | PASS |
+
+Output of `python tests/clients/run_launch_check.py` (two scripted turns, each its own `launch`, against the scripted mock model of the matrix above; it passes when both turns print the mock's answer marker, the mock saw requests, and nothing listens on the proxy port afterwards). Run on Linux (a container), Python 3.13. Windows and macOS were not run.
 
 The port comes from `--port`, then `GUARDIAN_PORT` in the environment or the `.env` in the data directory, then 8786; the client is always given `127.0.0.1`. A proxy already answering there is used and left running; a port held by something else gets a free one. If the proxy will not start, the client is **not** started (running it without the proxy would send Claude Code to the vendor's API instead of your backend): the last lines of the proxy's output and the command to run the client directly are printed, and `--direct-if-proxy-fails` opts in to running it anyway. The proxy runs in its own process group, so pressing Ctrl-C in the client to cancel a turn does not stop it; killing the launcher with `SIGKILL` cannot be caught and leaves an idle loopback proxy running. In the DSH bundle: `npm run launch -- <client>` (on Windows `node launch.mjs <client>`; not tested on Windows).
 

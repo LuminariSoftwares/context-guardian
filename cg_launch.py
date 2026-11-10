@@ -128,26 +128,34 @@ def configured_port(env: Dict[str, str], dotenv_dirs: List[Path]) -> int:
     return DEFAULT_PORT
 
 
-def data_dirs() -> List[Path]:
+def data_dirs(environ: Optional[Dict[str, str]] = None) -> List[Path]:
     """The directories whose .env the proxy would load."""
     out: List[Path] = []
+    given = (environ or {}).get("GUARDIAN_DATA_DIR", "").strip()
     try:
         import cg_paths
-        out.append(Path(cg_paths.data_dir()))
+        out.append(Path(given) if given else Path(cg_paths.data_dir()))
         if cg_paths.PACKAGE_DIR not in out:
             out.append(Path(cg_paths.PACKAGE_DIR))
     except Exception:                                      # noqa: BLE001
-        pass
+        if given:
+            out.append(Path(given))
     return out
 
 
 def _append_no_proxy(env: Dict[str, str]) -> None:
+    """Add loopback to NO_PROXY and no_proxy without losing the user's own entries: both spellings
+    are merged and the same list is written to both (Windows treats them as one variable)."""
+    have: List[str] = []
     for key in ("NO_PROXY", "no_proxy"):
-        have = [p.strip() for p in env.get(key, "").split(",") if p.strip()]
-        for host in (LOOPBACK, "localhost"):
-            if host not in have:
-                have.append(host)
-        env[key] = ",".join(have)
+        for part in env.get(key, "").split(","):
+            part = part.strip()
+            if part and part not in have:
+                have.append(part)
+    for host in (LOOPBACK, "localhost"):
+        if host not in have:
+            have.append(host)
+    env["NO_PROXY"] = env["no_proxy"] = ",".join(have)
 
 
 def build_env(client: str, base_url: str, parent: Dict[str, str]) -> Dict[str, str]:
@@ -171,6 +179,8 @@ def build_env(client: str, base_url: str, parent: Dict[str, str]) -> Dict[str, s
 
 
 def warnings_for(client: str, env: Dict[str, str]) -> List[str]:
+    if client == "continue":
+        return ["cn runs with a temporary config for this run: your own Continue models, rules and MCP servers are not loaded."]
     if client == "claude-code":
         return ["Claude Code talks the Anthropic Messages API: the proxy's GUARDIAN_UPSTREAM_URL must serve it."]
     if client == "openclaude" and not env.get("OPENAI_MODEL"):
@@ -322,14 +332,26 @@ def stop_proxy(proc: "subprocess.Popen") -> None:
             pass
         proc.kill()
         proc.wait(timeout=STOP_WAIT)
-    except Exception as exc:                               # noqa: BLE001
-        print("context-guardian: could not stop the proxy it started: %s" % exc, file=sys.stderr)
+    except BaseException as exc:                           # noqa: BLE001 -- even a second Ctrl-C must end in a kill
+        try:
+            proc.kill()
+        except Exception:                                  # noqa: BLE001
+            pass
+        _warn("could not stop the proxy it started cleanly: %s" % exc)
 
 
-def wait_ready(base_url: str, proc, timeout: float, ping: Callable[[str], bool] = is_guardian) -> bool:
+def _warn(text: str) -> None:
+    try:
+        print("context-guardian: " + text, file=sys.stderr)
+    except Exception:                                      # noqa: BLE001
+        pass
+
+
+def wait_ready(base_url: str, proc, timeout: float, ping: Callable[[str], bool] = is_guardian,
+               abort: Callable[[], bool] = lambda: False) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if proc is not None and proc.poll() is not None:
+        if abort() or (proc is not None and proc.poll() is not None):
             return False
         if ping(base_url):
             return True
@@ -346,50 +368,67 @@ def tail(path: str, lines: int = 12) -> str:
 
 # ---- running the client -------------------------------------------------------------------
 
-def run_client(cmd: List[str], env: Dict[str, str]) -> int:
-    """Run the client with the terminal; return its exit code. SIGINT is left to the client:
-    the terminal sends it to the whole foreground group, so the client sees the user's Ctrl-C."""
-    saved = {}
-    proc = None
+class SignalGuard:
+    """Installed for the whole launch, cleanup included. SIGINT gets a no-op FUNCTION, never
+    SIG_IGN (an ignored signal is inherited across exec and the client would lose Ctrl-C-to-cancel;
+    a function handler is reset to the default in the child). SIGTERM / SIGHUP / SIGBREAK are
+    forwarded to the client while it runs. A signal that arrives before the client starts is
+    remembered, so a launch that is still waiting for the proxy can stop."""
 
-    def forward(signum, frame):                            # noqa: ARG001
+    def __init__(self) -> None:
+        self.client = None
+        self.signalled: Optional[int] = None
+        self._saved: Dict[int, object] = {}
+
+    def _handler(self, signum, frame):                     # noqa: ARG002
+        if self.client is None:
+            self.signalled = signum
+            return
         try:
-            if proc is not None and proc.poll() is None:
-                proc.send_signal(signum)
+            if signum != getattr(signal, "SIGINT", None) and self.client.poll() is None:
+                self.client.send_signal(signum)            # the terminal already sent SIGINT to the client
         except Exception:                                  # noqa: BLE001
             pass
 
-    def install(sig, handler):
-        try:
-            saved[sig] = signal.signal(sig, handler)
-        except (ValueError, OSError, AttributeError):      # not the main thread, or unsupported here
-            pass
-
-    try:
-        # A no-op FUNCTION, never SIG_IGN: an ignored signal is inherited across exec, and the client
-        # (aider, a node CLI) would lose Ctrl-C-to-cancel. Function handlers reset to default in the child.
-        install(signal.SIGINT, lambda signum, frame: None)
-        for name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
-            if hasattr(signal, name):
-                install(getattr(signal, name), forward)
-        proc = subprocess.Popen(cmd, env=env)
-        while True:
-            try:
-                return exit_code_for(proc.wait())
-            except KeyboardInterrupt:
+    def __enter__(self) -> "SignalGuard":
+        for name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"):
+            sig = getattr(signal, name, None)
+            if sig is None:
                 continue
-    finally:
-        for sig, old in saved.items():
+            try:
+                self._saved[sig] = signal.signal(sig, self._handler)
+            except (ValueError, OSError):                  # not the main thread, or unsupported here
+                pass
+        return self
+
+    def __exit__(self, *exc) -> None:
+        for sig, old in self._saved.items():
             try:
                 signal.signal(sig, old)
             except Exception:                              # noqa: BLE001
                 pass
 
 
+def run_client(cmd: List[str], env: Dict[str, str], guard: Optional[SignalGuard] = None) -> int:
+    """Run the client with the terminal; return its exit code (128+N for a signal)."""
+    proc = subprocess.Popen(cmd, env=env)
+    if guard is not None:
+        guard.client = proc
+    while True:
+        try:
+            return exit_code_for(proc.wait())
+        except KeyboardInterrupt:
+            continue
+
+
+def _is_path(name: str) -> bool:
+    return os.sep in name or bool(os.altsep and os.altsep in name)
+
+
 def resolve_binary(name: str, override: Optional[str]) -> Optional[str]:
     if override:
         return override if (os.path.isfile(override) or shutil.which(override)) else None
-    if name and os.path.isfile(name):
+    if name and _is_path(name) and os.path.isfile(name):
         return name
     return shutil.which(name) if name else None
 
@@ -410,6 +449,13 @@ def launch(argv: List[str], environ: Optional[Dict[str, str]] = None) -> int:
         print(list_text())
         return 0
     client = opts["client"]
+    if opts["url"] and opts["port"]:
+        print("context-guardian launch: --url and --port both name the proxy; use one", file=sys.stderr)
+        return 2
+    if opts["model"] and client != "continue":
+        print("context-guardian launch: --model is only used by `continue`; pass the model to %s after --" % client,
+              file=sys.stderr)
+        return 2
     if client not in CLIENTS:
         print("context-guardian launch: name a client: %s\n\n%s" % (", ".join(CLIENTS), USAGE), file=sys.stderr)
         return 2
@@ -418,16 +464,13 @@ def launch(argv: List[str], environ: Optional[Dict[str, str]] = None) -> int:
 
     def say(text: str) -> None:
         if not quiet:
-            try:
-                print("context-guardian: " + text, file=sys.stderr)
-            except Exception:                              # noqa: BLE001
-                pass
+            _warn(text)
 
     # -- which proxy
     if opts["url"]:
         base_url, manage = opts["url"].rstrip("/"), False
     else:
-        port = opts["port"] or configured_port(environ, data_dirs())
+        port = opts["port"] or configured_port(environ, data_dirs(environ))
         base_url, manage = "http://%s:%d" % (LOOPBACK, port), True
 
     if kind == "steps":
@@ -454,59 +497,70 @@ def launch(argv: List[str], environ: Optional[Dict[str, str]] = None) -> int:
     proc, log_path, temp_files = None, None, []
     code = 2
     try:
-        started = False
-        if is_guardian(base_url):
-            say("using the proxy already running at %s" % base_url)
-        elif opts["no_start"] or not manage:
-            print("context-guardian launch: no proxy answers at %s%s" %
-                  (base_url, "" if manage else " (--url is never started for you)"), file=sys.stderr)
-            return 2
-        else:
-            port = int(base_url.rsplit(":", 1)[1])
-            if not port_is_free(port):
-                port = free_port()
-                base_url = "http://%s:%d" % (LOOPBACK, port)
-                say("the configured port is taken by something else; using %d" % port)
-            proc, log_path = start_proxy(port, environ)
-            started = True
-            if not wait_ready(base_url, proc, opts["timeout"]):
-                reason = tail(log_path)
-                stop_proxy(proc)
-                proc = None
-                if opts["direct"]:
-                    say("the proxy did not start; running %s WITHOUT it (--direct-if-proxy-fails)" % client)
-                    return _run(exe, rest, environ, kind, opts, None, temp_files)
-                print("context-guardian launch: the proxy did not become ready at %s.\n%s\n"
-                      "The client was not started (it would run without the proxy). To run it directly: %s"
-                      % (base_url, reason, " ".join([binary] + rest)), file=sys.stderr)
+        with SignalGuard() as guard:
+            def interrupted() -> bool:
+                return guard.signalled is not None
+
+            def signalled_code() -> int:
+                return 128 + int(guard.signalled or 2)
+
+            if is_guardian(base_url):
+                say("using the proxy already running at %s" % base_url)
+            elif opts["no_start"] or not manage:
+                print("context-guardian launch: no proxy answers at %s%s" %
+                      (base_url, "" if manage else " (--url is never started for you)"), file=sys.stderr)
                 return 2
-            say("started a proxy at %s; it stops when %s exits" % (base_url, client))
-        env = build_env(client, base_url, environ)
-        for w in warnings_for(client, env):
-            say(w)
-        say("%s [%s]" % (client, status))
-        code = _run(exe, rest, env, kind, opts, base_url, temp_files)
-        return code
-    except Exception as exc:                               # noqa: BLE001
-        print("context-guardian launch: %s: %s" % (type(exc).__name__, exc), file=sys.stderr)
+            else:
+                port = int(base_url.rsplit(":", 1)[1])
+                if not port_is_free(port):
+                    port = free_port()
+                    base_url = "http://%s:%d" % (LOOPBACK, port)
+                    say("the configured port is taken by something else; using %d" % port)
+                proc, log_path = start_proxy(port, environ)
+                if not wait_ready(base_url, proc, opts["timeout"], abort=interrupted):
+                    if interrupted():
+                        return signalled_code()
+                    reason = tail(log_path)
+                    stop_proxy(proc)
+                    proc = None
+                    if opts["direct"]:
+                        say("the proxy did not start; running %s WITHOUT it (--direct-if-proxy-fails)" % client)
+                        return _run(exe, rest, environ, kind, opts, None, temp_files, guard)
+                    print("context-guardian launch: the proxy did not become ready at %s.\n%s\n"
+                          "The client was not started (it would run without the proxy). To run it directly: %s"
+                          % (base_url, reason, " ".join([binary] + rest)), file=sys.stderr)
+                    return 2
+                say("started a proxy at %s; it stops when %s exits" % (base_url, client))
+            if interrupted():
+                return signalled_code()
+            env = build_env(client, base_url, environ)
+            for w in warnings_for(client, env):
+                say(w)
+            say("%s [%s]" % (client, status))
+            code = _run(exe, rest, env, kind, opts, base_url, temp_files, guard)
+            return code
+    except BaseException as exc:                           # noqa: BLE001 -- the launcher never leaves a traceback
+        if isinstance(exc, KeyboardInterrupt):
+            return 130
+        _warn("%s: %s" % (type(exc).__name__, exc))
         return 2
     finally:
         # Cleanup must never replace the client's exit code or raise past this point.
         try:
             if proc is not None:
                 stop_proxy(proc)
-        except Exception as exc:                           # noqa: BLE001
-            print("context-guardian: cleanup failed: %s" % exc, file=sys.stderr)
+        except BaseException as exc:                       # noqa: BLE001
+            _warn("cleanup failed: %s" % exc)
         for path in [log_path] + temp_files:
             if path:
                 try:
                     os.unlink(path)
-                except Exception:                          # noqa: BLE001
+                except BaseException:                      # noqa: BLE001
                     pass
 
 
 def _run(exe: str, rest: List[str], env: Dict[str, str], kind: str, opts: Dict, base_url: Optional[str],
-         temp_files: List[str]) -> int:
+         temp_files: List[str], guard: Optional[SignalGuard] = None) -> int:
     cmd = ([sys.executable, exe] if exe.lower().endswith(".py") else [exe]) + rest
     if kind == "continue" and base_url:
         handle, path = tempfile.mkstemp(prefix="cg-launch-continue-", suffix=".yaml")
@@ -514,7 +568,7 @@ def _run(exe: str, rest: List[str], env: Dict[str, str], kind: str, opts: Dict, 
         with os.fdopen(handle, "w", encoding="utf-8") as fh:
             fh.write(continue_config(base_url, opts["model"]))
         cmd = ([sys.executable, exe] if exe.lower().endswith(".py") else [exe]) + ["--config", path] + rest
-    return run_client(cmd, env)
+    return run_client(cmd, env, guard)
 
 
 def main(argv: Optional[List[str]] = None) -> int:

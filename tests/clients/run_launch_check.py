@@ -62,7 +62,6 @@ def main(argv=None):
             version = rc.first_version_word((p.stdout or "") + "\n" + (p.stderr or ""))
         except (OSError, subprocess.SubprocessError):
             pass
-        output = ""
         for n, text in enumerate(turns["turns"], 1):
             cmd = [sys.executable, str(ROOT / "context_guardian.py"), "launch", "claude-code", "--bin", exe, "--quiet", "--"]
             cmd += (["-c"] if n > 1 else []) + ["-p", text]
@@ -74,10 +73,10 @@ def main(argv=None):
                 output, code = "", "timeout"
             if code != 0:
                 reasons.append("turn %d exit %s" % (n, code))
+            if turns["answer_marker"] not in output:
+                reasons.append("the answer was not displayed in turn %d" % n)
             if listening(port):
                 reasons.append("the proxy was still listening after turn %d" % n)
-        if turns["answer_marker"] not in output:
-            reasons.append("the answer was not displayed")
         log = work / "mock.jsonl"
         if not log.exists() or not log.read_text(encoding="utf-8").strip():
             reasons.append("the mock upstream saw no request")

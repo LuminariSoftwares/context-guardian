@@ -247,13 +247,20 @@ def test_cleanup_failures_do_not_change_the_exit_code(tmp_path, monkeypatch):
         return proc, log
     monkeypatch.setattr(L, "start_proxy", spy)
     monkeypatch.setattr(L, "stop_proxy", lambda proc: (_ for _ in ()).throw(RuntimeError("injected")))
-    monkeypatch.setattr(os, "unlink", lambda p: (_ for _ in ()).throw(OSError("injected")))
+    import glob
+    import tempfile
+    pattern = os.path.join(tempfile.gettempdir(), "cg-launch-proxy-*.log")
+    before_logs = set(glob.glob(pattern))
+    real_unlink = os.unlink
+    monkeypatch.setattr(os, "unlink", lambda p, *a, **k: (_ for _ in ()).throw(OSError("injected")) if "cg-launch-" in str(p) else real_unlink(p, *a, **k))
     try:
         assert run(tmp_path, ["claude-code", "--port", str(port), "--bin", FAKE, "--quiet", "--", str(tmp_path / "o.json"), "9"]) == 9
     finally:
         monkeypatch.undo()
         for p in started:
             L.stop_proxy(p)
+        for leftover in set(glob.glob(pattern)) - before_logs:      # the injected failure left them; do not leave them behind
+            real_unlink(leftover)
     assert closed(port)
 
 
@@ -353,3 +360,104 @@ def test_npm_wrapper_runs_the_client_in_init_cwd_and_keeps_ctrl_c(tmp_path):
                        env=env, capture_output=True, text=True, timeout=120, cwd=str(ROOT))
     assert p.returncode == 0, p.stderr
     assert os.path.realpath(cwd_probe.read_text()) == os.path.realpath(str(work))
+
+
+# ---- review round 1 -------------------------------------------------------------------------------------
+
+def test_dotenv_secrets_never_reach_the_client(tmp_path):
+    """context_guardian.py loads .env at import; the launcher must hand the client the shell's own
+    environment, not the .env values (GUARDIAN_ARCHIVE_KEY lives there)."""
+    env = env_for(tmp_path)
+    (tmp_path / "data").mkdir(exist_ok=True)
+    (tmp_path / "data" / ".env").write_text("GUARDIAN_ARCHIVE_KEY=SECRETSECRET\nGUARDIAN_SOME_SETTING=visible-in-env-file\n", encoding="utf-8")
+    out = tmp_path / "leak.json"
+    probe = tmp_path / "leakclient.py"
+    probe.write_text("import json,os,sys\njson.dump({k: v for k, v in os.environ.items() if k.startswith('GUARDIAN_')}, open(sys.argv[1], 'w'))\n", encoding="utf-8")
+    port = L.free_port()
+    for entry in ([sys.executable, str(ROOT / "context_guardian.py")], [sys.executable, str(ROOT / "cg_launch.py")]):
+        cmd = entry + (["launch"] if entry[-1].endswith("context_guardian.py") else []) + ["openai", "--port", str(port), "--quiet", "--", str(probe), str(out)]
+        p = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=120)
+        assert p.returncode == 0, p.stderr
+        seen = json.loads(out.read_text())
+        assert "GUARDIAN_ARCHIVE_KEY" not in seen and "SECRETSECRET" not in json.dumps(seen), entry[-1]
+        assert "GUARDIAN_SOME_SETTING" not in seen
+
+
+def test_no_proxy_keeps_the_users_entries_in_both_spellings():
+    e = L.build_env("claude-code", "http://127.0.0.1:1", {"NO_PROXY": "internal.corp"})
+    assert e["NO_PROXY"] == e["no_proxy"] == "internal.corp,127.0.0.1,localhost"
+    e = L.build_env("claude-code", "http://127.0.0.1:1", {"no_proxy": "a.example", "NO_PROXY": "b.example,127.0.0.1"})
+    assert e["NO_PROXY"] == e["no_proxy"] == "b.example,127.0.0.1,a.example,localhost"
+
+
+def test_a_second_ctrl_c_during_cleanup_still_ends_in_a_kill():
+    killed = []
+
+    class Stubborn:
+        def poll(self):
+            return None
+        def terminate(self):
+            pass
+        def send_signal(self, s):
+            pass
+        def wait(self, timeout=None):
+            raise KeyboardInterrupt()
+        def kill(self):
+            killed.append(1)
+    L.stop_proxy(Stubborn())                                        # must not raise
+    assert killed
+
+
+def test_a_signal_before_the_client_starts_stops_the_wait(tmp_path, monkeypatch):
+    started = []
+    real = L.start_proxy
+    monkeypatch.setattr(L, "start_proxy", lambda p, e: (lambda r: (started.append(r[0]), r)[1])(real(p, e)))
+
+    def slow_wait(base, proc, timeout, ping=L.is_guardian, abort=lambda: False):
+        for _ in range(100):
+            if abort():
+                return False
+            time.sleep(0.05)
+            if _ == 3:
+                os.kill(os.getpid(), signal.SIGTERM if os.name != "nt" else signal.SIGBREAK)
+        return False
+    monkeypatch.setattr(L, "wait_ready", slow_wait)
+    out = tmp_path / "o.json"
+    code = run(tmp_path, ["claude-code", "--port", str(L.free_port()), "--bin", FAKE, "--quiet", "--", str(out)])
+    assert code in (128 + signal.SIGTERM, 128 + getattr(signal, "SIGBREAK", 15)) and not out.exists()
+    deadline = time.time() + 15
+    while started and started[0].poll() is None and time.time() < deadline:
+        time.sleep(0.1)
+    assert started and started[0].poll() is not None
+
+
+def test_signal_handlers_are_restored_and_sigint_is_a_function():
+    before = signal.getsignal(signal.SIGINT)
+    with L.SignalGuard():
+        h = signal.getsignal(signal.SIGINT)
+        assert callable(h) and h is not signal.SIG_IGN
+    assert signal.getsignal(signal.SIGINT) == before
+
+
+def test_options_that_would_be_silently_ignored_are_errors(tmp_path, capsys):
+    assert run(tmp_path, ["aider", "--model", "x", "--bin", FAKE, "--quiet"]) == 2
+    assert "--model is only used by" in capsys.readouterr().err
+    assert run(tmp_path, ["claude-code", "--url", "http://127.0.0.1:1", "--port", "2", "--bin", FAKE, "--quiet"]) == 2
+    assert "use one" in capsys.readouterr().err
+
+
+def test_continue_says_it_replaces_the_users_config():
+    assert "temporary config" in L.warnings_for("continue", {})[0]
+
+
+def test_a_bare_filename_in_the_working_directory_is_not_a_binary(tmp_path, monkeypatch):
+    (tmp_path / "mytool").write_text("x")
+    monkeypatch.chdir(tmp_path)
+    assert L.resolve_binary("mytool", None) is None
+    assert L.resolve_binary(str(tmp_path / "mytool"), None) == str(tmp_path / "mytool")
+
+
+def test_port_resolution_reads_the_given_environment(tmp_path):
+    (tmp_path / "d").mkdir()
+    (tmp_path / "d" / ".env").write_text("GUARDIAN_PORT=9456\n", encoding="utf-8")
+    assert L.configured_port({}, L.data_dirs({"GUARDIAN_DATA_DIR": str(tmp_path / "d")})) == 9456

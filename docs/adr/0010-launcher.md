@@ -16,7 +16,7 @@ step without touching anything the user owns.
 reaches Claude Code, not the proxy; the usage text lists it. It does exactly this:
 
 1. **Resolve the proxy address the way the proxy does.** `GUARDIAN_PORT` / `GUARDIAN_HOST` from the environment, then the
-   data directory's `.env` (`cg_doctor.read_env_file`; the proxy loads `.env` with `override=False`), default 8786. The URL the
+   data directory's `.env` (`cg_launch` reads it with its own small reader; the proxy loads `.env` with `override=False`). The client is handed the environment as the shell gave it, snapshotted before `.env` is loaded, so no `.env` value (for example `GUARDIAN_ARCHIVE_KEY`) reaches the client, default 8786. The URL the
    client gets is always `http://127.0.0.1:<port>`; a non-loopback `GUARDIAN_HOST` is never put in a client's environment (a
    proxy we start is told `GUARDIAN_HOST=127.0.0.1` and `GUARDIAN_PORT=<port>` explicitly). `--port` and `--url` override.
 2. **Find or start the proxy.** If `/guardian/stats` answers (it carries a `version` key; polled with no environment proxy),
@@ -34,7 +34,7 @@ reaches Claude Code, not the proxy; the usage text lists it. It does exactly thi
    The only files created are the proxy's output temp file and, for `continue`, a temp config; both removed at the end.
 4. **Signals and shutdown.** While the client runs, the launcher handles SIGINT with a no-op *function* (never `SIG_IGN`, which the client would inherit across `exec` and lose its Ctrl-C; a test checks the client's disposition),
    forwards SIGTERM/SIGHUP to the client, and cleans up afterwards in a `finally`, whatever happened. It terminates a proxy it
-   started: POSIX SIGTERM, wait 5 s, SIGKILL; Windows CTRL_BREAK_EVENT, wait, then `terminate()`, then `kill()`. A proxy that
+   started: POSIX SIGTERM, wait 5 s, SIGKILL; Windows CTRL_BREAK_EVENT (falling back to `terminate()`), wait, then `kill()`; a second Ctrl-C during that wait still ends in a kill. A proxy that
    was already running is never touched. Windows has no SIGHUP: closing the console sends CTRL_CLOSE_EVENT to every process on it, the proxy included, so nothing is orphaned there. The exit code is the client's; a client killed by signal N exits 128+N; launcher
    problems exit 2; a missing client binary exits 127. Cleanup failures are printed to stderr and never change the exit code.
    Limit, stated: `SIGKILL` of the launcher cannot be caught and leaves an idle loopback proxy running.
@@ -64,6 +64,10 @@ The proxy's own settings (upstream URL, window) come from its normal environment
 with stdio inherited, in `INIT_CWD` (npm runs scripts in the package directory), handling SIGINT with a no-op listener (`process.on('SIGINT', noop)`, never an ignored signal) so Ctrl-C reaches the
 client only; its pre-check names the Python it tried in the install hint; on Windows `npm run` goes through `npm.cmd`, which can show cmd.exe's "Terminate batch job" prompt on Ctrl-C, so `node launch.mjs <client>` is the documented way to start it there (not tested on Windows in this PR). The DSH engine needs no proxy; nothing in the engine changes. `launch.mjs` is in `package.json` `files` and in the
 `check` script.
+
+## Known limits
+
+`.cmd` shims on Windows run through cmd.exe, so `&`, `|`, `^`, `%` in client arguments are interpreted by it (the arguments are the user's own); Claude Code's own `.cmd` shim can also show "Terminate batch job?" on Ctrl-C, not only npm's. A Ctrl-Break typed on Windows reaches the proxy too. A `.py` client runs under the launcher's interpreter whatever its shebang says. `--model` is accepted only for `continue`, `--url` and `--port` are mutually exclusive, and a bare file name in the working directory is not taken for a binary.
 
 ## Failure modes
 
@@ -108,7 +112,8 @@ Round 1 (*revise*): blocking: the proxy would have died on a user's Ctrl-C on PO
 fastapi, Windows stop sequence, packaging omissions. Non-blocking adopted: dispatch before the `--help` scan, 60 s readiness,
 OpenClaude/aider model variables, Anthropic-upstream note, 128+N exit codes, GUI clients listed as steps, `continue` via a temp config,
 the `openai` row defined, test isolation (HOME/USERPROFILE/APPDATA, ports, leftover children), README contradiction.
-Round 2: one blocking item left: ignoring SIGINT with `SIG_IGN` is inherited by the client on POSIX; a function handler is used instead,
+Code review (fresh Opus reviewer), round 1 -- four blocking: (1) `.env` values, including `GUARDIAN_ARCHIVE_KEY`, reached the client's environment through `context_guardian.py` importing `.env` before `launch` copied `os.environ` (reproduced; fixed by snapshotting the environment before `load_dotenv`, tested through both entry points); (2) a second Ctrl-C or a SIGTERM during cleanup replaced the client's exit code and left the proxy running (handlers now stay installed through cleanup, `stop_proxy` always ends in a kill, a signal while waiting for the proxy aborts the launch); (3) `NO_PROXY` handling dropped the user's own entries in the other spelling (both are merged, one list written to both); (4) the README named a run that was not recorded (now recorded, with its output and date, and the runner checks every turn). Non-blocking fixed: silent options, bare file names, port resolution from the given environment, the notice that `continue` replaces the user's config, test leakage of temp files, ADR text that disagreed with the code.
+Round 2 (design): one blocking item left: ignoring SIGINT with `SIG_IGN` is inherited by the client on POSIX; a function handler is used instead,
 with a test on the client's disposition, and the same in `launch.mjs`. The reviewer accepted both judgement calls for the maintainer to
 sign off: print-only for the settings clients (the brief's `--apply` pattern is not followed for `opencode.json`; an `--apply` for it is an
 open item) and refusing to start the client when the proxy will not start (opt-in `--direct-if-proxy-fails`).
