@@ -414,6 +414,11 @@ def run_client(cmd: List[str], env: Dict[str, str], guard: Optional[SignalGuard]
     proc = subprocess.Popen(cmd, env=env)
     if guard is not None:
         guard.client = proc
+        if guard.signalled is not None and guard.signalled != getattr(signal, "SIGINT", None):
+            try:
+                proc.send_signal(guard.signalled)          # arrived between Popen and now: pass it on
+            except Exception:                              # noqa: BLE001
+                pass
     while True:
         try:
             return exit_code_for(proc.wait())
@@ -496,8 +501,10 @@ def launch(argv: List[str], environ: Optional[Dict[str, str]] = None) -> int:
 
     proc, log_path, temp_files = None, None, []
     code = 2
-    try:
-        with SignalGuard() as guard:
+    # The guard encloses the cleanup too: a SIGTERM/SIGHUP/second Ctrl-C while the proxy is being stopped
+    # must neither replace the client's exit code nor leave the proxy running.
+    with SignalGuard() as guard:
+        try:
             def interrupted() -> bool:
                 return guard.signalled is not None
 
@@ -539,24 +546,24 @@ def launch(argv: List[str], environ: Optional[Dict[str, str]] = None) -> int:
             say("%s [%s]" % (client, status))
             code = _run(exe, rest, env, kind, opts, base_url, temp_files, guard)
             return code
-    except BaseException as exc:                           # noqa: BLE001 -- the launcher never leaves a traceback
-        if isinstance(exc, KeyboardInterrupt):
-            return 130
-        _warn("%s: %s" % (type(exc).__name__, exc))
-        return 2
-    finally:
-        # Cleanup must never replace the client's exit code or raise past this point.
-        try:
-            if proc is not None:
-                stop_proxy(proc)
-        except BaseException as exc:                       # noqa: BLE001
-            _warn("cleanup failed: %s" % exc)
-        for path in [log_path] + temp_files:
-            if path:
-                try:
-                    os.unlink(path)
-                except BaseException:                      # noqa: BLE001
-                    pass
+        except BaseException as exc:                           # noqa: BLE001 -- the launcher never leaves a traceback (SystemExit becomes exit 2)
+            if isinstance(exc, KeyboardInterrupt):
+                return 130
+            _warn("%s: %s" % (type(exc).__name__, exc))
+            return 2
+        finally:
+            # Cleanup must never replace the client's exit code or raise past this point.
+            try:
+                if proc is not None:
+                    stop_proxy(proc)
+            except BaseException as exc:                       # noqa: BLE001
+                _warn("cleanup failed: %s" % exc)
+            for path in [log_path] + temp_files:
+                if path:
+                    try:
+                        os.unlink(path)
+                    except BaseException:                      # noqa: BLE001
+                        pass
 
 
 def _run(exe: str, rest: List[str], env: Dict[str, str], kind: str, opts: Dict, base_url: Optional[str],
