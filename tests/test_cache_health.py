@@ -128,7 +128,7 @@ def test_line_with_and_without_cached_counts():
     h.observe("S", [("s", 100), ("n", 20)], source="generated")
     line = h.line("S")
     assert line.startswith("last 1 compaction kept 25% of the prefix (first 50 tokens identical in 1/1)")
-    assert "reports no cached-token counts" in line and "estimates" in line and "0%" not in line.split("(token")[0].split("; ")[-1]
+    assert "no cached-token counts were seen" in line and "estimates" in line
     h = ch.CacheHealth(head_tokens=50)   # same session again, with the upstream reporting cached tokens
     h.observe("S", [("s", 100), ("a", 300)])
     h.usage("S", 1, 400, 300)
@@ -136,7 +136,7 @@ def test_line_with_and_without_cached_counts():
     h.usage("S", 2, 120, 12)
     line = h.line("S")
     assert "cache hit rate 75% before, 10% on the compacted request" in line
-    assert "reports no cached-token counts" not in line
+    assert "no cached-token counts were seen" not in line
 
 
 def test_hit_rates_land_on_the_right_request_even_when_late():
@@ -182,6 +182,7 @@ def test_usage_cache_counts_shapes(g):
     assert f(json.dumps({"usage": {"input_tokens": 5, "cache_read_input_tokens": 80, "cache_creation_input_tokens": 15}}).encode(), j) == (100, 80)
     assert f(json.dumps({"usage": {"input_tokens": 100}}).encode(), j) == (100, None)
     assert f(json.dumps({"timings": {"prompt_n": 20, "cache_n": 80}}).encode(), j) == (100, 80)
+    assert f(json.dumps({"usage": {"prompt_tokens": 100}, "timings": {"prompt_n": 20, "cache_n": 80}}).encode(), j) == (100, 80)
     assert f(json.dumps({"prompt_eval_count": 40}).encode(), j) == (40, None)
     assert f(b"not json", j) is None and f(b"[]", j) is None and f(b"{}", j) is None
 
@@ -271,8 +272,12 @@ def test_scripted_session_reports_what_the_stub_saw(g):
         return n
     last = rows[-1]
     i = last["seq"] - 1
-    expect_msgs = common(bodies[i - 1]["messages"], bodies[i]["messages"])
+    a, b = bodies[i - 1]["messages"], bodies[i]["messages"]
+    expect_msgs = common(a, b)
     assert expect_msgs >= 1                                   # the system prompt at least
+    shared = sum(len(json.dumps(x)) for x in a[:expect_msgs])
+    expect_pct = 100.0 * shared / sum(len(json.dumps(x)) for x in a)
+    assert abs(last["shared_pct"] - expect_pct) <= 10, (last["shared_pct"], expect_pct)
     assert 0 <= last["shared_pct"] <= 100
     assert last["shared_tokens"] > 0
     assert "kept" in s["line"] and "% of the prefix" in s["line"]
@@ -340,7 +345,7 @@ def test_ledger_failures_never_touch_the_response(g, monkeypatch, target):
         monkeypatch.setattr(g.cg_cache_health, "fingerprint", boom)
     r = turn(g, history(3))
     assert r.status_code == 200 and r.content == clean
-    assert seen[-1] == seen[0] or len(seen) == 2             # upstream saw the same request both times
+    assert len(seen) == 2 and seen[1] == seen[0]               # the upstream saw the same bytes both times
     assert stats(g)["cache_health"]["errors"] >= 1
 
 
@@ -383,4 +388,101 @@ def test_statusline_cache_suffix():
 
 def test_dashboard_has_the_card_and_escapes_the_line(g):
     html = TestClient(g.app, base_url=LOOPBACK).get("/guardian/health").text
-    assert "Cache health" in html and ".replace(/<" not in html or "&lt;" in html
+    assert "Cache health" in html
+    assert '.replace(/&/g,"&amp;").replace(/</g,"&lt;")' in html      # the line is escaped before it is shown
+
+
+# ---- review round 1: Anthropic route, list system, streaming, interleaving ----------------------
+
+def wire_anthropic(g, cached=40):
+    seen = []
+
+    def handler(request):
+        if request.url.path.endswith("/messages"):
+            if b"BEGIN_TRANSCRIPT" in request.content or b"Summarise" in request.content[:2000] and False:
+                pass
+            body = json.loads(request.content)
+            seen.append(body)
+            txt = "a condensed summary of the older turns, long enough to be accepted by the guard" if body.get("max_tokens", 0) and "BEGIN_TRANSCRIPT" in json.dumps(body["messages"]) else "ok"
+            return R(json.dumps({"id": "m", "type": "message", "role": "assistant", "content": [{"type": "text", "text": txt}],
+                                 "stop_reason": "end_turn",
+                                 "usage": {"input_tokens": 10, "cache_read_input_tokens": cached, "cache_creation_input_tokens": 0}}).encode())
+        return httpx.Response(404, json={})
+    g._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return seen
+
+
+def a_turns(n, system):
+    h = []
+    for i in range(n):
+        h.append({"role": "user", "content": "question %d %s" % (i, "pad " * 60)})
+        h.append({"role": "assistant", "content": "answer %d %s" % (i, "pad " * 60)})
+    h.append({"role": "user", "content": "last question"})
+    return {"model": "m", "max_tokens": 50, "system": system, "messages": h}
+
+
+def a_post(g, body, session="a1"):
+    return TestClient(g.app, base_url=LOOPBACK).post("/v1/messages", content=json.dumps(body).encode(),
+                                                    headers={"content-type": "application/json", "x-guardian-session": session})
+
+
+@pytest.mark.parametrize("system", [
+    [{"type": "text", "text": "You are careful. " * 300, "cache_control": {"type": "ephemeral"}}],
+    "You are careful. " * 300])
+def test_anthropic_system_counts_toward_the_shared_prefix(g, system):
+    wire_anthropic(g)
+    for n in range(2, 12):
+        a_post(g, a_turns(n, system))
+    s = stats(g)["cache_health"]
+    rows = s["latest_session"]["rows"]
+    assert rows, s
+    last = rows[-1]
+    assert last["route"] == "messages"
+    assert last["shared_pct"] > 20                      # the system prompt (~1,400 tokens, longer than the head) leads and is unchanged
+    assert last["head_identical"] is True
+    assert "cache_control" in s["line"]
+    assert "cache hit rate" in s["line"]
+
+
+def test_streamed_compaction_is_recorded_and_bytes_pass(g):
+    raw = (b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+           b'data: {"choices":[],"usage":{"prompt_tokens":10,"prompt_tokens_details":{"cached_tokens":5}}}\n\n'
+           b'data: [DONE]\n\n')
+
+    def handler(req):
+        if not req.url.path.endswith("/chat/completions"):
+            return httpx.Response(404)
+        if b"BEGIN_TRANSCRIPT" in req.content:
+            return R(json.dumps({"choices": [{"message": {"role": "assistant", "content": "condensed summary of the older turns, long enough to be accepted"}, "finish_reason": "stop"}]}).encode())
+        return R(raw, "text/event-stream")
+    g._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    for n in range(1, 9):
+        assert turn(g, history(n), stream=True).content == raw
+    s = stats(g)["cache_health"]
+    assert s["compactions"] >= 1 and s["reports_cached_tokens"] is True
+
+
+def test_two_interleaved_sessions_through_the_proxy(g):
+    wire(g)
+    for n in range(1, 9):
+        turn(g, history(n), session="one")
+        turn(g, history(n)[:1] + [{"role": "user", "content": "other conversation %d %s" % (n, "x " * 200)}] * n, session="two")
+    sessions = TestClient(g.app, base_url=LOOPBACK).get("/guardian/stats").json()["cache_health"]["sessions"]
+    assert sessions == 2
+    assert g.CACHE_HEALTH._sessions["one"].rows or g.CACHE_HEALTH._sessions["two"].rows
+
+
+def test_reused_memo_with_a_changed_front_is_a_row_not_a_replay():
+    h = ch.CacheHealth()
+    h.observe("S", [("s", 100), ("a", 100), ("b", 100)])                 # an uncompacted request was recorded
+    h.observe("S", [("s", 100), ("sum", 30)], source="reused")           # the memo had been filled elsewhere
+    s = h.summary()
+    assert s["compactions"] == 1 and s["reused_turns"] == 0
+
+
+def test_skipped_large_forgets_the_stale_previous_request():
+    h = ch.CacheHealth()
+    h.observe("S", [("s", 100), ("a", 100)])
+    h.forget_previous("S")
+    h.observe("S", [("s", 100), ("sum", 30)], source="generated")
+    assert h.summary()["compactions"] == 0                               # nothing to compare against

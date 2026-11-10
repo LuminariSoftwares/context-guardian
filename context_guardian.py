@@ -893,6 +893,8 @@ def _cache_counts_from(obj: Any) -> Optional[Tuple[int, Optional[int]]]:
             if n:
                 details = usage.get("prompt_tokens_details")
                 cached = _int_or_none(details.get("cached_tokens")) if isinstance(details, dict) else None
+                if cached is None and isinstance(obj.get("timings"), dict):
+                    cached = _int_or_none(obj["timings"].get("cache_n"))     # llama.cpp reports both blocks
                 return n, cached
             if _int_or_none(usage.get("input_tokens")) is not None:
                 total = sum(_int_or_none(usage.get(k)) or 0
@@ -3730,12 +3732,13 @@ def _cache_done(job: Dict[str, Any], data: bytes, capped: bool, resp: httpx.Resp
             return
         if job["size"] > CACHE_HEALTH_MAX_BYTES:
             CACHE_HEALTH.skipped_large += 1
+            CACHE_HEALTH.forget_previous(job["session"])      # the next comparison must not use a stale request
             return
         payload, route = job["payload"], job["route"]
         elements = cg_cache_health.fingerprint(
             payload, route, lambda m: estimate_tokens([m]),
             lambda tools: estimate_tool_tokens({"tools": tools}),
-            lambda x: int(len(x if isinstance(x, str) else _anthropic_text(x)) / CHARS_PER_TOKEN_ESTIMATE))
+            lambda x: int(len(x if isinstance(x, str) else _anthropic_text([x])) / CHARS_PER_TOKEN_ESTIMATE))
         seq = CACHE_HEALTH.observe(job["session"], elements, route=route, source=job["source"],
                                    spill=job["spill"], at=time.strftime("%Y-%m-%dT%H:%M:%S"))
         if not capped and not resp.headers.get("content-encoding"):
@@ -3748,6 +3751,17 @@ def _cache_done(job: Dict[str, Any], data: bytes, capped: bool, resp: httpx.Resp
     except Exception as exc:                               # noqa: BLE001
         CACHE_HEALTH.errors += 1
         log.debug("cache health failed, response unaffected: %s", exc)
+
+
+def _after_response(fn, *args) -> None:
+    """Run bookkeeping on the next turn of the event loop, so the response's last chunk is
+    not held behind it. Falls back to running it now if there is no loop. Never raises."""
+    try:
+        asyncio.get_running_loop().call_soon(fn, *args)
+    except RuntimeError:
+        fn(*args)
+    except Exception as exc:                               # noqa: BLE001
+        log.debug("could not schedule bookkeeping: %s", exc)
 
 
 def _cache_job(session_id: Optional[str], route: str, payload: Any, body: bytes) -> Optional[Dict[str, Any]]:
@@ -4549,7 +4563,7 @@ async def proxy(path: str, request: Request):
     if calib_model is not None or cache_job is not None:
         body_stream = _tapped_stream(
             upstream_resp.aiter_raw(), upstream_resp, calib_model, calib_estimate,
-            on_done=(lambda data, capped, resp, job=cache_job: _cache_done(job, data, capped, resp))
+            on_done=(lambda data, capped, resp, job=cache_job: _after_response(_cache_done, job, data, capped, resp))
             if cache_job is not None else None)
     else:
         body_stream = upstream_resp.aiter_raw()

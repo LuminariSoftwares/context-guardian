@@ -151,3 +151,13 @@ Round 2 verdict *approve*, no blockers. Adopted from its non-blocking list: Cont
 the PR ships with `0`, `snap["source"]` set after the dry-run return (test), record only 200 responses (test),
 overlapping-response ordering named as a limit, `cache_prefix_pct` on `/guardian/usage` for the statusline, doctor
 "off" line (existing doctor tests unaffected).
+
+Code review (fresh Opus reviewer, after implementation), round 1: **one blocking**: on the Anthropic route a list-form
+`system` (what Claude Code sends, with `cache_control`) was estimated at 0 tokens, so the headline figure was wrong and the
+line contradicted itself. Fixed (each block estimated on its own text) and tested through the proxy on both the string and
+the list form. Also fixed: ledger work ran inside the tap's `finally`, i.e. before the last chunk of the response, contrary to
+the docs (reproduced with a 0.5 s sleep); it is now scheduled with `call_soon` and the measured cost stays in the table above;
+llama.cpp's `timings.cache_n` was ignored when `usage.prompt_tokens` was present; a reused-memo request whose front really
+changed was counted as a replay (a row is now written whenever the prefix actually broke); a skipped oversized request left a
+stale "previous request"; the line blamed the upstream when a stream simply carried no usage frame; five weak assertions
+strengthened and Anthropic, streaming and interleaved-session proxy tests added.

@@ -104,7 +104,11 @@ class CacheHealth:
         prev = rec.prev
         if prev is not None and prev:
             n, shared = shared_prefix(prev, elements)
-            if source in REAL_SOURCES:
+            # A row is a compaction that really rewrote the prefix: a new or extended summary
+            # always did; a reused summary did only when the request's front differs from the
+            # last one we recorded (the compacted request was not recorded, or another session
+            # filled the memo).
+            if source in REAL_SOURCES or (source == "reused" and n < len(prev)):
                 rec.compactions += 1
                 rec.rows.append(self._row(rec, seq, route, source, at, prev, elements, n, shared))
                 while len(rec.rows) > self.max_rows:
@@ -139,6 +143,12 @@ class CacheHealth:
             "head_hash_after": hashlib.sha256("".join(d for d, _ in new[:k]).encode()).hexdigest()[:8],
             "hit_before": hit_before, "hit_at": None,
         }
+
+    def forget_previous(self, session: str) -> None:
+        """Drop the remembered previous request (it was not recorded, so it is stale)."""
+        rec = self._sessions.get(session)
+        if rec is not None:
+            rec.prev = None
 
     def usage(self, session: str, seq: int, prompt: Optional[int], cached: Optional[int]) -> None:
         """File the upstream's reported prompt/cached counts under the request they belong to."""
@@ -188,7 +198,7 @@ class CacheHealth:
                 parts.append("%d%% on the compacted request" % round(100 * sum(at) / len(at)))
             text += "; cache hit rate " + ", ".join(parts)
         elif not rec.reports:
-            text += "; this upstream reports no cached-token counts, so only prefix stability is shown"
+            text += "; no cached-token counts were seen (the upstream may report none, or a stream carried no usage frame), so only prefix stability is shown"
         text += " (token counts are estimates"
         if any(r["route"] == "messages" for r in rows):
             text += "; hosted Anthropic caches only up to the client's cache_control breakpoints"
