@@ -4593,8 +4593,7 @@ async def proxy(path: str, request: Request):
                 except Exception as exc:                   # noqa: BLE001
                     log.error("Context tools failed (%s: %s). Sending the request the normal way.",
                               type(exc).__name__, exc)
-                    _state["context_loops_discarded"] += 1
-                    done = None
+                    done = None                            # the loop's own finally already counted the discard
                 if done is not None:
                     return done
             # Grabbed HERE, immediately after the estimate was recorded and

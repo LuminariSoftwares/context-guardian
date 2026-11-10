@@ -640,3 +640,17 @@ def test_compaction_on_top_of_a_fold_drops_the_fold(g, monkeypatch):
     monkeypatch.setattr(g, "maybe_compact", exact_count_says_over)
     chat(g, history(9))
     assert g.CONTEXT_FOLDS.total() == 0 and g._state["context_folds_dropped"] >= 1
+
+
+def test_a_raising_loop_is_counted_as_discarded_once(g):
+    def handler(request):
+        body = json.loads(request.content)
+        if "BEGIN_TRANSCRIPT" in json.dumps(body["messages"]):
+            return Model._reply(200, {"choices": [{"message": {"content": SUMMARY}}]})
+        if has_guardian_tools(body):
+            return Model._reply(200, {"choices": [{"message": "not a dict"}]})          # unparseable reply
+        return Model._reply(200, {"choices": [{"message": {"role": "assistant", "content": "normal"}, "finish_reason": "stop"}]})
+    g._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    r = chat(g, history(8))
+    assert r.json()["choices"][0]["message"]["content"] == "normal"
+    assert g._state["context_loops"] == 1 and g._state["context_loops_discarded"] == 1

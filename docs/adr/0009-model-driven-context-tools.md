@@ -115,7 +115,7 @@ persist: a loop commits at its end or not at all, spans are written only when a 
 client disconnect (`CancelledError`) leaves the commit step unreached. A failed loop costs the extra upstream calls it
 made. Every proxy-tool execution runs under the loop deadline.
 
-**Audit.** Every proxy-tool call, accepted or rejected, is logged as a `context_tool` event (`tool`, `ok`, `reason`,
+**Audit.** Every executed proxy-tool call (the round that trips the round or call cap is not executed), accepted or rejected, is logged as a `context_tool` event (`tool`, `ok`, `reason`,
 `turns`, `est_tokens`, `fold`), every fold application (with the span name), orphan drop and cancellation as `context_fold`,
 and a fold's span carries `{"fold": "f<k>", "model_requested": true}` (`_apply_memo` gains an optional `extra` passed to
 `write_span`), all counted in
