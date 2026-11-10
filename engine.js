@@ -47,6 +47,7 @@ import { ANCHORS_REV, findLostAnchors, lostConstraints, renderCarried } from './
 import { buildHandoff, writeHandoff } from './cg_handoff.js'
 import { staleRecall } from './cg_autorecall.js'
 import { staleAssertions, steerText } from './cg_postcheck.js'
+import { planIdle, idleRecord } from './cg_idle_route.js'
 import { pruneSealed, writeSealedSpan } from './cg_seal.js'
 import { randomUUID } from 'node:crypto'
 
@@ -1121,18 +1122,42 @@ export function apply(ctx, config) {
     idleTimers.delete(agent)
     const before = measure(agent)
     record({ event: 'idle-check', session: String(agent.session?.id ?? ''), tokens: before?.tokens ?? null, pressure: before === undefined ? null : Number(before.pressure.toFixed(4)), threshold: options.idleCompactRatio })
-    if (before === undefined || before.pressure < options.idleCompactRatio) return
-    // After a failed or empty attempt, wait for the surface to grow 10 % before trying again.
-    if (before.tokens < (idleFloor.get(agent.session) ?? 0)) return
-    // Space idle passes: every pass is another lossy summary of a summary.
-    if (Date.now() - (idleLast.get(agent.session) ?? 0) < options.idleCooldownMs) return
+    // After a failed or empty attempt, wait for the surface to grow 10 % before trying again; passes are spaced
+    // because every idle pass is another lossy summary of a summary. With the append-only chain on, the pass
+    // goes to the chained compactRegion (compactNow would roll the whole chain up); manual /compact,
+    // context_compact and idle-on + appendOnly-off still go through compactNow.
+    const plan = planIdle({
+      idleRatio: options.idleCompactRatio,
+      cooldownMs: options.idleCooldownMs,
+      appendOnly: options.appendOnly,
+      pressure: before?.pressure,
+      tokens: before?.tokens ?? 0,
+      floorTokens: idleFloor.get(agent.session) ?? 0,
+      lastIdleMs: idleLast.get(agent.session) ?? 0,
+      nowMs: Date.now(),
+      hasCompactRegion: typeof service.compactRegion === 'function',
+      surface: Array.from(agent.session?.surface?.nodes ?? []),
+    })
+    if (plan.action === 'skip') return
     idleLast.set(agent.session, Date.now())
     triggerBySession.set(agent.session, 'idle')
+    if (plan.action === 'compactRegion') {
+      try {
+        await service.compactRegion(plan.start, plan.end, agent, AbortSignal.timeout(600_000))
+        const after = measure(agent)
+        record({ ...idleRecord(plan, before.tokens, after?.tokens ?? null), session: String(agent.session?.id ?? '') })
+        log.info(`context-guardian engine: idle compaction (chain) -- ~${before.tokens} -> ~${after?.tokens ?? '?'} tokens`)
+      } catch (error) {
+        idleFloor.set(agent.session, before.tokens * 1.1)
+        record({ ...idleRecord(plan, before.tokens, null), session: String(agent.session?.id ?? ''), error: String(error?.code ?? error?.message ?? error).slice(0, 200) })
+      } finally { triggerBySession.delete(agent.session) }
+      return
+    }
     try {
       const result = await ctx.compaction.compactNow(agent, AbortSignal.timeout(600_000))
       const after = measure(agent)
       if (result === null) idleFloor.set(agent.session, before.tokens * 1.1)
-      record({ event: 'idle-compaction', session: String(agent.session?.id ?? ''), before: before.tokens, after: after?.tokens ?? null, compacted: result !== null })
+      record({ ...idleRecord(plan, before.tokens, after?.tokens ?? null), session: String(agent.session?.id ?? ''), compacted: result !== null })
       if (result !== null) log.info(`context-guardian engine: idle compaction at ${(before.pressure * 100).toFixed(0)} % -- ~${before.tokens} -> ~${after?.tokens ?? '?'} tokens`)
     } catch (error) {
       idleFloor.set(agent.session, before.tokens * 1.1)
