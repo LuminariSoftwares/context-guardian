@@ -3754,10 +3754,12 @@ def _cache_done(job: Dict[str, Any], data: bytes, capped: bool, resp: httpx.Resp
 
 
 def _after_response(fn, *args) -> None:
-    """Run bookkeeping on the next turn of the event loop, so the response's last chunk is
-    not held behind it. Falls back to running it now if there is no loop. Never raises."""
+    """Run bookkeeping on a worker thread, so neither the response's last chunk nor the event
+    loop waits for it (a callback on the loop itself still ran before the final chunk was
+    flushed: the HTTP middleware passes every send through the loop). Falls back to running it
+    now if there is no loop. Never raises."""
     try:
-        asyncio.get_running_loop().call_soon(fn, *args)
+        asyncio.get_running_loop().run_in_executor(None, fn, *args)
     except RuntimeError:
         fn(*args)
     except Exception as exc:                               # noqa: BLE001

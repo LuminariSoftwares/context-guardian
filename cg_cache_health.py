@@ -13,6 +13,7 @@ calls it after the response has been delivered (ADR 0008).
 import collections
 import hashlib
 import json
+import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 Element = Tuple[str, int]               # (12-hex digest of the canonical JSON, estimated tokens)
@@ -80,6 +81,15 @@ class _Session:
         self.hit: Optional[Tuple[int, float]] = None     # (seq, rate) of the latest request with a rate
 
 
+def _locked(fn):
+    def wrapper(self, *a, **k):
+        with self._lock:
+            return fn(self, *a, **k)
+    wrapper.__name__ = fn.__name__
+    wrapper.__doc__ = fn.__doc__
+    return wrapper
+
+
 class CacheHealth:
     def __init__(self, head_tokens: int = 1024, max_sessions: int = 64, max_rows: int = 50) -> None:
         self.head_tokens = max(1, int(head_tokens))
@@ -88,8 +98,10 @@ class CacheHealth:
         self._sessions: "collections.OrderedDict[str, _Session]" = collections.OrderedDict()
         self.errors = 0
         self.skipped_large = 0
+        self._lock = threading.RLock()      # the proxy files results from a worker thread and reads from the loop
 
     # -- feeding -------------------------------------------------------------------
+    @_locked
     def observe(self, session: str, elements: List[Element], *, route: str = "chat",
                 source: Optional[str] = None, spill: bool = False, at: str = "") -> int:
         """Record the request the upstream just answered. `source` is the summary memo source
@@ -144,12 +156,14 @@ class CacheHealth:
             "hit_before": hit_before, "hit_at": None,
         }
 
+    @_locked
     def forget_previous(self, session: str) -> None:
         """Drop the remembered previous request (it was not recorded, so it is stale)."""
         rec = self._sessions.get(session)
         if rec is not None:
             rec.prev = None
 
+    @_locked
     def usage(self, session: str, seq: int, prompt: Optional[int], cached: Optional[int]) -> None:
         """File the upstream's reported prompt/cached counts under the request they belong to."""
         rec = self._sessions.get(session)
@@ -167,6 +181,7 @@ class CacheHealth:
                 row["hit_at"] = rate
 
     # -- reading -------------------------------------------------------------------
+    @_locked
     def prefix_pct(self, session: str) -> Optional[int]:
         """Mean share of the previous prefix kept over the session's last compactions, or None."""
         rec = self._sessions.get(session)
@@ -175,6 +190,7 @@ class CacheHealth:
             return None
         return int(round(sum(r["shared_pct"] for r in rows) / len(rows)))
 
+    @_locked
     def line(self, session: Optional[str] = None) -> str:
         sid = session or (next(reversed(self._sessions)) if self._sessions else None)
         rec = self._sessions.get(sid) if sid is not None else None
@@ -204,6 +220,7 @@ class CacheHealth:
             text += "; hosted Anthropic caches only up to the client's cache_control breakpoints"
         return text + ")"
 
+    @_locked
     def summary(self) -> Dict[str, Any]:
         recs = list(self._sessions.items())
         latest_id, latest = (recs[-1] if recs else (None, None))

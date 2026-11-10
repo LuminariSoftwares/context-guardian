@@ -399,11 +399,11 @@ def wire_anthropic(g, cached=40):
 
     def handler(request):
         if request.url.path.endswith("/messages"):
-            if b"BEGIN_TRANSCRIPT" in request.content or b"Summarise" in request.content[:2000] and False:
-                pass
             body = json.loads(request.content)
-            seen.append(body)
-            txt = "a condensed summary of the older turns, long enough to be accepted by the guard" if body.get("max_tokens", 0) and "BEGIN_TRANSCRIPT" in json.dumps(body["messages"]) else "ok"
+            summarising = "BEGIN_TRANSCRIPT" in json.dumps(body["messages"])
+            if not summarising:
+                seen.append(body)
+            txt = "a condensed summary of the older turns, long enough to be accepted by the guard" if summarising else "ok"
             return R(json.dumps({"id": "m", "type": "message", "role": "assistant", "content": [{"type": "text", "text": txt}],
                                  "stop_reason": "end_turn",
                                  "usage": {"input_tokens": 10, "cache_read_input_tokens": cached, "cache_creation_input_tokens": 0}}).encode())
@@ -467,9 +467,13 @@ def test_two_interleaved_sessions_through_the_proxy(g):
     for n in range(1, 9):
         turn(g, history(n), session="one")
         turn(g, history(n)[:1] + [{"role": "user", "content": "other conversation %d %s" % (n, "x " * 200)}] * n, session="two")
-    sessions = TestClient(g.app, base_url=LOOPBACK).get("/guardian/stats").json()["cache_health"]["sessions"]
-    assert sessions == 2
-    assert g.CACHE_HEALTH._sessions["one"].rows or g.CACHE_HEALTH._sessions["two"].rows
+    assert stats(g)["cache_health"]["sessions"] == 2
+    one, two = g.CACHE_HEALTH._sessions["one"], g.CACHE_HEALTH._sessions["two"]
+    assert one.rows and two.rows
+    # session one grows by appending, so its comparisons see its own system prompt; session two's first
+    # message differs, so its numbers cannot have been computed against session one's requests
+    assert one.rows[-1]["head_hash_before"] != two.rows[-1]["head_hash_before"] or one.rows[-1]["shared_tokens"] != two.rows[-1]["shared_tokens"]
+    assert one.seq == two.seq == 8
 
 
 def test_reused_memo_with_a_changed_front_is_a_row_not_a_replay():

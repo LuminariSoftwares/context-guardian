@@ -56,10 +56,10 @@ changes the message right after the system prompt, so the shared prefix ends the
    them) leave both `null`, and the line says "this upstream reports no cached-token counts, so only prefix
    stability is shown" rather than 0%.
 5. *When the work runs.* Not before the request is sent. The fingerprint, comparison and usage read all run in the
-   response tap's `finally`, after the last byte has gone to the client (the tap is installed when calibration is on
+   response tap's `finally`, handed to a worker thread so neither the final chunk nor the event loop waits for it (checked with a real uvicorn server: with the ledger work made to sleep 1 s the client's response took 0.019 s; the same server with the work on the loop took 1.03 s) (the tap is installed when calibration is on
    or `GUARDIAN_CACHE_HEALTH=1`; with calibration off it is a pure copy-after-yield wrapper and a test proves byte and
    chunk equality). The only work on the request path is reading three values from a contextvar. Requests whose JSON
-   exceeds `GUARDIAN_CACHE_HEALTH_MAX_MB` (default 4) are skipped and counted, and only a 200 response is recorded (a rejected request is not what the upstream's cache holds). The pass still runs on the event loop after the response; its measured cost goes in the PR, which is why the cap is small. Requests of one session that overlap are compared in the order their responses finish; that can mis-order the comparison for that session and is a documented limit.
+   exceeds `GUARDIAN_CACHE_HEALTH_MAX_MB` (default 4) are skipped and counted, and only a 200 response is recorded (a rejected request is not what the upstream's cache holds). The pass runs on a worker thread (the ledger has a lock); the cap keeps it small. Requests of one session that overlap are compared in the order their responses finish; that can mis-order the comparison for that session and is a documented limit.
 6. *Surfaces.* `/guardian/stats` `cache_health` (`enabled`, `sessions`, `compactions`, `reused_turns`, `spills`,
    `prefix_breaks_without_compaction`, `reports_cached_tokens`, `errors`, and for the latest session its last 5
    rows and `line`); the `/guardian/health` dashboard shows the line in one card; `context-guardian-statusline --cache`
@@ -130,7 +130,7 @@ independent computation of the common prefix of the stub's recorded requests (ru
 
 Fingerprint pass (canonical JSON + SHA-256 + estimate per message), Python 3.13, Linux container, 2026-11-10,
 `fingerprint()` called on a synthetic history: 100 messages / 0.4 MB of JSON: 1.3 ms; 1000 messages / 3.5 MB: 11.6 ms.
-It runs on the event loop after the response, which is why `GUARDIAN_CACHE_HEALTH_MAX_MB` defaults to 4.
+It runs on a worker thread after the response is produced; the cap (`GUARDIAN_CACHE_HEALTH_MAX_MB`, 4) bounds it.
 
 ## Review log
 
@@ -156,7 +156,7 @@ Code review (fresh Opus reviewer, after implementation), round 1: **one blocking
 `system` (what Claude Code sends, with `cache_control`) was estimated at 0 tokens, so the headline figure was wrong and the
 line contradicted itself. Fixed (each block estimated on its own text) and tested through the proxy on both the string and
 the list form. Also fixed: ledger work ran inside the tap's `finally`, i.e. before the last chunk of the response, contrary to
-the docs (reproduced with a 0.5 s sleep); it is now scheduled with `call_soon` and the measured cost stays in the table above;
+the docs (reproduced with a 0.5 s sleep); it is now moved to a worker thread (a `call_soon` callback still ran before the final chunk: the HTTP middleware passes every send through the loop; found by the re-review with a real uvicorn server), with a lock inside the ledger;
 llama.cpp's `timings.cache_n` was ignored when `usage.prompt_tokens` was present; a reused-memo request whose front really
 changed was counted as a replay (a row is now written whenever the prefix actually broke); a skipped oversized request left a
 stale "previous request"; the line blamed the upstream when a stream simply carried no usage frame; five weak assertions
