@@ -92,6 +92,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 import cg_breakdown
+import cg_empty_retry
 
 # Single source of truth for the running code's version. Used by /guardian/stats,
 # the /guardian/health dashboard, the banner and the PyPI update check, through
@@ -243,6 +244,15 @@ DRY_RUN = os.environ.get("GUARDIAN_DRY_RUN", "0").strip().lower() in ("1", "true
 # that indexes choices[0] on every frame breaks on it.
 INJECT_STREAM_OPTIONS = os.environ.get(
     "GUARDIAN_INJECT_STREAM_OPTIONS", "0").strip().lower() in ("1", "true", "yes")
+
+# EMPTY_RETRY: when the upstream finishes a turn with nothing visible in it (empty text,
+# a reasoning block and no answer, or only an echo of the compaction header this proxy
+# injects), ask once more with a short nudge as trailing user text and give the client the
+# retry's answer. Off by default. One retry per turn; the nudge goes into that one request
+# only and is never stored or replayed. See cg_empty_retry.py.
+EMPTY_RETRY = os.environ.get(
+    "GUARDIAN_EMPTY_RETRY", "0").strip().lower() in ("1", "true", "yes")
+EMPTY_RETRY_NUDGE = (os.environ.get("GUARDIAN_EMPTY_RETRY_NUDGE") or "").strip() or cg_empty_retry.DEFAULT_NUDGE
 
 # --- 0.5.0 additions ---------------------------------------------------------
 # VERBOSE: print a visible multi-line banner on every compaction instead of the
@@ -630,6 +640,12 @@ _state = {
     # Summaries that did not fit one call at the window and were made in pieces
     # (summarize_in_pieces); the summary_chunked event carries the call count.
     "summaries_chunked": 0,
+    # GUARDIAN_EMPTY_RETRY: turns the upstream finished empty and re-asked (one retry each),
+    # the retries that produced an answer, and failures of the feature itself (the
+    # client got the upstream's own answer in those).
+    "empty_retries": 0,
+    "empty_retry_recovered": 0,
+    "empty_retry_errors": 0,
     # Span files actually written this run; the archive pointer counts these.
     "spans_written": 0,
     # Requests in which a message bigger than the window was archived and
@@ -4232,6 +4248,82 @@ async def maybe_compact_anthropic(client: httpx.AsyncClient, payload: Dict[str, 
     return out
 
 
+def _empty_retry_event(outcome: str, route: str) -> None:
+    """Count and log one empty-turn retry outcome ("retry", "recovered", "error")."""
+    key = {"retry": "empty_retries", "recovered": "empty_retry_recovered",
+           "error": "empty_retry_errors"}.get(outcome)
+    if key:
+        _state[key] += 1
+    log_event({"event": "empty_turn_retry", "outcome": outcome, "route": route})
+    if outcome == "retry":
+        log.info("Upstream finished a turn with nothing in it -- asking once more.")
+
+
+async def _send_nudged(client: httpx.AsyncClient, route: str, payload: Dict[str, Any],
+                       method: str, url: str, headers: Dict[str, str], params: Dict[str, str]):
+    """Send the one retry: the forwarded request plus the nudge. Returns the open
+    response (status 200 only) or None. The nudge exists only in this request body."""
+    body = json.dumps(cg_empty_retry.nudged_payload(route, payload, EMPTY_RETRY_NUDGE)).encode("utf-8")
+    resp = await client.send(client.build_request(method, url, content=body, headers=headers, params=params),
+                             stream=True)
+    if resp.status_code != 200 or resp.headers.get("content-encoding"):
+        await resp.aclose()
+        return None
+    return resp
+
+
+async def _empty_retry_body(client: httpx.AsyncClient, route: str, payload: Dict[str, Any],
+                            upstream_resp: httpx.Response, method: str, url: str,
+                            headers: Dict[str, str], params: Dict[str, str]):
+    """The response body the client reads, for a request that has the retry on. Any
+    failure of the feature yields the upstream's own bytes."""
+    content_type = upstream_resp.headers.get("content-type", "").lower()
+    if "text/event-stream" in content_type or payload.get("stream") is True:
+        async def start_retry():
+            resp = await _send_nudged(client, route, payload, method, url, headers, params)
+            if resp is None:
+                return None
+
+            async def chunks():
+                try:
+                    async for c in resp.aiter_raw():
+                        yield c
+                finally:
+                    await resp.aclose()
+            return chunks()
+        async for frame in cg_empty_retry.splice(
+                route, upstream_resp.aiter_raw(), start_retry,
+                lambda name: _empty_retry_event(name, route)):
+            yield frame
+        return
+
+    body = await upstream_resp.aread()
+    out = body
+    try:
+        try:
+            parsed = json.loads(body)
+        except ValueError:
+            parsed = None                                   # not JSON: not ours to judge
+        if parsed is not None and cg_empty_retry.response_is_empty(route, parsed):
+            _empty_retry_event("retry", route)
+            resp = await _send_nudged(client, route, payload, method, url, headers, params)
+            if resp is not None:
+                try:
+                    retry_body = await resp.aread()
+                finally:
+                    await resp.aclose()
+                data = json.loads(retry_body)
+                if cg_empty_retry.response_has_answer(route, data):
+                    out = retry_body
+                    _empty_retry_event("recovered", route)
+    except Exception as exc:                               # noqa: BLE001
+        log.error("Empty-turn retry failed (%s: %s). Returning the upstream's answer unchanged.",
+                  type(exc).__name__, exc)
+        _empty_retry_event("error", route)
+        out = body
+    yield out
+
+
 @app.api_route("/v1/{path:path}", methods=["GET", "POST"])
 async def proxy(path: str, request: Request):
     """Generic passthrough for everything except chat/completions, which
@@ -4263,6 +4355,8 @@ async def proxy(path: str, request: Request):
     calib_estimate = None
     # The model a chat or messages request names, for note_rejection.
     window_model = ""
+    # Set when GUARDIAN_EMPTY_RETRY applies to this request: (route, the dict forwarded).
+    retry_for = None
     if path == "chat/completions" and request.method == "POST" and body_bytes:
         try:
             payload = json.loads(body_bytes)
@@ -4306,6 +4400,8 @@ async def proxy(path: str, request: Request):
             if rewritten is not payload:
                 body_bytes = json.dumps(rewritten).encode("utf-8")
             payload = rewritten
+            if EMPTY_RETRY and not DRY_RUN and payload.get("n") in (None, 1):
+                retry_for = ("chat", payload)
             note_breakdown(payload)
             # Grabbed HERE, immediately after the estimate was recorded and
             # before anything else can touch _state. Only chat/completions
@@ -4344,6 +4440,8 @@ async def proxy(path: str, request: Request):
                 if rewritten is not payload:
                     body_bytes = json.dumps(rewritten).encode("utf-8")
                 note_breakdown(rewritten)
+                if EMPTY_RETRY and not DRY_RUN and isinstance(rewritten, dict):
+                    retry_for = ("messages", rewritten)
                 # The calibration tap, as on chat/completions: before 0.12.0
                 # this route had none, so its estimate never learned from the
                 # usage the backend reports. The raw size of what is actually
@@ -4391,11 +4489,14 @@ async def proxy(path: str, request: Request):
     # one: there is no path here that re-encodes, re-chunks, re-times or holds
     # a chunk back. Only the copy side effect is new, and it happens after the
     # chunk is on its way to the client.
+    raw_stream = upstream_resp.aiter_raw()
+    if retry_for is not None and upstream_resp.status_code == 200 and not upstream_resp.headers.get("content-encoding"):
+        raw_stream = _empty_retry_body(client, retry_for[0], retry_for[1], upstream_resp, request.method,
+                                       upstream_url, headers, dict(request.query_params))
     if calib_model is not None:
-        body_stream = _tapped_stream(upstream_resp.aiter_raw(), upstream_resp,
-                                     calib_model, calib_estimate)
+        body_stream = _tapped_stream(raw_stream, upstream_resp, calib_model, calib_estimate)
     else:
-        body_stream = upstream_resp.aiter_raw()
+        body_stream = raw_stream
     if window_model and upstream_resp.status_code in (400, 413):
         body_stream = _rejection_tap(body_stream, upstream_resp, window_model)
     return StreamingResponse(
