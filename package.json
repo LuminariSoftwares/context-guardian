@@ -41,6 +41,8 @@
     "cg_breakdown.py",
     "cg_launch.py",
     "launch.mjs",
+    "cg_cache_health.py",
+    "cg_empty_retry.py",
     "requirements.txt",
     "docs/dsh-integration.md",
     "docs/dsh-upstream-append-only.md",

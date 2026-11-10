@@ -2,7 +2,7 @@
 """One-line context usage from a running Context Guardian, for a client's status line.
 
     context-guardian-statusline --url http://127.0.0.1:8786 [--session ID]
-                                [--format claude|opencode|plain] [--timeout SECONDS]
+                                [--format claude|opencode|plain] [--timeout SECONDS] [--cache]
 
 Prints `ctx <pct>% (<used>/<window>) <exact|est>` from GET <url>/guardian/usage and
 exits 0. Any failure (unreachable, timeout, non-200, bad JSON) prints `ctx ?` and
@@ -39,6 +39,14 @@ def render(body: dict) -> str:
                                     "exact" if body.get("count_source") == "tokenize" else "est")
 
 
+def cache_suffix(body: dict) -> str:
+    """` | prefix 12%` when the proxy measured it for this session, else nothing."""
+    pct = body.get("cache_prefix_pct")
+    if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+        return ""
+    return " | prefix %d%%" % round(pct)
+
+
 def fetch(url: str, session: str, timeout: float) -> dict:
     base = url.rstrip("/")
     if urllib.parse.urlparse(base).scheme not in ("http", "https"):
@@ -69,6 +77,8 @@ def main(argv=None) -> int:
     ap.add_argument("--session", default="", help="session id (default: the most recent session)")
     ap.add_argument("--format", choices=("claude", "opencode", "plain"), default="plain",
                     help="claude reads and ignores stdin; the line is the same for every format")
+    ap.add_argument("--cache", action="store_true",
+                    help="append `| prefix N%%` (share of the prefix kept by recent compactions) when measured")
     ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
                     help="seconds before giving up (default %(default)s)")
     try:
@@ -77,7 +87,11 @@ def main(argv=None) -> int:
             sys.stdin.read()
         if not args.timeout > 0:
             raise ValueError("timeout must be positive")
-        print(render(fetch(args.url, args.session, args.timeout)))
+        body = fetch(args.url, args.session, args.timeout)
+        line = render(body)
+        if args.cache:
+            line += cache_suffix(body)
+        print(line)
         return 0
     except SystemExit:
         raise
