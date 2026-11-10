@@ -171,7 +171,7 @@ def test_store_ids_lru_and_commit_cancel():
 def test_status_names_ranges_and_is_capped():
     ctx, _ = make_ctx(8)
     text = ctx.status()
-    assert "foldable ranges" in text and "T2-T6" in text.replace("T2-T5", "T2-T6") or "T2-T" in text
+    assert "foldable ranges" in text and "T2-T6" in text
     assert "T1 " in text and "protected" in text
     big, _ = make_ctx(400)
     assert len(big.status()) <= ct.STATUS_MAX_CHARS + 200 and "turns elided" in big.status()
@@ -287,7 +287,6 @@ def test_a_proposed_fold_is_applied_on_the_next_request_and_never_leaks(g):
     assert len(model.calls) == 2 and has_guardian_tools(model.calls[0])
     assert model.summaries == 0                                           # nothing is summarised inside the loop
     # the next request: the fold is applied, directly after the system messages, and is smaller
-    before = len(texts(model.calls[0]))
     chat(g, history(9))
     nxt = model.calls[-1]
     assert model.summaries == 1
@@ -295,7 +294,6 @@ def test_a_proposed_fold_is_applied_on_the_next_request_and_never_leaks(g):
     assert "MARK-U5" in texts(nxt) and "MARK-U1" in texts(nxt)
     assert nxt["messages"][0]["content"].startswith("[Context Guardian auto-compaction") and "[fold f1: turns T2-T4]" in nxt["messages"][0]["content"]
     assert len(texts(nxt)) < len(texts({"messages": history(9)}))
-    assert before > 0
 
 
 def test_the_fold_span_is_sealed_marked_and_verifies(g):
