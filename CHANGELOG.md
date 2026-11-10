@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased
+
+- **Cache-health ledger (`GUARDIAN_CACHE_HEALTH`, off by default).** Measures what each compaction does to the prefix a provider's prompt cache could reuse: per session, the share of the previous request's estimated tokens that stayed identical at the front, whether the leading `GUARDIAN_CACHE_PREFIX_TOKENS` (1024) tokens did, and, when the upstream reports cached prompt tokens, the cache hit rate before and on the compacted request. Shown as one plain-English line in `/guardian/stats` (`cache_health`), the `/guardian/health` dashboard, `context-guardian-doctor` and `context-guardian-statusline --cache`. Measure only (ADR 0008): compaction output is unchanged; whether to keep the earliest turns verbatim for a more stable prefix is left as an open decision. New module `cg_cache_health.py`. Idea inspired by public descriptions of ranxianglei/billion-context (MIT); implemented independently.
 ## dsh-context-guardian 0.4.0-beta.1 / PyPI context-guardian 0.15.0 (2026-11-04)
 
 - **Packaging (P141 S10).** The wheel, the Docker image and the npm bundle now ship `cg_resume.py`, `cg_mask.py`, `cg_recall_index.py` and `cg_breakdown.py` (the proxy and the recall CLI import them).
