@@ -92,6 +92,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 import cg_breakdown
+import cg_cache_health
 import cg_empty_retry
 
 # Single source of truth for the running code's version. Used by /guardian/stats,
@@ -245,6 +246,25 @@ DRY_RUN = os.environ.get("GUARDIAN_DRY_RUN", "0").strip().lower() in ("1", "true
 INJECT_STREAM_OPTIONS = os.environ.get(
     "GUARDIAN_INJECT_STREAM_OPTIONS", "0").strip().lower() in ("1", "true", "yes")
 
+# CACHE_HEALTH: a per-session ledger of what each compaction did to the prefix a provider's
+# prompt cache could reuse, plus the observed cache hit rate when the upstream reports cached
+# tokens. Measures only; runs after the response has been delivered. Off by default.
+# See cg_cache_health.py and docs/adr/0008-cache-health-ledger.md.
+CACHE_HEALTH_ON = os.environ.get(
+    "GUARDIAN_CACHE_HEALTH", "0").strip().lower() in ("1", "true", "yes")
+
+
+def _env_pos_int(name: str, default: int) -> int:
+    try:
+        v = int(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+    return v if v > 0 else default
+
+
+CACHE_PREFIX_TOKENS = _env_pos_int("GUARDIAN_CACHE_PREFIX_TOKENS", 1024)
+CACHE_HEALTH_MAX_BYTES = _env_pos_int("GUARDIAN_CACHE_HEALTH_MAX_MB", 4) * 1024 * 1024
+CACHE_HEALTH = cg_cache_health.CacheHealth(head_tokens=CACHE_PREFIX_TOKENS)
 # EMPTY_RETRY: when the upstream finishes a turn with nothing visible in it (empty text,
 # a reasoning block and no answer, or only an echo of the compaction header this proxy
 # injects), ask once more with a short nudge as trailing user text and give the client the
@@ -865,6 +885,72 @@ def usage_prompt_tokens(data: bytes, content_type: str) -> Optional[int]:
             if not isinstance(obj, dict):
                 continue
             found = _prompt_tokens_from(obj)
+            if found is not None:
+                return found
+        return None
+    except Exception:                                      # noqa: BLE001
+        return None
+
+
+def _int_or_none(v: Any) -> Optional[int]:
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
+
+
+def _cache_counts_from(obj: Any) -> Optional[Tuple[int, Optional[int]]]:
+    """(prompt tokens, cached prompt tokens or None when not reported) out of one decoded
+    response object, or None. Pure; never raises (it reads bytes off the wire)."""
+    try:
+        usage = obj.get("usage")
+        if not isinstance(usage, dict) and isinstance(obj.get("message"), dict):
+            usage = obj["message"].get("usage")
+        if isinstance(usage, dict):
+            n = _int_or_none(usage.get("prompt_tokens"))
+            if n:
+                details = usage.get("prompt_tokens_details")
+                cached = _int_or_none(details.get("cached_tokens")) if isinstance(details, dict) else None
+                if cached is None and isinstance(obj.get("timings"), dict):
+                    cached = _int_or_none(obj["timings"].get("cache_n"))     # llama.cpp reports both blocks
+                return n, cached
+            if _int_or_none(usage.get("input_tokens")) is not None:
+                total = sum(_int_or_none(usage.get(k)) or 0
+                            for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+                if total > 0:
+                    return total, _int_or_none(usage.get("cache_read_input_tokens"))
+        n = _int_or_none(obj.get("prompt_eval_count"))
+        if n:
+            return n, None
+        timings = obj.get("timings")
+        if isinstance(timings, dict) and _int_or_none(timings.get("prompt_n")) is not None:
+            cache_n = _int_or_none(timings.get("cache_n"))
+            return timings["prompt_n"] + (cache_n or 0), cache_n
+    except Exception:                                      # noqa: BLE001
+        return None
+    return None
+
+
+def usage_cache_counts(data: bytes, content_type: str) -> Optional[Tuple[int, Optional[int]]]:
+    """(prompt tokens, cached tokens or None) the backend reported for a response body (one
+    JSON document or an SSE stream), or None when it reported no prompt figure."""
+    try:
+        text = data.decode("utf-8", "replace")
+        if not ("event-stream" in content_type or text.startswith("data:")):
+            try:
+                obj = json.loads(text)
+            except (ValueError, TypeError):
+                return None
+            return _cache_counts_from(obj) if isinstance(obj, dict) else None
+        for line in reversed(text.splitlines()):
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            body = line[len("data:"):].strip()
+            if not body or body == "[DONE]":
+                continue
+            try:
+                obj = json.loads(body)
+            except (ValueError, TypeError):
+                continue
+            found = _cache_counts_from(obj) if isinstance(obj, dict) else None
             if found is not None:
                 return found
         return None
@@ -2992,6 +3078,9 @@ def _spill_limit(threshold_tokens: int, estimated: int, base_tokens: int, tool_t
 
 def _note_spill(spill: Dict[str, Any], event: Optional[str]) -> None:
     _state["oversized_spills"] += 1
+    snap = _usage_snap.get()
+    if snap is not None:
+        snap["spill"] = True
     log.info("Oversized message %d (~%d tokens) archived as %s and forwarded as head + tail "
              "(~%d -> ~%d message tokens).", spill["message_index"] + 1, spill["original_tokens"],
              spill["span"], spill["tokens_before"], spill["tokens_after"])
@@ -3334,6 +3423,7 @@ async def maybe_compact(client: httpx.AsyncClient, payload: Dict[str, Any],
     log_event(event)
     snap["used"] = tokens_after
     snap["at"] = event.get("timestamp") or time.strftime("%Y-%m-%dT%H:%M:%S")
+    snap["source"] = memo["source"]
     note_compaction_receipt(memo["new"], pointer, tokens_saved, memo["source"])
 
     if VERBOSE:
@@ -3518,6 +3608,9 @@ def record_usage(session_id: str, model: str) -> None:
         "count_source": snap["count_source"], "model": model,
         "last_compaction_at": snap["at"] or (prev or {}).get("last_compaction_at"),
     }
+    # The ledger fills this in after the response (see _cache_done); keep the last figure.
+    if prev and "cache_prefix_pct" in prev:
+        _usage_sessions[session_id]["cache_prefix_pct"] = prev["cache_prefix_pct"]
     while len(_usage_sessions) > USAGE_SESSIONS_MAX:
         _usage_sessions.popitem(last=False)
 
@@ -3535,11 +3628,14 @@ async def usage(session: Optional[str] = None):
     if row is None:
         return JSONResponse({"error": "unknown session"}, status_code=404)
     window, used = row["window"], row["used_after_compaction"]
-    return JSONResponse({
+    out = {
         "window": window, "used_after_compaction": used,
         "pct": round(100.0 * used / window, 1) if window else 0.0,
         "count_source": row["count_source"], "model": row["model"],
-        "last_compaction_at": row["last_compaction_at"]})
+        "last_compaction_at": row["last_compaction_at"]}
+    if CACHE_HEALTH_ON:                  # the documented shape is unchanged unless the ledger is on
+        out["cache_prefix_pct"] = row.get("cache_prefix_pct")
+    return JSONResponse(out)
 
 
 _breakdown: Dict[str, int] = dict.fromkeys(cg_breakdown.KEYS, 0)
@@ -3629,7 +3725,69 @@ async def stats():
                  "last_tool_tokens is the part compaction cannot touch."),
         # Where the latest request's window went, in estimated tokens (cg_breakdown).
         "breakdown": dict(_breakdown),
+        "cache_health": cache_health_stats(),
     })
+
+
+def cache_health_stats() -> Dict[str, Any]:
+    """The ledger for /guardian/stats. Never raises: a failure reads as {"error": true}."""
+    if not CACHE_HEALTH_ON:
+        return {"enabled": False}
+    try:
+        return CACHE_HEALTH.summary()
+    except Exception as exc:                               # noqa: BLE001
+        log.debug("cache health summary failed: %s", exc)
+        return {"enabled": True, "error": True}
+
+
+def _cache_done(job: Dict[str, Any], data: bytes, capped: bool, resp: httpx.Response) -> None:
+    """After the response has been delivered: file this request in the ledger. Fail open."""
+    try:
+        if resp.status_code != 200:
+            return
+        if job["size"] > CACHE_HEALTH_MAX_BYTES:
+            CACHE_HEALTH.skipped_large += 1
+            CACHE_HEALTH.forget_previous(job["session"])      # the next comparison must not use a stale request
+            return
+        payload, route = job["payload"], job["route"]
+        elements = cg_cache_health.fingerprint(
+            payload, route, lambda m: estimate_tokens([m]),
+            lambda tools: estimate_tool_tokens({"tools": tools}),
+            lambda x: int(len(x if isinstance(x, str) else _anthropic_text([x])) / CHARS_PER_TOKEN_ESTIMATE))
+        seq = CACHE_HEALTH.observe(job["session"], elements, route=route, source=job["source"],
+                                   spill=job["spill"], at=time.strftime("%Y-%m-%dT%H:%M:%S"))
+        if not capped and not resp.headers.get("content-encoding"):
+            found = usage_cache_counts(data, resp.headers.get("content-type", ""))
+            if found is not None:
+                CACHE_HEALTH.usage(job["session"], seq, found[0], found[1])
+        row = _usage_sessions.get(job["session"])
+        if row is not None:
+            row["cache_prefix_pct"] = CACHE_HEALTH.prefix_pct(job["session"])
+    except Exception as exc:                               # noqa: BLE001
+        CACHE_HEALTH.errors += 1
+        log.debug("cache health failed, response unaffected: %s", exc)
+
+
+def _after_response(fn, *args) -> None:
+    """Run bookkeeping on a worker thread, so neither the response's last chunk nor the event
+    loop waits for it (a callback on the loop itself still ran before the final chunk was
+    flushed: the HTTP middleware passes every send through the loop). Falls back to running it
+    now if there is no loop. Never raises."""
+    try:
+        asyncio.get_running_loop().run_in_executor(None, fn, *args)
+    except RuntimeError:
+        fn(*args)
+    except Exception as exc:                               # noqa: BLE001
+        log.debug("could not schedule bookkeeping: %s", exc)
+
+
+def _cache_job(session_id: Optional[str], route: str, payload: Any, body: bytes) -> Optional[Dict[str, Any]]:
+    """What the ledger needs from the request path: values already in hand, no work."""
+    if not CACHE_HEALTH_ON or not session_id or not isinstance(payload, dict):
+        return None
+    snap = _usage_snap.get() or {}
+    return {"session": session_id, "route": route, "payload": payload, "size": len(body),
+            "source": snap.get("source"), "spill": bool(snap.get("spill"))}
 
 
 def seal_status() -> Dict[str, Any]:
@@ -3859,6 +4017,9 @@ async function tick(){
     card("Rejected summaries",fmt(rejected),rejected?"empty/degenerate - investigate":"none - healthy"),
     card("Uptime",human(s.uptime_seconds),`run ${s.run_id||""}`),
     estimateCard(s),
+    ...(s.cache_health&&s.cache_health.enabled?[card("Cache health",
+      s.cache_health.compactions?`${fmt(s.cache_health.compactions)} compaction(s) measured`:"none yet",
+      String(s.cache_health.line||"").replace(/&/g,"&amp;").replace(/</g,"&lt;"))]:[]),
     ...(s.dry_run||s.dry_runs?[card("Dry runs",fmt(s.dry_runs),
       `would have saved ${fmt(s.dry_run_tokens_saved_total)} tokens &middot; requests forwarded unchanged`)]:[])
   ].join("");
@@ -3916,7 +4077,7 @@ async def health():
 
 
 async def _tapped_stream(chunks, upstream_resp: httpx.Response,
-                         model: str, estimated: int):
+                         model: Optional[str], estimated: int, on_done=None):
     """Pass the upstream stream through untouched, and read the usage off it.
 
     The client's bytes are this proxy's product, so the first and only rule is
@@ -3947,7 +4108,7 @@ async def _tapped_stream(chunks, upstream_resp: httpx.Response,
         # report on the response has strictly lost.
         try:
             encoded = upstream_resp.headers.get("content-encoding")
-            if (not capped and upstream_resp.status_code == 200 and not encoded):
+            if (model is not None and not capped and upstream_resp.status_code == 200 and not encoded):
                 reported = usage_prompt_tokens(
                     bytes(buffer),
                     upstream_resp.headers.get("content-type", ""))
@@ -3955,6 +4116,11 @@ async def _tapped_stream(chunks, upstream_resp: httpx.Response,
                     CALIBRATOR.observe(model, estimated, reported)
         except Exception as exc:                           # noqa: BLE001
             log.debug("usage calibration tap failed, response unaffected: %s", exc)
+        if on_done is not None:
+            try:
+                on_done(bytes(buffer), capped, upstream_resp)
+            except Exception as exc:                       # noqa: BLE001
+                log.debug("tap callback failed, response unaffected: %s", exc)
 
 
 async def rewrite_chat_payload(client: httpx.AsyncClient,
@@ -4242,6 +4408,7 @@ async def maybe_compact_anthropic(client: httpx.AsyncClient, payload: Dict[str, 
     log_event(event)
     snap["used"] = event["estimated_tokens_after"]
     snap["at"] = event.get("timestamp") or time.strftime("%Y-%m-%dT%H:%M:%S")
+    snap["source"] = memo["source"]
     note_compaction_receipt(memo["new"], pointer, event["tokens_saved"], memo["source"])
     log.info("Compacted Anthropic request %d -> %d messages, ~%d -> ~%d tokens.",
              len(messages), len(to_keep), estimated, event["estimated_tokens_after"])
@@ -4355,6 +4522,7 @@ async def proxy(path: str, request: Request):
     calib_estimate = None
     # The model a chat or messages request names, for note_rejection.
     window_model = ""
+    cache_job = None
     # Set when GUARDIAN_EMPTY_RETRY applies to this request: (route, the dict forwarded).
     retry_for = None
     if path == "chat/completions" and request.method == "POST" and body_bytes:
@@ -4400,6 +4568,7 @@ async def proxy(path: str, request: Request):
             if rewritten is not payload:
                 body_bytes = json.dumps(rewritten).encode("utf-8")
             payload = rewritten
+            cache_job = _cache_job(usage_sid, "chat", payload, body_bytes)
             if EMPTY_RETRY and not DRY_RUN and payload.get("n") in (None, 1):
                 retry_for = ("chat", payload)
             note_breakdown(payload)
@@ -4440,6 +4609,7 @@ async def proxy(path: str, request: Request):
                 if rewritten is not payload:
                     body_bytes = json.dumps(rewritten).encode("utf-8")
                 note_breakdown(rewritten)
+                cache_job = _cache_job(usage_sid, "messages", rewritten, body_bytes)
                 if EMPTY_RETRY and not DRY_RUN and isinstance(rewritten, dict):
                     retry_for = ("messages", rewritten)
                 # The calibration tap, as on chat/completions: before 0.12.0
@@ -4493,8 +4663,11 @@ async def proxy(path: str, request: Request):
     if retry_for is not None and upstream_resp.status_code == 200 and not upstream_resp.headers.get("content-encoding"):
         raw_stream = _empty_retry_body(client, retry_for[0], retry_for[1], upstream_resp, request.method,
                                        upstream_url, headers, dict(request.query_params))
-    if calib_model is not None:
-        body_stream = _tapped_stream(raw_stream, upstream_resp, calib_model, calib_estimate)
+    if calib_model is not None or cache_job is not None:
+        body_stream = _tapped_stream(
+            raw_stream, upstream_resp, calib_model, calib_estimate,
+            on_done=(lambda data, capped, resp, job=cache_job: _after_response(_cache_done, job, data, capped, resp))
+            if cache_job is not None else None)
     else:
         body_stream = raw_stream
     if window_model and upstream_resp.status_code in (400, 413):
