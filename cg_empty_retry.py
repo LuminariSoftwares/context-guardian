@@ -109,6 +109,44 @@ def response_is_empty(route: str, data: Any) -> bool:
     return False
 
 
+def response_has_answer(route: str, data: Any) -> bool:
+    """True only for a completed response that positively carries an answer: visible text, a
+    refusal or a tool call, with a normal finish. Used to decide whether a retry may replace
+    the upstream's own answer, so anything unrecognised (an error body sent with status 200,
+    a cut-off turn) is False."""
+    if not isinstance(data, dict):
+        return False
+    if route == "chat":
+        choices = data.get("choices")
+        if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
+            return False
+        c = choices[0]
+        msg = c.get("message")
+        if not isinstance(msg, dict):
+            return False
+        if msg.get("tool_calls") or msg.get("function_call"):
+            return c.get("finish_reason") in (None, "stop", "tool_calls", "function_call")
+        if c.get("finish_reason") not in _DONE_OPENAI:
+            return False
+        if msg.get("refusal"):
+            return True
+        content = msg.get("content")
+        if isinstance(content, list):
+            content = "".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") in (None, "text"))
+        return isinstance(content, str) and not is_degenerate_text(content)
+    if route == "messages":
+        if data.get("type") not in (None, "message") or not isinstance(data.get("content"), list):
+            return False
+        blocks = [b for b in data["content"] if isinstance(b, dict)]
+        if any(b.get("type") in ("tool_use", "server_tool_use") for b in blocks):
+            return data.get("stop_reason") in (None, "tool_use", "end_turn", "pause_turn")
+        if data.get("stop_reason") not in _DONE_ANTHROPIC:
+            return False
+        text = "".join(b.get("text") or "" for b in blocks if b.get("type") == "text")
+        return not is_degenerate_text(text)
+    return False
+
+
 def nudged_payload(route: str, payload: Dict[str, Any], nudge: str) -> Dict[str, Any]:
     """A copy of the forwarded request with `nudge` as trailing user text. The caller's
     payload is never modified, and the copy is used for the one retry request only."""
@@ -180,6 +218,8 @@ class StreamScan:
 
     # -- helpers
     def _text_delta(self, piece: str) -> str:
+        if self.visible:                  # already an answer: nothing more to learn from the text
+            return "release"
         self.text += piece
         state = _echo_state(self.text)
         if state in ("empty", "maybe"):
@@ -268,7 +308,9 @@ class StreamScan:
         if kind == "content_block_stop":
             return "hold" if self._block_kind.get(obj.get("index", -1)) == "text" else "pass"
         if kind == "message_delta":
-            self.finish = (obj.get("delta") or {}).get("stop_reason") if isinstance(obj.get("delta"), dict) else None
+            d = obj.get("delta") if isinstance(obj.get("delta"), dict) else {}
+            if "stop_reason" in d:
+                self.finish = d.get("stop_reason")
             self.finished = True
             return "hold"
         if kind == "message_stop":

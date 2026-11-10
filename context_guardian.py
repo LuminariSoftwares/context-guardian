@@ -4313,7 +4313,7 @@ async def _empty_retry_body(client: httpx.AsyncClient, route: str, payload: Dict
                 finally:
                     await resp.aclose()
                 data = json.loads(retry_body)
-                if isinstance(data, dict) and not cg_empty_retry.response_is_empty(route, data):
+                if cg_empty_retry.response_has_answer(route, data):
                     out = retry_body
                     _empty_retry_event("recovered", route)
     except Exception as exc:                               # noqa: BLE001

@@ -599,3 +599,26 @@ def test_anthropic_nudge_is_never_replayed(on):
     post(on, a_req(), "/v1/messages")
     post(on, a_req(), "/v1/messages")
     assert seen[2] == a_req() and on.EMPTY_RETRY_NUDGE.encode() not in seen[2]
+
+
+def test_a_retry_that_is_not_positively_an_answer_never_replaces_the_original(on):
+    empty = chat_json("")
+    for bad in ({"error": {"message": "model unloaded"}}, chat_json("", finish="length"), {"choices": []}, {"id": "x"}):
+        seen = wire_seq(on, [empty, bad])
+        r = post(on, req())
+        assert r.json() == empty and len(seen) == 2, bad
+    a_empty = a_msg([{"type": "text", "text": ""}])
+    seen = wire_seq(on, [a_empty, {"type": "error", "error": {"type": "overloaded_error", "message": "x"}}])
+    assert post(on, a_req(), "/v1/messages").json() == a_empty and len(seen) == 2
+    assert on._state["empty_retry_recovered"] == 0
+
+
+def test_has_answer_shapes():
+    import cg_empty_retry as e
+    assert e.response_has_answer("chat", chat_json(GOOD))
+    assert e.response_has_answer("chat", chat_json("", finish="tool_calls", tool_calls=[{"id": "1"}]))
+    assert not e.response_has_answer("chat", chat_json(""))
+    assert not e.response_has_answer("chat", chat_json(GOOD, finish="length"))
+    assert e.response_has_answer("messages", a_msg([{"type": "text", "text": GOOD}]))
+    assert not e.response_has_answer("messages", a_msg([]))
+    assert not e.response_has_answer("messages", {"type": "error"})
