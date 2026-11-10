@@ -159,7 +159,7 @@ Context Guardian savings (last 7d)
 
 ## Point your client at the proxy
 
-The proxy compacts OpenAI-style `POST /v1/chat/completions` requests. Every client below is configured from its own documented settings; none of these four has been tested against the proxy yet, so please open an issue with what you see.
+The proxy compacts OpenAI-style `POST /v1/chat/completions` requests. Every client below is configured from its own documented settings. Claude Code, aider, OpenCode and Continue also have PASS rows in [Works with](#works-with) (2026-10-31); Cline is untested. To skip the setup for one run, see [Launch a client](#launch-a-client-for-one-process).
 
 | client | where | what to set |
 |---|---|---|
@@ -186,6 +186,35 @@ Then search Claude Code's history like any other run: `context-guardian-recall "
 After a compaction, the `SessionStart` hook (matcher `compact`, so it does not fire on startup, resume or clear) prints a short block of plain facts from the archived spans as the hook's `additionalContext`: the goal, the latest decisions, the files edited, the errors still open and a line naming `context-guardian-recall "<term>"`. The block is built by `cg_resume.py`, is capped at 8000 characters, and is left out when the session has no archived spans. It only reads the archive; `SessionStart` never archives, and any failure is logged and prints nothing. The matcher is `compact` only because Claude Code replays saved context on resume and runs `SessionStart` again then. Re-run `install --apply` to add the third hook to an existing install.
 
 Limits: Claude Code documents its transcript lines as internal and liable to change between versions, so lines are archived verbatim and only read for their text. The adapter does not change what Claude Code keeps in its own window; it keeps a sealed, searchable copy of what was said.
+
+## Launch a client for one process
+
+`context-guardian launch <client>` starts the proxy if it is not running, sets the client's base-URL variable **for that one process**, runs the client, and stops the proxy again if (and only if) it started it. It changes no file you own: nothing goes into your shell profile or the client's settings. The client's exit code is returned.
+
+```bash
+context-guardian launch claude-code -- --resume       # arguments after -- go to the client
+context-guardian launch aider -- --model openai/<model>
+context-guardian launch continue --model <model>      # cn with a temporary config, removed at the end
+context-guardian launch openai -- some-openai-cli     # any CLI that reads OPENAI_BASE_URL or OPENAI_API_BASE
+context-guardian launch --list                        # what each client sets and what has been tested
+```
+
+| client | what it sets for the one process | tested |
+|---|---|---|
+| `claude-code` | `ANTHROPIC_BASE_URL` (the proxy's upstream must serve the Anthropic Messages API) | the variable passed the [Works with](#works-with) row; the launcher itself: see the launcher table below |
+| `openclaude` | `CLAUDE_CODE_USE_OPENAI=1`, `OPENAI_BASE_URL`, `OPENAI_API_KEY=local` if you have none | untested |
+| `aider` | `OPENAI_API_BASE`, `OPENAI_API_KEY=local` if you have none | untested (the matrix passed with `--openai-api-base`) |
+| `continue` (`cn`) | `cn --config <temporary file>`; this replaces your own Continue config for that run | untested |
+| `openai` | `OPENAI_BASE_URL` and `OPENAI_API_BASE` | untested |
+| `opencode`, `cline`, `cursor` | needs a setting in the client itself: the exact steps are printed and nothing is changed | steps only |
+
+| date | client through `launch` | version | result |
+|---|---|---|---|
+| 2026-11-10 | claude-code | 2.1.322 | PASS |
+
+Output of `python tests/clients/run_launch_check.py` (two scripted turns, each its own `launch`, against the scripted mock model of the matrix above; it passes when both turns print the mock's answer marker, the mock saw requests, and nothing listens on the proxy port afterwards). Run on Linux (a container), Python 3.13. Windows and macOS were not run.
+
+The port comes from `--port`, then `GUARDIAN_PORT` in the environment or the `.env` in the data directory, then 8786; the client is always given `127.0.0.1`. A proxy already answering there is used and left running; a port held by something else gets a free one. If the proxy will not start, the client is **not** started (running it without the proxy would send Claude Code to the vendor's API instead of your backend): the last lines of the proxy's output and the command to run the client directly are printed, and `--direct-if-proxy-fails` opts in to running it anyway. The proxy runs in its own process group, so pressing Ctrl-C in the client to cancel a turn does not stop it; killing the launcher with `SIGKILL` cannot be caught and leaves an idle loopback proxy running. In the DSH bundle: `npm run launch -- <client>` (on Windows `node launch.mjs <client>`; not tested on Windows).
 
 ## Show real usage in your client
 
@@ -377,6 +406,7 @@ sequenceDiagram
 | MCP server | `cg_mcp.py` | `context-guardian-mcp`: seven read-only tools over the proxy's stats, the archive and Claude Code's context fullness |
 | Claude Code adapter | `cg_claude_code.py` | `context-guardian-claude-code`: capture, install, uninstall, status |
 | setup tools | `cg_configure.py`, `cg_doctor.py`, `setup.mjs` | write a `.env`, check an install, add the DSH preset row |
+| launcher | `cg_launch.py`, `launch.mjs` | `context-guardian launch <client>`: start the proxy if needed, run one client pointed at it, stop what it started |
 
 ### Design decisions
 
@@ -699,6 +729,11 @@ cp .env.example .env
 | `GUARDIAN_CONTEXT_TOOLS_FOLD_TIMEOUT` | `60` | Seconds the proxy's summariser may take to write a fold's summary; past it the fold is dropped |
 | `GUARDIAN_CONTEXT_TOOLS_MAX_FOLDS` | `4` | Live folds per session |
 | `GUARDIAN_CONTEXT_TOOLS_PROTECT_TURNS` | `2` | Most recent turns that can never be folded (the first turn and the kept-recent window are protected too) |
+| `GUARDIAN_CACHE_HEALTH` | `0` | `1`: keep a per-session ledger of what each real compaction did to the prefix a provider's prompt cache could reuse, and surface it as `cache_health` in `/guardian/stats`, on the `/guardian/health` dashboard, in `context-guardian-doctor` and with `context-guardian-statusline --cache`. It measures only: it never changes a request or a response, and runs after the response has been delivered. Each row holds the share of the previous request's estimated tokens that stayed identical at the front, whether the first `GUARDIAN_CACHE_PREFIX_TOKENS` tokens did, and, when the upstream reports cached prompt tokens (OpenAI-style `prompt_tokens_details.cached_tokens`, Anthropic `cache_read_input_tokens`, llama.cpp `timings.cache_n`), the cache hit rate on the request before and on the compacted one. An upstream that reports none (Ollama's OpenAI route among them) shows prefix stability only. Counts and 8-hex digests only; no message text is stored |
+| `GUARDIAN_CACHE_PREFIX_TOKENS` | `1024` | How many leading tokens must stay identical for a compaction to count as keeping the cached head (1024 is the smallest block providers cache) |
+| `GUARDIAN_CACHE_HEALTH_MAX_MB` | `4` | A request whose JSON is bigger than this is not fingerprinted (counted as `skipped_large`) |
+| `GUARDIAN_EMPTY_RETRY` | `0` | `1`: when the upstream finishes a turn with nothing visible in it (an empty message, a reasoning block and no answer, or only an echo of the `[Context Guardian auto-compaction` header the proxy injects), ask once more and give the client the retry's answer. The retry is the same forwarded request with one short user message appended (`GUARDIAN_EMPTY_RETRY_NUDGE`); that message exists only in the retry request, is never stored and never reaches the client. At most one retry per turn, on `/v1/chat/completions` and `/v1/messages`, streaming and not. A turn that ended for any other reason (`length`, a tool call, a filter) is not retried. If the retry fails or is empty too, the client gets the upstream's own answer, byte for byte. Off in `GUARDIAN_DRY_RUN`. A header echo followed by real words is an answer, not a parrot, and is not retried. The retry is read to the end before anything is sent, so a slow retry is silent for as long as it takes (bounded by `GUARDIAN_UPSTREAM_TIMEOUT`). Counted as `empty_retries`, `empty_retry_recovered` and `empty_retry_errors` in `/guardian/stats` |
+| `GUARDIAN_EMPTY_RETRY_NUDGE` | a short built-in sentence | The text of that one appended user message |
 
 **A note on timeouts:** local "thinking"/reasoning models can go silent for a long time before their first output token. If you see `500` errors appear only on real (non-trivial) requests after a long pause, raise `GUARDIAN_UPSTREAM_TIMEOUT` before assuming something is broken — the default 5-second timeout most HTTP clients ship with is sized for ordinary REST APIs, not local LLM inference, which is exactly the bug this project's own commit history caught during development.
 
@@ -930,6 +965,8 @@ Context Guardian stands on other people's ideas, and says so:
 - **[VCC](https://github.com/lllyasviel/VCC)** (lllyasviel) — the conversation-compiler principle that compiler ports: compile the log into a compact view made only of original tokens, with a pointer back to every elided part.
 - **[dsh-openwolf](https://github.com/hawk2048/dsh-openwolf)** (MIT) — the idea of snapshotting session state right before a compaction. The engine's `precompact-<seq>.json` and the `FILES WRITTEN` list are an independent implementation of that idea; no openwolf code is included.
 - **[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)** — `summarize()` is the hook its compaction engine documents for exactly this.
+
+Several features were inspired by public descriptions of ranxianglei/billion-context (MIT); implemented independently.
 
 Full third-party notices: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 

@@ -256,6 +256,7 @@ def doctor(root: Path = PACKAGE_ROOT, env: dict | None = None, preset: Path | No
         out.append(_f("ok", f"proxy reachable at {url}{shown}"))
         out.extend(detected_window_findings(stats))
         out.extend(count_source_findings(stats, work))
+        out.extend(cache_health_findings(stats))
         if w["source"] == "env" and whole and running != w["value"]:
             out.append(_f("warn", f"proxy is running with num_ctx {running} but GUARDIAN_NUM_CTX is {w['value']}",
                           "restart the proxy so it re-reads GUARDIAN_NUM_CTX"))
@@ -329,6 +330,22 @@ def count_source_findings(stats: dict, work: dict | None = None) -> list:
         out.append(_f("ok", f"count: last request counted by {last}{note}{fails}" if last
                       else "count: no request counted yet"))
     return out
+
+def cache_health_findings(stats: dict) -> list:
+    """What compaction does to the reusable prompt prefix (the proxy's cache-health ledger).
+    Silent for a proxy that predates it, or one that has measured no compaction yet."""
+    block = stats.get("cache_health") if isinstance(stats, dict) else None
+    if not isinstance(block, dict):
+        return []
+    if block.get("enabled") is False:
+        return [_f("ok", "cache health: off (GUARDIAN_CACHE_HEALTH=1 measures what compaction does to the cached prefix)")]
+    if block.get("error"):
+        return [_f("warn", "cache health: the proxy could not render its ledger", "see the proxy log at debug level")]
+    line = block.get("line")
+    if not isinstance(line, str) or not block.get("compactions"):
+        return []
+    return [_f("ok", "cache health: " + line)]
+
 
 def render(findings) -> tuple[str, int]:
     """The text report and its exit code: 1 when any finding is an error."""
