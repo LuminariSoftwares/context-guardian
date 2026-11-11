@@ -1,5 +1,7 @@
 <h1 align="center">Context Guardian</h1>
 
+<p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/brand/luminari-softwares-horizontal-dark.svg"><img src="docs/brand/luminari-softwares-horizontal-light.svg" alt="Luminari Softwares" height="40"></picture></p>
+
 <p align="center">
   <a href="https://github.com/LuminariSoftwares/context-guardian/actions/workflows/test.yml"><img alt="tests (pytest) on Ubuntu, Windows, macOS" src="https://github.com/LuminariSoftwares/context-guardian/actions/workflows/test.yml/badge.svg"></a>
   <a href="https://github.com/LuminariSoftwares/context-guardian/actions/workflows/node.yml"><img alt="node smoke tests on Ubuntu, Windows, macOS" src="https://github.com/LuminariSoftwares/context-guardian/actions/workflows/node.yml/badge.svg"></a>
