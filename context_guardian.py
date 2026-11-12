@@ -100,7 +100,7 @@ import cg_empty_retry
 # the /guardian/health dashboard, the banner and the PyPI update check, through
 # guardian_version(), which returns this constant and never installed metadata
 # (which can name a different, older install). Keep it in lockstep with pyproject.toml.
-__version__ = "0.15.0"  # keep equal to pyproject.toml version
+__version__ = "0.16.0"  # keep equal to pyproject.toml version
 from starlette.background import BackgroundTask
 
 # Load .env BEFORE any config is read.
