@@ -4,13 +4,13 @@
   "title": "Context Guardian",
   "description": "40 turns: 1,130,722 tokens upstream -> 161,141. A fail-open compaction proxy for local models.",
   "repository": {"url": "https://github.com/LuminariSoftwares/context-guardian", "source": "github"},
-  "version": "0.15.0",
+  "version": "0.16.0",
   "packages": [
     {
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "context-guardian",
-      "version": "0.15.0",
+      "version": "0.16.0",
       "runtimeHint": "uvx",
       "transport": {"type": "stdio"},
       "packageArguments": [{"type": "positional", "value": "mcp"}]
